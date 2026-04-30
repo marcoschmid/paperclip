@@ -5,7 +5,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { computePreviousStatus, insertOrSkipRun } from "../services/routine-checks/runner.ts";
+import { computePreviousStatus, insertOrSkipRun, runOne } from "../services/routine-checks/runner.ts";
+import type { CheckDef } from "../services/routine-checks/types.ts";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe : describe.skip;
@@ -84,5 +85,95 @@ describeDb("insertOrSkipRun", () => {
     expect(a).not.toBeNull();
     expect(b).not.toBeNull();
     expect(a).not.toBe(b);
+  });
+});
+
+const noopLogger = { info: () => {}, warn: () => {}, error: () => {} };
+
+describeDb("runOne", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  beforeAll(async () => { tempDb = await startEmbeddedPostgresTestDatabase("pc-runner-runone-"); db = createDb(tempDb.connectionString); });
+  afterAll(async () => { await tempDb?.cleanup(); });
+  afterEach(async () => { await db.execute(sql`TRUNCATE TABLE routine_check_runs`); });
+
+  it("executes check, persists row, dispatches notify when shouldNotify=true", async () => {
+    const def: CheckDef = {
+      name: "demo",
+      schedule: "*/5 * * * *",
+      notify: "telegram",
+      run: async () => ({ status: "warn", findings: 3, payload: { foo: 1 }, summary: "3 drift" }),
+    };
+    const posts: any[] = [];
+    const result = await runOne({
+      db, def,
+      scheduledFor: new Date("2026-04-30T09:00:00Z"),
+      logger: noopLogger,
+      now: () => new Date("2026-04-30T09:00:30Z"),
+      webhook: {
+        url: "http://localhost",
+        token: "t",
+        fetcher: async (_url, init) => { posts.push(JSON.parse(String(init!.body))); return new Response("{}", { status: 200 }); },
+      },
+    });
+
+    expect(result.skipped).toBe(false);
+    expect(result.notified).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].check).toBe("demo");
+    expect(posts[0].findings).toBe(3);
+    expect(posts[0].previous_status).toBeNull();
+
+    const rows = await db.select().from(routineCheckRuns);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe("warn");
+    expect(rows[0]!.findings).toBe(3);
+    expect(rows[0]!.notified).toBe(true);
+  });
+
+  it("skips when slot already has a row", async () => {
+    const def: CheckDef = { name: "demo", schedule: "*/5 * * * *", notify: "silent", run: async () => ({ status: "ok", findings: 0, payload: {}, summary: "" }) };
+    const slot = new Date("2026-04-30T09:00:00Z");
+    const r1 = await runOne({ db, def, scheduledFor: slot, logger: noopLogger, now: () => new Date(), webhook: undefined });
+    const r2 = await runOne({ db, def, scheduledFor: slot, logger: noopLogger, now: () => new Date(), webhook: undefined });
+    expect(r1.skipped).toBe(false);
+    expect(r2.skipped).toBe(true);
+  });
+
+  it("records error when check throws", async () => {
+    const def: CheckDef = { name: "broken", schedule: "*/5 * * * *", notify: "threshold", thresholdSeverity: "error", run: async () => { throw new Error("boom"); } };
+    const result = await runOne({ db, def, scheduledFor: new Date("2026-04-30T09:00:00Z"), logger: noopLogger, now: () => new Date(), webhook: undefined });
+    expect(result.skipped).toBe(false);
+    const rows = await db.select().from(routineCheckRuns);
+    expect(rows[0]!.status).toBe("error");
+    expect(rows[0]!.errorText).toContain("boom");
+  });
+
+  it("does NOT notify when shouldNotify=false (silent + stable ok)", async () => {
+    const def: CheckDef = { name: "quiet", schedule: "*/5 * * * *", notify: "silent", run: async () => ({ status: "ok", findings: 0, payload: {}, summary: "" }) };
+    const posts: any[] = [];
+    const r = await runOne({
+      db, def,
+      scheduledFor: new Date("2026-04-30T09:00:00Z"),
+      logger: noopLogger, now: () => new Date(),
+      webhook: { url: "http://x", token: "t", fetcher: async () => { posts.push(1); return new Response("{}", { status: 200 }); } },
+    });
+    expect(r.notified).toBe(false);
+    expect(posts).toHaveLength(0);
+    const rows = await db.select().from(routineCheckRuns);
+    expect(rows[0]!.notified).toBe(false);
+  });
+
+  it("appends (catch-up) suffix when scheduledFor is older than 90s before now", async () => {
+    const def: CheckDef = { name: "demo", schedule: "*/5 * * * *", notify: "telegram", run: async () => ({ status: "warn", findings: 1, payload: {}, summary: "msg" }) };
+    const posts: any[] = [];
+    await runOne({
+      db, def,
+      scheduledFor: new Date("2026-04-30T09:00:00Z"),
+      logger: noopLogger,
+      now: () => new Date("2026-04-30T09:30:00Z"), // 30 min later — clear catch-up
+      webhook: { url: "http://x", token: "t", fetcher: async (_u, init) => { posts.push(JSON.parse(String(init!.body))); return new Response("{}", { status: 200 }); } },
+    });
+    expect(posts[0].summary).toMatch(/\(catch-up\)/);
   });
 });

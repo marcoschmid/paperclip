@@ -1,7 +1,8 @@
 import { and, desc, eq, ne } from "drizzle-orm";
 import { routineCheckRuns } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
-import type { CheckStatus, NotifyChannel } from "./types.js";
+import { buildSummary, computeContentHash, postWebhook, shouldNotify, type WebhookPayload } from "./notify.js";
+import type { CheckCtx, CheckDef, CheckLogger, CheckResult, CheckStatus, NotifyChannel } from "./types.js";
 
 export async function computePreviousStatus(args: {
   db: Db;
@@ -37,4 +38,109 @@ export async function insertOrSkipRun(args: {
     .onConflictDoNothing({ target: [routineCheckRuns.checkName, routineCheckRuns.scheduledFor] })
     .returning({ id: routineCheckRuns.id });
   return rows[0]?.id ?? null;
+}
+
+const CATCHUP_GRACE_MS = 90_000;
+
+export interface WebhookCfg {
+  url: string;
+  token: string;
+  fetcher?: typeof fetch;
+}
+
+export interface RunOneArgs {
+  db: Db;
+  def: CheckDef;
+  scheduledFor: Date;
+  logger: CheckLogger;
+  now: () => Date;
+  webhook: WebhookCfg | undefined;
+}
+
+export interface RunOneResult {
+  skipped: boolean;
+  notified: boolean;
+  status: CheckStatus | null;
+}
+
+export async function runOne(args: RunOneArgs): Promise<RunOneResult> {
+  const id = await insertOrSkipRun({
+    db: args.db,
+    checkName: args.def.name,
+    scheduledFor: args.scheduledFor,
+    notifyChannel: args.def.notify,
+  });
+  if (id === null) {
+    return { skipped: true, notified: false, status: null };
+  }
+
+  const start = args.now().getTime();
+  let result: CheckResult;
+  let errorText: string | null = null;
+
+  const ctx: CheckCtx = {
+    db: args.db,
+    fs: await import("node:fs/promises"),
+    now: args.now,
+    logger: args.logger,
+  };
+
+  try {
+    result = await args.def.run(ctx);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    errorText = msg;
+    result = { status: "error", findings: 0, payload: { error: msg }, summary: `error: ${msg}` };
+  }
+
+  const previousStatus = await computePreviousStatus({ db: args.db, checkName: args.def.name, currentId: id });
+  const willNotify = shouldNotify({
+    channel: args.def.notify,
+    thresholdSeverity: args.def.thresholdSeverity,
+    currentStatus: result.status,
+    previousStatus,
+    findings: result.findings,
+  });
+
+  let notified = false;
+  if (willNotify && args.webhook) {
+    const isCatchUp = args.now().getTime() - args.scheduledFor.getTime() > CATCHUP_GRACE_MS;
+    const baseSummary = isCatchUp ? `${result.summary} (catch-up)` : result.summary;
+    const summary = buildSummary({ original: baseSummary, previousStatus, currentStatus: result.status });
+    const examples = Array.isArray((result.payload as { examples?: unknown }).examples)
+      ? ((result.payload as { examples: unknown[] }).examples.map((x) => String(x)))
+      : [];
+    const hash = computeContentHash({ summary, findings: result.findings, examples });
+    const payload: WebhookPayload = {
+      check: args.def.name,
+      status: result.status,
+      previous_status: previousStatus,
+      findings: result.findings,
+      summary,
+      content_hash: hash,
+      scheduled_for: args.scheduledFor.toISOString(),
+      details_hint: `paperclip checks history ${args.def.name} --limit 1`,
+    };
+    notified = await postWebhook({
+      url: args.webhook.url,
+      token: args.webhook.token,
+      fetcher: args.webhook.fetcher,
+      payload,
+      logger: args.logger,
+    });
+  }
+
+  await args.db
+    .update(routineCheckRuns)
+    .set({
+      status: result.status,
+      findings: result.findings,
+      payloadJson: result.payload,
+      durationMs: args.now().getTime() - start,
+      errorText,
+      notified,
+    })
+    .where(eq(routineCheckRuns.id, id));
+
+  return { skipped: false, notified, status: result.status };
 }
