@@ -52,9 +52,21 @@ export interface ContentHashInput {
   examples: string[];
 }
 
+/**
+ * Canonical content hash for webhook dedupe.
+ *
+ * Format: sha256-<32 hex> over the byte string
+ *   summary + 0x1F + findings + 0x1F + (top-3 examples joined with 0x1E)
+ *
+ * The Hermes-side dedupe layer reproduces this format. Any change here MUST
+ * be coordinated with hermes/gateway/paperclip_notify.py — otherwise dedupe
+ * stops matching.
+ */
 export function computeContentHash(i: ContentHashInput): string {
-  const top3 = i.examples.slice(0, 3).join("|");
-  const raw = `${i.summary} ${i.findings} ${top3}`;
+  const SEP = "\x1F";        // ASCII Unit Separator — between fields
+  const ITEM_SEP = "\x1E";   // ASCII Record Separator — between examples
+  const top3 = i.examples.slice(0, 3).join(ITEM_SEP);
+  const raw = `${i.summary}${SEP}${String(i.findings)}${SEP}${top3}`;
   return `sha256-${createHash("sha256").update(raw).digest("hex").slice(0, 32)}`;
 }
 

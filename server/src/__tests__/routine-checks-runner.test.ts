@@ -165,17 +165,32 @@ describeDb("runOne", () => {
     expect(rows[0]!.notified).toBe(false);
   });
 
-  it("appends (catch-up) suffix when scheduledFor is older than 90s before now", async () => {
+  it("appends (catch-up) suffix when isCatchUp:true is passed", async () => {
     const def: CheckDef = { name: "demo", schedule: "*/5 * * * *", notify: "telegram", run: async () => ({ status: "warn", findings: 1, payload: {}, summary: "msg" }) };
     const posts: any[] = [];
     await runOne({
       db, def,
       scheduledFor: new Date("2026-04-30T09:00:00Z"),
       logger: noopLogger,
-      now: () => new Date("2026-04-30T09:30:00Z"), // 30 min later — clear catch-up
+      now: () => new Date("2026-04-30T09:00:30Z"),
+      isCatchUp: true,
       webhook: { url: "http://x", token: "t", fetcher: async (_u, init) => { posts.push(JSON.parse(String(init!.body))); return new Response("{}", { status: 200 }); } },
     });
     expect(posts[0].summary).toMatch(/\(catch-up\)/);
+  });
+
+  it("does NOT append (catch-up) suffix when isCatchUp is omitted/false", async () => {
+    const def: CheckDef = { name: "demo", schedule: "*/5 * * * *", notify: "telegram", run: async () => ({ status: "warn", findings: 1, payload: {}, summary: "msg" }) };
+    const posts: any[] = [];
+    await runOne({
+      db, def,
+      scheduledFor: new Date("2026-04-30T09:00:00Z"),
+      logger: noopLogger,
+      now: () => new Date("2026-04-30T10:00:00Z"), // 1 hour later — would have triggered old heuristic
+      webhook: { url: "http://x", token: "t", fetcher: async (_u, init) => { posts.push(JSON.parse(String(init!.body))); return new Response("{}", { status: 200 }); } },
+    });
+    expect(posts[0].summary).not.toMatch(/\(catch-up\)/);
+    expect(posts[0].summary).toBe("msg");
   });
 });
 
@@ -218,6 +233,30 @@ describeDb("catchUpAll", () => {
     });
     await catchUpAll({ db, registry: reg, now: () => new Date("2026-04-30T09:30:00Z"), logger: noopLogger, webhook: undefined });
     expect(called).toBe(0);
+  });
+
+  it("catchUpAll passes isCatchUp:true to runOne (catch-up suffix in webhook)", async () => {
+    const reg = new Registry();
+    reg.register({
+      name: "demo",
+      schedule: "0 * * * *",
+      notify: "telegram",
+      run: async () => ({ status: "warn", findings: 2, payload: {}, summary: "msg" }),
+    });
+    const posts: any[] = [];
+    await catchUpAll({
+      db,
+      registry: reg,
+      now: () => new Date("2026-04-30T09:30:00Z"),
+      logger: noopLogger,
+      webhook: {
+        url: "http://x",
+        token: "t",
+        fetcher: async (_u, init) => { posts.push(JSON.parse(String(init!.body))); return new Response("{}", { status: 200 }); },
+      },
+    });
+    expect(posts).toHaveLength(1);
+    expect(posts[0].summary).toMatch(/\(catch-up\)/);
   });
 });
 

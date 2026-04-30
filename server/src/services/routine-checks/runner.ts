@@ -42,8 +42,6 @@ export async function insertOrSkipRun(args: {
   return rows[0]?.id ?? null;
 }
 
-const CATCHUP_GRACE_MS = 90_000;
-
 export interface WebhookCfg {
   url: string;
   token: string;
@@ -57,6 +55,12 @@ export interface RunOneArgs {
   logger: CheckLogger;
   now: () => Date;
   webhook: WebhookCfg | undefined;
+  /**
+   * Explicit catch-up flag. When true, the dispatcher appends a "(catch-up)"
+   * suffix to the webhook summary. Defaults to false. Set this from
+   * catchUpAll; tickAll should leave it unset.
+   */
+  isCatchUp?: boolean;
 }
 
 export interface RunOneResult {
@@ -106,7 +110,7 @@ export async function runOne(args: RunOneArgs): Promise<RunOneResult> {
 
   let notified = false;
   if (willNotify && args.webhook) {
-    const isCatchUp = args.now().getTime() - args.scheduledFor.getTime() > CATCHUP_GRACE_MS;
+    const isCatchUp = args.isCatchUp ?? false;
     const baseSummary = isCatchUp ? `${result.summary} (catch-up)` : result.summary;
     const summary = buildSummary({ original: baseSummary, previousStatus, currentStatus: result.status });
     const examples = Array.isArray((result.payload as { examples?: unknown }).examples)
@@ -171,7 +175,8 @@ export async function catchUpAll(args: OrchestrationArgs): Promise<void> {
 
     if (lastSlot.getTime() > lastRecorded) {
       args.logger.info({ check: def.name, slot: lastSlot.toISOString() }, "catch-up running missed slot");
-      await runOne({ db: args.db, def, scheduledFor: lastSlot, logger: args.logger, now: args.now, webhook: args.webhook });
+      // Pass isCatchUp:true so the dispatcher emits the (catch-up) suffix in summary.
+      await runOne({ db: args.db, def, scheduledFor: lastSlot, logger: args.logger, now: args.now, webhook: args.webhook, isCatchUp: true });
     }
   }
 }
