@@ -1,7 +1,9 @@
 import { sql } from "drizzle-orm";
 import type { CheckCtx, CheckDef, CheckResult } from "../types.js";
 
-const PREFIX = "/Users/marco/.openclaw/workspace";
+function getPrefix(): string {
+  return process.env.OPENCLAW_WORKSPACE_PREFIX ?? "/Users/marco/.openclaw/workspace";
+}
 const LOCAL_ADAPTERS = ["claude_local", "codex_local", "hermes_local"] as const;
 const COMPANIES = ["HAPPYGANG", "Casa Marco"] as const;
 
@@ -14,7 +16,8 @@ interface CompanyDrift {
 }
 
 async function run(ctx: CheckCtx): Promise<CheckResult> {
-  const prefixLike = `${PREFIX}%`;
+  const prefix = getPrefix();
+  const prefixLike = `${prefix}%`;
 
   const companyNamesList = sql.join(
     COMPANIES.map((v) => sql`${v}`),
@@ -114,7 +117,7 @@ async function run(ctx: CheckCtx): Promise<CheckResult> {
   return {
     status,
     findings,
-    payload: { companies: drifts, examples },
+    payload: { companies: drifts, examples: examples.slice(0, 3) },
     summary: findings > 0 ? `Drift: ${summary}` : `clean: ${summary}`,
   };
 }

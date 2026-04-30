@@ -200,6 +200,18 @@ describeDb("workspace-drift-guard", () => {
     expect(happyRow?.run_event_context_cwd_outside_24h).toBe(1);
   });
 
+  it("caps global examples array at 3", async () => {
+    const { happy, casa } = await seedHappyAndCasa();
+    await db.insert(executionWorkspaces).values([
+      { companyId: happy.companyId, projectId: happy.projectId, mode: "isolated", strategyType: "branch", name: "h-drift-1", status: "active", cwd: "/tmp/h1" },
+      { companyId: happy.companyId, projectId: happy.projectId, mode: "isolated", strategyType: "branch", name: "h-drift-2", status: "active", cwd: "/tmp/h2" },
+      { companyId: casa.companyId,  projectId: casa.projectId,  mode: "isolated", strategyType: "branch", name: "c-drift-1", status: "active", cwd: "/tmp/c1" },
+      { companyId: casa.companyId,  projectId: casa.projectId,  mode: "isolated", strategyType: "branch", name: "c-drift-2", status: "active", cwd: "/tmp/c2" },
+    ]);
+    const r = await workspaceDriftGuard.run({ db, fs: fsStub, logger: noopLogger, now: () => new Date() });
+    expect((r.payload as { examples: string[] }).examples.length).toBeLessThanOrEqual(3);
+  });
+
   it("aggregates summary string correctly", async () => {
     const { happy } = await seedHappyAndCasa();
     await db.insert(agents).values({
