@@ -28,6 +28,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { startRoutineChecks } from "./services/routine-checks/boot.js";
 import {
   feedbackService,
   heartbeatService,
@@ -695,6 +696,13 @@ export async function startServer(): Promise<StartedServer> {
     }, backupIntervalMs);
   }
   
+  // Routine checks: opt-in via PAPERCLIP_ROUTINE_CHECKS=1.
+  // Performs an initial catch-up for missed slots and then ticks every minute.
+  const routineChecks = await startRoutineChecks({ db, logger }).catch((err) => {
+    logger.error({ err }, "routine-checks: startRoutineChecks failed");
+    return null;
+  });
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -764,6 +772,8 @@ export async function startServer(): Promise<StartedServer> {
   
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      routineChecks?.stop();
+
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
         telemetryClient.stop();
