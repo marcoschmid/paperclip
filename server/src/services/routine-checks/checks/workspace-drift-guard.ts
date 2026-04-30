@@ -124,7 +124,10 @@ async function run(ctx: CheckCtx): Promise<CheckResult> {
 
 export const workspaceDriftGuard: CheckDef = {
   name: "workspace-drift-guard",
-  schedule: "0 9,18,22 * * *",
+  // Cron interpreted UTC. 07/16/20 UTC = 09/18/22 CEST, matching the
+  // legacy Hermes-local-time slots Marco's daily routines are tuned to.
+  // DST: in CET (winter) shifts to 08/17/21 local; deemed acceptable.
+  schedule: "0 7,16,20 * * *",
   notify: "threshold",
   thresholdSeverity: "warn",
   run,

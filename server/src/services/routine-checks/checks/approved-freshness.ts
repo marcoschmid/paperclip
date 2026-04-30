@@ -92,7 +92,10 @@ async function run(ctx: CheckCtx): Promise<CheckResult> {
 
 export const approvedFreshness: CheckDef = {
   name: "approved-freshness",
-  schedule: "0 7 * * 1",
+  // Cron interpreted UTC. 05 UTC Mon = 07:00 CEST Mon, matching the
+  // legacy Hermes-local-time slot. DST: in CET (winter) shifts to
+  // 06:00 local; deemed acceptable.
+  schedule: "0 5 * * 1",
   notify: "threshold",
   thresholdSeverity: "warn",
   run,
