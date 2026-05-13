@@ -765,6 +765,14 @@ export const ISSUE_RUNS_WATCHDOG_SMOKE_INTERVAL_SECONDS = 30;
 export const ISSUE_RUNS_EXECUTORS = ["hermes", "mc-dispatch"] as const;
 export type IssueRunExecutor = (typeof ISSUE_RUNS_EXECUTORS)[number];
 
+/**
+ * agents.executor — Phase-4 4b-1 privilege-matrix principal selection.
+ * Currently identical to ISSUE_RUNS_EXECUTORS by design (run.executor mirrors agent.executor).
+ */
+export const AGENT_EXECUTORS = ISSUE_RUNS_EXECUTORS;
+export type AgentExecutor = IssueRunExecutor;
+export const AGENT_EXECUTOR_DEFAULT: AgentExecutor = "mc-dispatch";
+
 export const ISSUE_RUNS_STATUSES = ["running", "completed", "failed", "failed_lease_expired"] as const;
 export type IssueRunStatus = (typeof ISSUE_RUNS_STATUSES)[number];
 

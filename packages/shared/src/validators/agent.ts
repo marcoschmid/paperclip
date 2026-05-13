@@ -1,5 +1,7 @@
 import { z } from "zod";
 import {
+  AGENT_EXECUTORS,
+  AGENT_EXECUTOR_DEFAULT,
   AGENT_ICON_NAMES,
   AGENT_ROLES,
   AGENT_STATUSES,
@@ -7,6 +9,8 @@ import {
 } from "../constants.js";
 import { agentAdapterTypeSchema } from "../adapter-type.js";
 import { envConfigSchema } from "./secret.js";
+
+export const agentExecutorSchema = z.enum(AGENT_EXECUTORS);
 
 export const agentPermissionsSchema = z.object({
   canCreateAgents: z.boolean().optional().default(false),
@@ -58,6 +62,7 @@ export const createAgentSchema = z.object({
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.unknown()).optional().nullable(),
+  executor: agentExecutorSchema.optional().default(AGENT_EXECUTOR_DEFAULT),
 });
 
 export type CreateAgent = z.infer<typeof createAgentSchema>;
