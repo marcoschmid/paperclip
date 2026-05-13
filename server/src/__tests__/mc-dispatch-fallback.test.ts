@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { companies, createDb, issueRuns, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -153,7 +154,7 @@ describeEmbeddedPostgres("mc-dispatch-fallback service (Phase-4 4c-3 wave 1)", (
     expect(locks.length).toBe(0);
   });
 
-  it("recordDecision: rejects with hold_and_alert when dryRun=false (4c-2 pending)", async () => {
+  it("recordDecision: dryRun=false spawns issue_runs row with executor=mc-dispatch", async () => {
     await seedCompany();
     const issueId = await seedIssue();
     const svc = mcDispatchFallbackService(db);
@@ -166,8 +167,33 @@ describeEmbeddedPostgres("mc-dispatch-fallback service (Phase-4 4c-3 wave 1)", (
       reason: "hermes_down_2m",
       dryRun: false,
     });
-    expect(result.outcome).toBe("rejected-hold-and-alert");
-    expect(result.warnings.some((w) => w.includes("MC-spawn integration not yet wired"))).toBe(true);
+    expect(result.outcome).toBe("accepted-spawned");
+    expect(result.issueRunId).toBeTruthy();
+
+    const rows = await db.select().from(issueRuns).where(eq(issueRuns.issueId, issueId));
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.executor).toBe("mc-dispatch");
+    expect(rows[0]?.leaseOwner).toBe("mc-dispatch-fallback@hermes");
+    expect(rows[0]?.resultSummary).toContain("fallback_from=hermes");
+    expect(rows[0]?.resultSummary).toContain("reason=hermes_down_2m");
+  });
+
+  it("recordDecision: dryRun=false races returns rejected-lock-active", async () => {
+    await seedCompany();
+    const issueId = await seedIssue();
+    const existingRunId = await seedActiveLock(issueId);
+    const svc = mcDispatchFallbackService(db);
+
+    const result = await svc.recordDecision({
+      companyId,
+      issueId,
+      issueRunId: null,
+      fallbackFrom: "hermes",
+      reason: "hermes_down_2m",
+      dryRun: false,
+    });
+    expect(result.outcome).toBe("rejected-lock-active");
+    expect(result.issueRunId).toBe(existingRunId);
   });
 
   it("recordDecision: rejected-lock-active when active lock present", async () => {

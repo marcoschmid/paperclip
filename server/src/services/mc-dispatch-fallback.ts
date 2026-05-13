@@ -1,7 +1,10 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRuns, issues } from "@paperclipai/db";
-import type { McDispatchFallbackOutcome } from "@paperclipai/shared";
+import {
+  ISSUE_RUNS_LOCK_TTL_SECONDS,
+  type McDispatchFallbackOutcome,
+} from "@paperclipai/shared";
 import { notFound } from "../errors.js";
 
 /**
@@ -134,16 +137,45 @@ export function mcDispatchFallbackService(db: Db): McDispatchFallbackService {
           legacyTaskId: null,
           issueRunId: input.issueRunId,
           warnings: [
-            "Wave-1 stub: no MC-spawn invoked; activity-event-write deferred to 4c-2.",
+            "dry-run: no issue_runs row written; activity-event-write deferred to MC-spawn integration.",
           ],
         };
       }
 
-      warnings.push("MC-spawn integration not yet wired — falling back to hold_and_alert (4c-2 pending)");
+      const ownerToken = `mc-dispatch-fallback@${input.fallbackFrom}`;
+      const summaryMarker = `[fallback_from=${input.fallbackFrom} reason=${input.reason}]`;
+      const inserted = await db
+        .insert(issueRuns)
+        .values({
+          companyId: input.companyId,
+          issueId: input.issueId,
+          executor: "mc-dispatch",
+          leaseOwner: ownerToken,
+          leaseExpiresAt: sql`now() + (${ISSUE_RUNS_LOCK_TTL_SECONDS} || ' seconds')::interval`,
+          status: "running",
+          promptSnapshotPath: null,
+          resultSummary: summaryMarker,
+        })
+        .onConflictDoNothing({
+          target: issueRuns.issueId,
+          where: sql`${issueRuns.status} = 'running'`,
+        })
+        .returning({ runId: issueRuns.runId });
+
+      if (!inserted[0]) {
+        const existing = await fetchActiveLock(input.issueId);
+        return {
+          outcome: "rejected-lock-active" satisfies McDispatchFallbackOutcome,
+          legacyTaskId: null,
+          issueRunId: existing?.runId ?? null,
+          warnings: ["race: another lock acquired between evaluation and spawn"],
+        };
+      }
+
       return {
-        outcome: "rejected-hold-and-alert" satisfies McDispatchFallbackOutcome,
+        outcome: "accepted-spawned" satisfies McDispatchFallbackOutcome,
         legacyTaskId: null,
-        issueRunId: input.issueRunId,
+        issueRunId: inserted[0].runId,
         warnings,
       };
     },
