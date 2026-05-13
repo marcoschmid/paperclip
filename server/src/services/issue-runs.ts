@@ -105,7 +105,10 @@ export function issueRunsService(db: Db): IssueRunsService {
           status: "running",
           promptSnapshotPath: input.promptSnapshotPath ?? null,
         })
-        .onConflictDoNothing({ target: issueRuns.issueId })
+        .onConflictDoNothing({
+          target: issueRuns.issueId,
+          where: sql`${issueRuns.status} = 'running'`,
+        })
         .returning();
 
       if (inserted[0]) {
