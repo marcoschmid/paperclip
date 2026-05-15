@@ -132,6 +132,17 @@ function nextCronTickInTimeZone(expression: string, timeZone: string, after: Dat
   return null;
 }
 
+// Truncate microseconds to milliseconds for safe optimistic-lock comparison.
+// PostgreSQL TIMESTAMPTZ has microsecond precision; JS Date has only millisecond
+// precision. If a value with µs precision lands in next_run_at (e.g. via PG
+// now() defaulted elsewhere), the scheduler-tick optimistic-lock
+// WHERE eq(nextRunAt, jsDate) fails because jsDate is ms-truncated but DB
+// keeps µs, leaving the trigger stuck. Always store ms-only values from JS.
+function truncateDateToMs(date: Date | null | undefined): Date | null | undefined {
+  if (date === null || date === undefined) return date;
+  return new Date(date.getTime());
+}
+
 function nextResultText(status: string, issueId?: string | null) {
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
   if (status === "coalesced") return "Coalesced into an existing live execution issue";
@@ -583,7 +594,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
         .set({
           lastFiredAt: input.triggeredAt,
           lastResult: nextResultText(input.status, input.issueId),
-          nextRunAt: input.nextRunAt === undefined ? undefined : input.nextRunAt,
+          nextRunAt: input.nextRunAt === undefined ? undefined : truncateDateToMs(input.nextRunAt),
           updatedAt: new Date(),
         })
         .where(eq(routineTriggers.id, input.triggerId));
@@ -1163,7 +1174,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
           enabled: input.enabled ?? true,
           cronExpression: input.kind === "schedule" ? input.cronExpression : null,
           timezone: input.kind === "schedule" ? (input.timezone || "UTC") : null,
-          nextRunAt,
+          nextRunAt: truncateDateToMs(nextRunAt),
           publicId,
           secretId,
           signingMode: input.kind === "webhook" ? input.signingMode : null,
@@ -1219,7 +1230,7 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
           enabled: patch.enabled ?? existing.enabled,
           cronExpression,
           timezone,
-          nextRunAt,
+          nextRunAt: truncateDateToMs(nextRunAt),
           signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
           replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
           updatedByAgentId: actor.agentId ?? null,
@@ -1494,14 +1505,17 @@ export function routineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeup
         const claimed = await db
           .update(routineTriggers)
           .set({
-            nextRunAt: claimedNextRunAt,
+            nextRunAt: truncateDateToMs(claimedNextRunAt),
             updatedAt: new Date(),
           })
           .where(
             and(
               eq(routineTriggers.id, row.trigger.id),
               eq(routineTriggers.enabled, true),
-              eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
+              // Tolerance compare: DB may have µs-precision values from upstream
+              // PG-now()/defaults; JS Date is ms-precision only. Truncate both
+              // sides to ms for the optimistic-lock equality.
+              sql`date_trunc('milliseconds', ${routineTriggers.nextRunAt}) = date_trunc('milliseconds', ${row.trigger.nextRunAt}::timestamptz)`,
             ),
           )
           .returning({ id: routineTriggers.id })
