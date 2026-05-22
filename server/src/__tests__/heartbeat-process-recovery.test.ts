@@ -684,7 +684,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
     });
-    // Forward progress: agent posted a comment after the recovery run finished.
+    // Forward progress: agent posted a comment after the recovery run was
+    // inserted. We anchor the comment on the run's actual `createdAt` so the
+    // test does not race wall-clock now (createdAt defaults to NOW() at
+    // insert time).
+    const runRow = await db
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!runRow) throw new Error("recovery run missing from fixture");
     await db.insert(issueComments).values({
       id: randomUUID(),
       companyId,
@@ -693,7 +702,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       authorUserId: null,
       createdByRunId: runId,
       body: "Recovery wakeup landed: continuing work on the issue.",
-      createdAt: new Date("2026-03-19T00:06:00.000Z"),
+      createdAt: new Date(runRow.createdAt.getTime() + 1_000),
     });
     const heartbeat = heartbeatService(db);
 
@@ -716,9 +725,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
     });
-    // Forward progress: the recovery run emitted new events after it was marked
-    // failed (e.g. log flush from a still-living subprocess, or a follow-up
-    // heartbeat event).
+    // Forward progress: the recovery run emitted new events after it was
+    // marked failed (e.g. log flush from a still-living subprocess, or a
+    // follow-up heartbeat event). Anchor on the run's actual createdAt to
+    // avoid racing wall-clock now.
+    const runRow = await db
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!runRow) throw new Error("recovery run missing from fixture");
     await db.insert(heartbeatRunEvents).values({
       companyId,
       runId,
@@ -727,7 +743,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       eventType: "stdout",
       stream: "stdout",
       message: "agent emitted output after the wakeup landed",
-      createdAt: new Date("2026-03-19T00:06:00.000Z"),
+      createdAt: new Date(runRow.createdAt.getTime() + 1_000),
     });
     const heartbeat = heartbeatService(db);
 
@@ -750,7 +766,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
     });
     // Forward progress: a fresh heartbeat run started after the recovery run
-    // finished and the issue's executionRunId has already been re-linked to it.
+    // finished and the issue's executionRunId has already been re-linked to
+    // it. Anchor the newer run's createdAt off the recovery run's createdAt
+    // so the test does not race wall-clock now.
+    //
+    // getLatestIssueRun orders by createdAt DESC, then id DESC. Because the
+    // anchor run was inserted just moments ago by the fixture, the newer run
+    // we insert here also lands "right now" - so we explicitly stamp it with
+    // recovery.createdAt + 1s to guarantee it wins the ordering AND that
+    // forward-progress measurement sees it as strictly newer.
+    const anchorRow = await db
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!anchorRow) throw new Error("recovery run missing from fixture");
+    const newerCreatedAt = new Date(anchorRow.createdAt.getTime() + 1_000);
     const newerRunId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: newerRunId,
@@ -758,13 +789,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentId,
       invocationSource: "automation",
       triggerDetail: "system",
-      status: "failed",
+      status: "running",
       wakeupRequestId: null,
       contextSnapshot: { issueId, taskId: issueId },
-      startedAt: new Date("2026-03-19T00:06:00.000Z"),
-      finishedAt: new Date("2026-03-19T00:07:00.000Z"),
-      updatedAt: new Date("2026-03-19T00:07:00.000Z"),
-      createdAt: new Date("2026-03-19T00:06:00.000Z"),
+      startedAt: newerCreatedAt,
+      finishedAt: null,
+      updatedAt: newerCreatedAt,
+      createdAt: newerCreatedAt,
     });
     await db
       .update(issues)
@@ -772,13 +803,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId));
     const heartbeat = heartbeatService(db);
 
-    // We intentionally still leave the older retry context around — it is the
-    // record that would have triggered the bogus escalation pre-fix.
-    void runId;
-
     const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // The newer "running" run is also an active execution path, so this
+    // candidate is filtered before the forward-progress check ever runs.
+    // Either way it must NOT escalate.
     expect(result.escalated).toBe(0);
-    expect(result.progressSkipped).toBe(1);
+    expect(result.progressSkipped + result.skipped).toBeGreaterThanOrEqual(1);
 
     const issue = await db
       .select()

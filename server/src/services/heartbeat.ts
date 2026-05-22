@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -2955,6 +2955,86 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
+  // TEC-123: detect forward progress for the stranded-issue recovery path.
+  //
+  // The naive reconciler used to escalate any in_progress issue whose latest
+  // recovery run had status=failed and retryReason=issue_continuation_needed.
+  // That was incorrect: a wakeup request can succeed and produce real work
+  // (new comments, new heartbeat run events, a fresher executionRunId) even
+  // when the originating recovery run is recorded as failed (e.g. an adapter
+  // crashed at exit but the workspace already advanced). Escalating those
+  // issues to "blocked" silently drops live work onto a human queue.
+  //
+  // We treat any of the following as forward progress AFTER the recovery run:
+  //   - new issue comments on the issue created after the recovery run started
+  //   - new heartbeat_run_events created after the recovery run started
+  //   - the issue's executionRunId pointing at a row whose createdAt is newer
+  //     than the recovery run we're inspecting
+  // If we cannot identify a recovery anchor (no latestRun), we fall back to
+  // "no progress detected" so existing behaviour is preserved.
+  async function hasForwardProgressSinceRecovery(input: {
+    companyId: string;
+    issueId: string;
+    latestRun: Pick<typeof heartbeatRuns.$inferSelect, "id"> | null;
+  }): Promise<boolean> {
+    if (!input.latestRun) return false;
+    const runId = input.latestRun.id;
+
+    const runRow = await db
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!runRow) return false;
+    const anchor = runRow.createdAt;
+
+    const [commentRow, eventRow, newerRunRow] = await Promise.all([
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, input.issueId),
+            gt(issueComments.createdAt, anchor),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.companyId, input.companyId),
+            eq(heartbeatRunEvents.runId, runId),
+            gt(heartbeatRunEvents.createdAt, anchor),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+            // Exclude the anchor run itself. Postgres timestamptz keeps
+            // microsecond precision, but the JS Date round-trip drops it,
+            // so a naive `created_at > anchor` will sometimes match the same
+            // row.
+            ne(heartbeatRuns.id, runId),
+            gt(heartbeatRuns.createdAt, anchor),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    return Boolean(commentRow || eventRow || newerRunRow);
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
@@ -2964,6 +3044,26 @@ export function heartbeatService(db: Db) {
     > | null;
     comment: string;
   }) {
+    // TEC-123: row-lock the issue and re-check the invariants that made it a
+    // candidate before flipping it to blocked. The candidate scan in
+    // reconcileStrandedAssignedIssues() is not atomic with this update, so a
+    // concurrent transition (assignment change, manual status flip, a wakeup
+    // that just promoted in_progress→done) could otherwise be silently lost.
+    const guarded = await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${input.issue.id} for update`);
+      const current = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .then((rows) => rows[0] ?? null);
+      if (!current) return null;
+      if (current.status !== input.previousStatus) return null;
+      if (current.assigneeUserId) return null;
+      if (current.assigneeAgentId !== input.issue.assigneeAgentId) return null;
+      return current;
+    });
+    if (!guarded) return null;
+
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
     });
@@ -3010,6 +3110,11 @@ export function heartbeatService(db: Db) {
       dispatchRequeued: 0,
       continuationRequeued: 0,
       escalated: 0,
+      // TEC-123: bumped when an issue was on the escalation path but had
+      // forward progress since the last recovery run. We deliberately treat
+      // this separately from `skipped` so observability can distinguish
+      // "had progress, keep waiting" from "filtered out for other reasons".
+      progressSkipped: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -3047,6 +3152,18 @@ export function heartbeatService(db: Db) {
         }
 
         if (latestRetryReason === "assignment_recovery") {
+          // TEC-123: respect forward progress made by the recovery wakeup
+          // even if its host run is recorded as failed.
+          if (
+            await hasForwardProgressSinceRecovery({
+              companyId: issue.companyId,
+              issueId: issue.id,
+              latestRun,
+            })
+          ) {
+            result.progressSkipped += 1;
+            continue;
+          }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -3084,6 +3201,20 @@ export function heartbeatService(db: Db) {
       }
 
       if (latestRetryReason === "issue_continuation_needed") {
+        // TEC-123: continuation recovery is the original hot-spot. If new
+        // work landed since the recovery run (comments, run events, fresher
+        // executionRunId), the issue is genuinely making progress and must
+        // not be silently moved to `blocked`.
+        if (
+          await hasForwardProgressSinceRecovery({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            latestRun,
+          })
+        ) {
+          result.progressSkipped += 1;
+          continue;
+        }
         const failureSummary = summarizeRunFailureForIssueComment(latestRun);
         const updated = await escalateStrandedAssignedIssue({
           issue,
