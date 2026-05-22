@@ -670,4 +670,152 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
   });
+
+  // TEC-123: forward-progress + TOCTOU guard for stranded in_progress recovery.
+  // Bug: reconcileStrandedAssignedIssues escalated in_progress issues to "blocked"
+  // even when the prior continuation_recovery produced new forward progress
+  // (new comments, new heartbeat run events, or a fresher executionRunId), and
+  // it did not row-lock the issue, so a concurrent state change between the
+  // hasActiveExecutionPath() check and the issue update could be silently
+  // overwritten. See projects/paperclip/.../runbooks for the diagnose.
+  it("skips escalation when a new issue comment landed after the failed continuation recovery", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    // Forward progress: agent posted a comment after the recovery run finished.
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorUserId: null,
+      createdByRunId: runId,
+      body: "Recovery wakeup landed: continuing work on the issue.",
+      createdAt: new Date("2026-03-19T00:06:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.progressSkipped).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("skips escalation when new heartbeat run events arrived after the failed continuation recovery", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    // Forward progress: the recovery run emitted new events after it was marked
+    // failed (e.g. log flush from a still-living subprocess, or a follow-up
+    // heartbeat event).
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId,
+      agentId,
+      seq: 1,
+      eventType: "stdout",
+      stream: "stdout",
+      message: "agent emitted output after the wakeup landed",
+      createdAt: new Date("2026-03-19T00:06:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.progressSkipped).toBe(1);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("skips escalation when the issue executionRunId now points at a newer heartbeat run", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    // Forward progress: a fresh heartbeat run started after the recovery run
+    // finished and the issue's executionRunId has already been re-linked to it.
+    const newerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: newerRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      wakeupRequestId: null,
+      contextSnapshot: { issueId, taskId: issueId },
+      startedAt: new Date("2026-03-19T00:06:00.000Z"),
+      finishedAt: new Date("2026-03-19T00:07:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:07:00.000Z"),
+      createdAt: new Date("2026-03-19T00:06:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: newerRunId, checkoutRunId: newerRunId, updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    // We intentionally still leave the older retry context around — it is the
+    // record that would have triggered the bogus escalation pre-fix.
+    void runId;
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.progressSkipped).toBe(1);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("does not double-escalate stranded in_progress work if the reconciler runs again immediately", async () => {
+    // After a single reconcile-call escalated the issue from in_progress to
+    // blocked, a re-run must not escalate again. The candidate filter does
+    // most of the work here, but the conditional update guard inside the
+    // escalation path is the safety belt for any future scheduler that loops
+    // over a stale candidate snapshot.
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.escalated).toBe(1);
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.escalated).toBe(0);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    // Only one escalation comment should ever have been written.
+    expect(comments).toHaveLength(1);
+  });
 });
