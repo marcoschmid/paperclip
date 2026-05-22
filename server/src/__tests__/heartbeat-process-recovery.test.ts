@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -719,16 +719,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("in_progress");
   });
 
-  it("skips escalation when new heartbeat run events arrived after the failed continuation recovery", async () => {
+  // TEC-123 round-2 update of an obsolete round-1 test:
+  // Originally this test treated raw heartbeat_run_events rows as forward
+  // progress. Codex adversarial review (round-2) showed that lifecycle/error
+  // rows are emitted by the reaper itself on EVERY failed continuation retry,
+  // so using raw events as a signal hides genuinely stranded issues forever.
+  // After round-2 the only forward-progress signals are issue-visible events:
+  // new issueComments, or a strictly newer heartbeat_runs row for the same
+  // issue. A lone stdout event from the dead recovery run is NOT enough.
+  it("still escalates when only stdout-style heartbeat_run_events landed after the failed continuation recovery", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
     });
-    // Forward progress: the recovery run emitted new events after it was
-    // marked failed (e.g. log flush from a still-living subprocess, or a
-    // follow-up heartbeat event). Anchor on the run's actual createdAt to
-    // avoid racing wall-clock now.
     const runRow = await db
       .select({ createdAt: heartbeatRuns.createdAt })
       .from(heartbeatRuns)
@@ -748,15 +752,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.escalated).toBe(0);
-    expect(result.progressSkipped).toBe(1);
+    expect(result.progressSkipped).toBe(0);
+    expect(result.escalated).toBe(1);
 
     const issue = await db
       .select()
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("in_progress");
+    expect(issue?.status).toBe("blocked");
   });
 
   it("skips escalation when the issue executionRunId now points at a newer heartbeat run", async () => {
@@ -847,5 +851,206 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     // Only one escalation comment should ever have been written.
     expect(comments).toHaveLength(1);
+  });
+
+  // TEC-123 round-2, Finding 1 [HIGH]:
+  // hasForwardProgressSinceRecovery() must NOT treat raw heartbeat_run_events
+  // as forward progress. Lifecycle events (and error events) are emitted by the
+  // reaper/heartbeat machinery itself on EVERY failed continuation retry. When
+  // a continuation recovery run is marked failed, the reaper writes lifecycle
+  // rows (e.g. "Detached child process reported activity", error events from
+  // the failed exit). The old code saw any heartbeat_run_events row created
+  // after the anchor and falsely classified the candidate as "progressing",
+  // suppressing escalation forever. The correct signal is issue-visible
+  // progress: new issueComments, or a strictly newer heartbeat_runs row for
+  // the same issue.
+  it("escalates when only system-emitted lifecycle/error events exist after the failed continuation recovery", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    // Simulate the reaper writing lifecycle + error events for the failed run
+    // (this happens in production every time a continuation retry fails).
+    // These rows are NOT proof that the issue made visible progress.
+    const runRow = await db
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!runRow) throw new Error("recovery run missing from fixture");
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId,
+      agentId,
+      seq: 1,
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Run marked failed: process_lost",
+      createdAt: new Date(runRow.createdAt.getTime() + 1_000),
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId,
+      agentId,
+      seq: 2,
+      eventType: "error",
+      stream: "system",
+      level: "error",
+      message: "Adapter exited non-zero after wakeup",
+      createdAt: new Date(runRow.createdAt.getTime() + 1_100),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.progressSkipped).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+  });
+
+  // TEC-123 round-2, Finding 2 [HIGH]:
+  // escalateStrandedAssignedIssue() must perform the conditional UPDATE inside
+  // the same transaction that holds the SELECT FOR UPDATE row lock. The old
+  // code released the lock at COMMIT, then called issuesSvc.update() OUTSIDE
+  // the transaction — so a concurrent state change between commit and update
+  // could be silently overwritten to "blocked".
+  //
+  // We deterministically reproduce the race by spying on db.transaction:
+  // the first transaction completes, and we mutate the issue back to "todo"
+  // immediately after commit (simulating a concurrent reassignment, user
+  // intervention, or successful wakeup that landed in another connection).
+  // - Pre-fix: issuesSvc.update runs OUTSIDE the tx -> overwrites to "blocked".
+  // - Post-fix: the conditional UPDATE runs INSIDE the same tx that holds the
+  //   row lock, so no external mutation can land in the gap. The conditional
+  //   WHERE clause re-checks status==previousStatus so even if a race somehow
+  //   wins (different connection blocked on FOR UPDATE), the UPDATE refuses.
+  it("does not overwrite a concurrent status change that lands between the lock release and the issue update", async () => {
+    const { issueId, agentId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Wrap the FIRST transaction db opens during reconcile. With pre-fix code
+    // that is the guard-only transaction; after it commits and the lock is
+    // released, we mutate the issue to a fresh state. Then issuesSvc.update
+    // (still called externally in pre-fix code) overwrites it. With the post-
+    // fix code the FIRST transaction is the entire escalate flow, so by the
+    // time our mutation lands the conditional UPDATE has already happened
+    // atomically — but since we want to be order-agnostic, we also reset
+    // status to a non-blocked value AFTER the spied tx commits and assert the
+    // visible end-state matches the post-fix invariant.
+    const originalTransaction = db.transaction.bind(db);
+    let didMutate = false;
+    const spy = vi
+      .spyOn(db, "transaction")
+      .mockImplementationOnce(async (cb: any, opts?: any) => {
+        const result = await originalTransaction(cb, opts);
+        if (!didMutate) {
+          didMutate = true;
+          // Concurrent state change after the guard tx commits (pre-fix race
+          // window): another actor reassigned the issue back to todo.
+          await db
+            .update(issues)
+            .set({
+              status: "todo",
+              checkoutRunId: null,
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              startedAt: null,
+              assigneeAgentId: agentId,
+              updatedAt: new Date(),
+            })
+            .where(eq(issues.id, issueId));
+        }
+        return result;
+      });
+
+    try {
+      await heartbeat.reconcileStrandedAssignedIssues();
+    } finally {
+      spy.mockRestore();
+    }
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // Post-fix: the conditional UPDATE that flips to "blocked" must NOT win
+    // over the concurrent state change. The issue must NOT have been silently
+    // overwritten to "blocked" after a non-matching concurrent status.
+    expect(issue?.status).not.toBe("blocked");
+  });
+
+  // TEC-123 round-2, Finding 3 [MEDIUM]:
+  // node-postgres returns timestamptz as JS Date (millisecond precision), but
+  // Postgres keeps microsecond precision on the actual row. The old code read
+  // the anchor's createdAt into JS (ms-rounded) and compared event/comment/run
+  // createdAt against that ms-rounded value. PRE-anchor rows whose true PG
+  // timestamp lies in the same millisecond bucket as the anchor (but with
+  // smaller microseconds) wrongly pass `created_at > anchor_ms` because the
+  // PG-side comparison uses the ms-rounded literal.
+  //
+  // Example:
+  //   anchor PG timestamp:  2026-03-19 00:00:00.000999+00
+  //   sibling event PG ts:  2026-03-19 00:00:00.000500+00 (truly BEFORE anchor)
+  //   JS anchor in pre-fix: '2026-03-19 00:00:00.000+00'
+  //   PG sees: event(.000500) > '.000' -> TRUE -> wrong "forward progress"
+  //
+  // Fix: compare against the actual PG-side anchor (subquery on heartbeat_runs)
+  // so microsecond precision is preserved.
+  it("does not count pre-anchor sibling events that share the anchor's millisecond bucket as forward progress", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+
+    // Force microsecond-precise timestamps that JS Date cannot represent.
+    // Anchor runs at .000999, sibling event at .000500 (truly before anchor).
+    await db.execute(
+      sql`update ${heartbeatRuns} set created_at = '2026-03-19 00:00:00.000999+00'::timestamptz where id = ${runId}`,
+    );
+    // Insert a sibling heartbeat_run_event whose true PG createdAt is BEFORE
+    // the anchor but in the same millisecond bucket.
+    await db.execute(
+      sql`insert into ${heartbeatRunEvents} (company_id, run_id, agent_id, seq, event_type, stream, level, message, created_at)
+          values (${companyId}, ${runId}, ${agentId}, 1, 'stdout', 'stdout', 'info', 'sibling pre-anchor row', '2026-03-19 00:00:00.000500+00'::timestamptz)`,
+    );
+    // Also insert a pre-anchor comment in the same ms bucket to cover the
+    // comments arm of the forward-progress query.
+    const preCommentId = randomUUID();
+    await db.execute(
+      sql`insert into ${issueComments} (id, company_id, issue_id, author_agent_id, body, created_at)
+          values (${preCommentId}, ${companyId}, ${issueId}, ${agentId}, 'sibling pre-anchor comment', '2026-03-19 00:00:00.000400+00'::timestamptz)`,
+    );
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // None of the pre-anchor rows are real forward progress. Escalation must
+    // proceed (since lifecycle/error/raw events are also no longer signals
+    // after Finding 1's fix).
+    expect(result.progressSkipped).toBe(0);
+    expect(result.escalated).toBe(1);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
   });
 });
