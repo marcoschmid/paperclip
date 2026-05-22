@@ -2960,16 +2960,32 @@ export function heartbeatService(db: Db) {
   // The naive reconciler used to escalate any in_progress issue whose latest
   // recovery run had status=failed and retryReason=issue_continuation_needed.
   // That was incorrect: a wakeup request can succeed and produce real work
-  // (new comments, new heartbeat run events, a fresher executionRunId) even
-  // when the originating recovery run is recorded as failed (e.g. an adapter
+  // (new comments or a fresher heartbeat run for the same issue) even when
+  // the originating recovery run is recorded as failed (e.g. an adapter
   // crashed at exit but the workspace already advanced). Escalating those
   // issues to "blocked" silently drops live work onto a human queue.
   //
   // We treat any of the following as forward progress AFTER the recovery run:
-  //   - new issue comments on the issue created after the recovery run started
-  //   - new heartbeat_run_events created after the recovery run started
-  //   - the issue's executionRunId pointing at a row whose createdAt is newer
-  //     than the recovery run we're inspecting
+  //   - new issue comments on the issue created after the recovery run row
+  //   - a strictly newer heartbeat_runs row for the same issue
+  //
+  // Notes on signals we deliberately do NOT use:
+  //   - Raw heartbeat_run_events rows: the reaper itself writes lifecycle
+  //     and error events on every failed run, and adapters can emit stdout
+  //     long after the run is marked failed. Treating those as progress
+  //     hides genuinely stranded issues forever (Codex adversarial review,
+  //     round-2 finding #1). If we ever introduce a dedicated semantic
+  //     "issue-visible progress" event type, we can add it here behind a
+  //     whitelist; until then, raw events are not a reliable signal.
+  //
+  // Microsecond precision: node-postgres returns timestamptz as JS Date
+  // (millisecond precision), while Postgres stores microseconds. Comparing
+  // against a JS-rounded anchor lets pre-anchor rows in the same millisecond
+  // bucket pass `created_at > $anchor_ms`. To preserve precision, we anchor
+  // every comparison against a Postgres-side subquery that re-reads the
+  // anchor run's createdAt, so the comparison stays microsecond-accurate
+  // (Codex adversarial review, round-2 finding #3).
+  //
   // If we cannot identify a recovery anchor (no latestRun), we fall back to
   // "no progress detected" so existing behaviour is preserved.
   async function hasForwardProgressSinceRecovery(input: {
@@ -2980,35 +2996,23 @@ export function heartbeatService(db: Db) {
     if (!input.latestRun) return false;
     const runId = input.latestRun.id;
 
-    const runRow = await db
-      .select({ createdAt: heartbeatRuns.createdAt })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    if (!runRow) return false;
-    const anchor = runRow.createdAt;
+    // Subquery that yields the anchor run's createdAt at microsecond
+    // precision. Used as the right-hand side of every > comparison so we
+    // never round-trip through JS Date.
+    const anchorCreatedAt = sql<Date>`(
+      select ${heartbeatRuns.createdAt}
+      from ${heartbeatRuns}
+      where ${heartbeatRuns.id} = ${runId}
+    )`;
 
-    const [commentRow, eventRow, newerRunRow] = await Promise.all([
+    const [commentRow, newerRunRow] = await Promise.all([
       db
         .select({ id: issueComments.id })
         .from(issueComments)
         .where(
           and(
             eq(issueComments.issueId, input.issueId),
-            gt(issueComments.createdAt, anchor),
-          ),
-        )
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
-      db
-        .select({ id: heartbeatRunEvents.id })
-        .from(heartbeatRunEvents)
-        .where(
-          and(
-            eq(heartbeatRunEvents.companyId, input.companyId),
-            eq(heartbeatRunEvents.runId, runId),
-            gt(heartbeatRunEvents.createdAt, anchor),
+            sql`${issueComments.createdAt} > ${anchorCreatedAt}`,
           ),
         )
         .limit(1)
@@ -3020,19 +3024,15 @@ export function heartbeatService(db: Db) {
           and(
             eq(heartbeatRuns.companyId, input.companyId),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
-            // Exclude the anchor run itself. Postgres timestamptz keeps
-            // microsecond precision, but the JS Date round-trip drops it,
-            // so a naive `created_at > anchor` will sometimes match the same
-            // row.
             ne(heartbeatRuns.id, runId),
-            gt(heartbeatRuns.createdAt, anchor),
+            sql`${heartbeatRuns.createdAt} > ${anchorCreatedAt}`,
           ),
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
     ]);
 
-    return Boolean(commentRow || eventRow || newerRunRow);
+    return Boolean(commentRow || newerRunRow);
   }
 
   async function escalateStrandedAssignedIssue(input: {
@@ -3044,54 +3044,101 @@ export function heartbeatService(db: Db) {
     > | null;
     comment: string;
   }) {
-    // TEC-123: row-lock the issue and re-check the invariants that made it a
-    // candidate before flipping it to blocked. The candidate scan in
-    // reconcileStrandedAssignedIssues() is not atomic with this update, so a
-    // concurrent transition (assignment change, manual status flip, a wakeup
-    // that just promoted in_progress→done) could otherwise be silently lost.
-    const guarded = await db.transaction(async (tx) => {
+    // TEC-123 round-2: the entire escalate flow (row lock, invariant recheck,
+    // conditional status flip to "blocked", escalation comment, activity log)
+    // runs INSIDE a single transaction. The round-1 implementation released
+    // the FOR UPDATE lock at the guard tx COMMIT and then called
+    // issuesSvc.update() outside the lock, leaving a window in which a
+    // concurrent reassignment or successful late wakeup could be silently
+    // overwritten to "blocked".
+    //
+    // Inside the transaction we also use a conditional UPDATE keyed on
+    // (status == previousStatus AND assigneeAgentId unchanged AND
+    // assigneeUserId IS NULL AND executionRunId IS NULL) so even if a future
+    // refactor breaks the lock scope, the database refuses to flip an issue
+    // whose invariants no longer match.
+    //
+    // We deliberately do NOT call issuesSvc.update(id, data, tx) for the
+    // status flip: that helper rewrites checkoutRunId/executionRunId when
+    // status changes, which we want to preserve, and it does not support a
+    // conditional WHERE clause across multiple invariant columns.
+    const sentinelDate = new Date();
+    return db.transaction(async (tx) => {
       await tx.execute(sql`select id from issues where id = ${input.issue.id} for update`);
-      const current = await tx
-        .select()
-        .from(issues)
-        .where(eq(issues.id, input.issue.id))
-        .then((rows) => rows[0] ?? null);
-      if (!current) return null;
-      if (current.status !== input.previousStatus) return null;
-      if (current.assigneeUserId) return null;
-      if (current.assigneeAgentId !== input.issue.assigneeAgentId) return null;
-      return current;
+
+      // Conditional UPDATE: re-checks every invariant the candidate scan
+      // depended on. If a concurrent actor changed any of these between the
+      // candidate scan and our lock acquisition (impossible under the
+      // FOR UPDATE held above for the duration of this tx, but harmless as a
+      // belt-and-braces guard), the UPDATE returns zero rows and we abort.
+      const updatedRows = await tx
+        .update(issues)
+        .set({
+          status: "blocked",
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: sentinelDate,
+        })
+        .where(
+          and(
+            eq(issues.id, input.issue.id),
+            eq(issues.status, input.previousStatus),
+            eq(issues.assigneeAgentId, input.issue.assigneeAgentId as string),
+            isNull(issues.assigneeUserId),
+            isNull(issues.executionRunId),
+          ),
+        )
+        .returning();
+      const updated = updatedRows[0] ?? null;
+      if (!updated) return null;
+
+      // Escalation comment written inside the same tx. We mirror
+      // issueService.addComment()'s behaviour (companyId + redaction handled
+      // by the outer redactor at the actor boundary) but stay local to the
+      // transaction.
+      const generalSettings = await instanceSettings.getGeneral();
+      const redactedBody = redactCurrentUserText(input.comment, {
+        enabled: generalSettings.censorUsernameInLogs,
+      });
+      await tx.insert(issueComments).values({
+        companyId: input.issue.companyId,
+        issueId: input.issue.id,
+        authorAgentId: null,
+        authorUserId: null,
+        createdByRunId: null,
+        body: redactedBody,
+      });
+
+      // Activity-log row INSIDE the tx. logActivity() additionally fires
+      // publishLiveEvent + plugin-bus emissions; those are safe to run with a
+      // tx-bound db since they only push to in-memory listeners. The tx
+      // commit boundary is the next await point, so a rollback would leak
+      // exactly one phantom in-memory event — the same risk shape every
+      // other tx-scoped logActivity callsite carries.
+      await logActivity(tx as unknown as Db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: "blocked",
+          previousStatus: input.previousStatus,
+          source: "heartbeat.reconcile_stranded_assigned_issue",
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        },
+      });
+
+      return updated;
     });
-    if (!guarded) return null;
-
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-    });
-    if (!updated) return null;
-
-    await issuesSvc.addComment(input.issue.id, input.comment, {});
-
-    await logActivity(db, {
-      companyId: input.issue.companyId,
-      actorType: "system",
-      actorId: "system",
-      agentId: null,
-      runId: null,
-      action: "issue.updated",
-      entityType: "issue",
-      entityId: input.issue.id,
-      details: {
-        identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.previousStatus,
-        source: "heartbeat.reconcile_stranded_assigned_issue",
-        latestRunId: input.latestRun?.id ?? null,
-        latestRunStatus: input.latestRun?.status ?? null,
-        latestRunErrorCode: input.latestRun?.errorCode ?? null,
-      },
-    });
-
-    return updated;
   }
 
   async function reconcileStrandedAssignedIssues() {
