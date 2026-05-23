@@ -13,6 +13,26 @@ Before making changes, read in this order:
 
 1. `doc/GOAL.md`
 2. `doc/PRODUCT.md`
+
+## Output-Konventionen (Marco-Workspace)
+
+> **Source of Truth = Workspace.** `~/Desktop/Jarvis/` = jederzeit löschbare Kopie.
+> Spec: `~/.openclaw/workspace/CLAUDE.md` § Desktop-Output-Regel.
+> Layout seit 2026-05-22 Phase-2-Migration: 2-Bucket ASCII (`inbox/` + `exports/`), 6-Emoji-Buckets entfernt.
+
+Pflicht für alle Paperclip-Agents die Files für Marco erzeugen:
+
+1. **Schreibe immer zuerst** nach `~/.openclaw/workspace/projects/{slug-path}/{task-id}/output/`
+2. **Niemals direkt** nach `~/Desktop/` schreiben — PreToolUse-Hook blockt hart bei Writes in Jarvis/ außerhalb Allowlist
+3. Bei `output_class=public-deliverable`: zusätzlich `~/.openclaw/bin/jarvis-publish --path=projects/{slug-path} --task={id} [--class={class}]` aufrufen
+4. Tagge Output via `--class=`-Flag: `public-deliverable` (default → `exports/{slug-path}/{date}_{task}/`) | `draft` (→ `exports/{slug-path}/_drafts/{date}_{task}/`) | `screenshot` (→ `exports/{slug-path}/{date}_{task}/screenshots/`) | `internal` (kein Desktop-Copy)
+5. Marco's `~/Desktop/Jarvis/inbox/` ist **read-only** für Agents — nie reinschreiben (Janitor moved >14d nach `~/.openclaw/jarvis-cold/inbox/<YYYY-MM>/`)
+6. `.no-publish` Marker in `projects/{slug-path}/` blockt Publish (Opt-out)
+
+Legacy-Shim (deprecated, mappt auf `--path=projects/{slug}`): `jarvis-publish --slug=SLUG --task=ID`.
+
+Auto-Publish: bei `output_class=public-deliverable` wird per default exportiert. `.no-publish`-Marker im Slug-Dir oder `--class=internal` opted out. Externe Kommunikation/Asana/Mail bleibt Marco-Approval (`feedback_external_comms_approval`).
+
 3. `doc/SPEC-implementation.md`
 4. `doc/DEVELOPING.md`
 5. `doc/DATABASE.md`
@@ -123,9 +143,7 @@ pnpm test:release-smoke
 
 Run the browser suites only when your change touches them or when you are explicitly verifying CI/release flows.
 
-For normal issue work, run the smallest relevant verification first. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
-
-Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
+Run this full check before claiming done:
 
 ```sh
 pnpm -r typecheck
