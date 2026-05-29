@@ -8,6 +8,7 @@ import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { logActivity } from "../services/activity-log.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -194,6 +195,22 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       runId: runIdHeader || undefined,
       source: "agent_key",
     };
+
+    // Audit logging must never break authentication, so swallow any failure.
+    try {
+      await logActivity(db, {
+        companyId: key.companyId,
+        actorType: "agent",
+        actorId: key.agentId,
+        agentId: key.agentId,
+        action: "auth.agent_token_used",
+        entityType: "agent_api_key",
+        entityId: key.id,
+        details: { keyName: key.name, source: "agent_key" },
+      });
+    } catch (err) {
+      logger.warn({ err, keyId: key.id }, "Failed to log auth.agent_token_used activity");
+    }
 
     next();
   };
