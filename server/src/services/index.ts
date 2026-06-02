@@ -14,6 +14,7 @@ export {
 } from "./issue-continuation-summary.js";
 export { projectService } from "./projects.js";
 export { decisionService } from "./decisions.js";
+export { projectDocumentService } from "./project-documents.js";
 export {
   clampIssueListLimit,
   ISSUE_LIST_DEFAULT_LIMIT,
