@@ -18,6 +18,7 @@ import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
+import { logActivity } from "../services/activity-log.js";
 import { forbidden, unprocessable } from "../errors.js";
 
 function hashToken(token: string) {
@@ -368,6 +369,21 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       runId: runIdHeader || undefined,
       source: "agent_key",
     };
+
+    try {
+      await logActivity(db, {
+        companyId: key.companyId,
+        actorType: "agent",
+        actorId: key.agentId,
+        agentId: key.agentId,
+        action: "auth.agent_token_used",
+        entityType: "agent_api_key",
+        entityId: key.id,
+        details: { keyName: key.name, source: "agent_key" },
+      });
+    } catch (err) {
+      logger.warn({ err, keyId: key.id }, "Failed to log auth.agent_token_used activity");
+    }
 
     next();
   };
