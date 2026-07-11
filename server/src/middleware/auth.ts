@@ -21,6 +21,8 @@ import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compa
 import { logActivity } from "../services/activity-log.js";
 import { forbidden, unprocessable } from "../errors.js";
 
+const AGENT_TOKEN_ACTIVITY_INTERVAL_MS = 60 * 60 * 1000;
+
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
@@ -370,19 +372,23 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       source: "agent_key",
     };
 
-    try {
-      await logActivity(db, {
-        companyId: key.companyId,
-        actorType: "agent",
-        actorId: key.agentId,
-        agentId: key.agentId,
-        action: "auth.agent_token_used",
-        entityType: "agent_api_key",
-        entityId: key.id,
-        details: { keyName: key.name, source: "agent_key" },
-      });
-    } catch (err) {
-      logger.warn({ err, keyId: key.id }, "Failed to log auth.agent_token_used activity");
+    const shouldLogTokenActivity =
+      !key.lastUsedAt || Date.now() - key.lastUsedAt.getTime() >= AGENT_TOKEN_ACTIVITY_INTERVAL_MS;
+    if (shouldLogTokenActivity) {
+      try {
+        await logActivity(db, {
+          companyId: key.companyId,
+          actorType: "agent",
+          actorId: key.agentId,
+          agentId: key.agentId,
+          action: "auth.agent_token_used",
+          entityType: "agent_api_key",
+          entityId: key.id,
+          details: { keyName: key.name, source: "agent_key" },
+        });
+      } catch (err) {
+        logger.warn({ err, keyId: key.id }, "Failed to log auth.agent_token_used activity");
+      }
     }
 
     next();

@@ -110,6 +110,11 @@ describeEmbeddedPostgres("actorMiddleware agent API key activity logging", () =>
       source: "agent_key",
     });
 
+    const repeated = await request(buildApp())
+      .get("/actor")
+      .set("authorization", `Bearer ${token}`);
+    expect(repeated.status).toBe(200);
+
     const rows = await db.select().from(activityLog);
     const authEvents = rows.filter((row) => row.action === "auth.agent_token_used");
 
