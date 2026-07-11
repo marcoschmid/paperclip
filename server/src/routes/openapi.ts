@@ -125,6 +125,10 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
   issueGraphLivenessAutoRecoveryRequestSchema,
+  staleWakeupMaintenancePreviewRequestSchema,
+  staleWakeupMaintenanceRunRequestSchema,
+  staleWakeupMaintenancePreviewSchema,
+  staleWakeupMaintenanceRunSchema,
   // Resource memberships
   updateResourceMembershipSchema,
   // Document annotations
@@ -254,7 +258,17 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
   }
 
   if (typeName === "ZodArray") {
-    return { type: "array", items: zodToOpenApiSchema(unwrapped._def.type) };
+    const jsonSchema: JsonSchema = {
+      type: "array",
+      items: zodToOpenApiSchema(unwrapped._def.type),
+    };
+    if (unwrapped._def.minLength?.value !== undefined) {
+      jsonSchema.minItems = unwrapped._def.minLength.value;
+    }
+    if (unwrapped._def.maxLength?.value !== undefined) {
+      jsonSchema.maxItems = unwrapped._def.maxLength.value;
+    }
+    return jsonSchema;
   }
 
   if (typeName === "ZodRecord") {
@@ -739,6 +753,8 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/instance/maintenance/stale-wakeups/preview",
+  "POST /api/instance/maintenance/stale-wakeups/run",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -4970,6 +4986,35 @@ registerCurrentRoute({
   tags: ["instance-settings"],
   summary: "Run issue graph liveness auto-recovery",
   body: issueGraphLivenessAutoRecoveryRequestSchema,
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/instance/maintenance/stale-wakeups/preview",
+  tags: ["instance-maintenance"],
+  summary: "Preview explicitly selected stale wakeup cancellations",
+  body: staleWakeupMaintenancePreviewRequestSchema,
+  responses: {
+    200: r.ok(staleWakeupMaintenancePreviewSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/instance/maintenance/stale-wakeups/run",
+  tags: ["instance-maintenance"],
+  summary: "Cancel explicitly selected stale wakeups",
+  body: staleWakeupMaintenanceRunRequestSchema,
+  responses: {
+    200: r.ok(staleWakeupMaintenanceRunSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+  },
 });
 
 registerCurrentRoute({

@@ -183,6 +183,7 @@ export interface CompanySkillForkRequest {
 }
 
 export interface CompanySkillUpdateRequest {
+  compatibility?: CompanySkillCompatibility;
   description?: string | null;
   iconUrl?: string | null;
   color?: string | null;

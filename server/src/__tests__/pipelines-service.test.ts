@@ -35,6 +35,7 @@ import {
 } from "../services/pipelines.ts";
 import { routineService } from "../services/routines.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { REDACTED_EVENT_VALUE } from "../redaction.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -381,6 +382,10 @@ describeEmbeddedPostgres("pipelineService", () => {
     const other: PipelineActor = { type: "user", userId: "other" };
 
     const claimed = await svc.claimCase({ companyId: company.id, caseId: created.case.id, actor: owner });
+    const claimEvent = (await svc.listCaseEvents(company.id, created.case.id))
+      .find((event) => event.type === "claimed");
+    expect(claimEvent?.payload).toMatchObject({ leaseToken: REDACTED_EVENT_VALUE });
+    expect(JSON.stringify(claimEvent?.payload)).not.toContain(claimed.leaseToken);
     await expect(svc.claimCase({ companyId: company.id, caseId: created.case.id, actor: other })).rejects.toMatchObject({
       status: 409,
       details: { code: "lease_held" },

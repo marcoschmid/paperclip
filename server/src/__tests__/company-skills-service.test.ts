@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import { agents, companies, companySkills, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -341,6 +342,28 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       categories: [],
     });
     await expect(svc.categoryCounts(companyId)).resolves.toEqual([]);
+  });
+
+  it("normalizes a legacy compatibility marker through the validated update API", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const skill = await svc.createLocalSkill(companyId, { name: "Compatibility Skill" });
+    await db
+      .update(companySkills)
+      .set({ compatibility: "paperclip-agent-capability-audit" as "compatible" })
+      .where(eq(companySkills.id, skill.id));
+
+    const updated = await svc.updateSkill(companyId, skill.id, { compatibility: "compatible" });
+
+    expect(updated.compatibility).toBe("compatible");
+    await expect(svc.getById(companyId, skill.id)).resolves.toMatchObject({
+      compatibility: "compatible",
+    });
   });
 
   it("creates a fork from the creation flow with copied files and lineage", async () => {

@@ -246,6 +246,134 @@ export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   return redacted.length <= 280 ? redacted : `${redacted.slice(0, 277)}...`;
 }
 
+/**
+ * Return a deep-sanitized copy for JSON persisted by the heartbeat subsystem.
+ * Callers must keep using their original object for adapter execution: storage
+ * hardening must never mutate or silently downgrade the live invocation input.
+ */
+export function sanitizeHeartbeatStorageCopy<T extends Record<string, unknown> | null>(value: T): T {
+  return (value === null ? null : redactEventPayload(value)) as T;
+}
+
+export function sanitizeHeartbeatResultJsonForStorage(
+  value: Record<string, unknown>,
+): Record<string, unknown>;
+export function sanitizeHeartbeatResultJsonForStorage(value: null): null;
+export function sanitizeHeartbeatResultJsonForStorage(
+  value: Record<string, unknown> | null,
+): Record<string, unknown> | null;
+export function sanitizeHeartbeatResultJsonForStorage(
+  value: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  return sanitizeHeartbeatStorageCopy(value);
+}
+
+export function sanitizeHeartbeatTaskSessionParamsForStorage(input: {
+  companyId: string;
+  agentId: string;
+  adapterType: string;
+  sessionParamsJson: Record<string, unknown> | null;
+}) {
+  const sanitized = sanitizeHeartbeatResultJsonForStorage(input.sessionParamsJson);
+  if (input.adapterType !== "acpx_local") return sanitized;
+  return restoreDeterministicPaperclipSessionKey({
+    companyId: input.companyId,
+    agentId: input.agentId,
+    rawParams: input.sessionParamsJson,
+    sanitizedParams: sanitized,
+  });
+}
+
+function restoreDeterministicPaperclipSessionKey(input: {
+  companyId: string;
+  agentId: string;
+  rawParams: Record<string, unknown> | null;
+  sanitizedParams: Record<string, unknown> | null;
+}) {
+  const rawSessionKey = input.rawParams?.sessionKey;
+  const expectedAcpxSessionPrefix = `paperclip:${input.companyId}:${input.agentId}:`;
+  if (
+    input.sanitizedParams
+    && typeof rawSessionKey === "string"
+    && rawSessionKey.length <= 2_048
+    && rawSessionKey.startsWith(expectedAcpxSessionPrefix)
+    && redactSensitiveText(rawSessionKey) === rawSessionKey
+  ) {
+    // ACPX sessionKey is a deterministic routing identity, not a credential.
+    // Preserve only the adapter-owned format after sanitizing all other fields.
+    input.sanitizedParams.sessionKey = rawSessionKey;
+  }
+  return input.sanitizedParams;
+}
+
+function sanitizeHeartbeatRunWriteForStorage<T extends Partial<typeof heartbeatRuns.$inferInsert>>(
+  write: T,
+  identity?: { companyId: string; agentId: string },
+): T {
+  const sanitized: Partial<typeof heartbeatRuns.$inferInsert> = { ...write };
+  for (const key of ["error", "stdoutExcerpt", "stderrExcerpt"] as const) {
+    const value = sanitized[key];
+    if (typeof value === "string") sanitized[key] = redactSensitiveText(value);
+  }
+  for (const key of ["contextSnapshot", "resultJson"] as const) {
+    const value = sanitized[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const rawRecord = value as Record<string, unknown>;
+      const sanitizedRecord = sanitizeHeartbeatStorageCopy(rawRecord);
+      if (key === "contextSnapshot") {
+        const rawResumeValue = rawRecord.resumeSessionParams;
+        const sanitizedResumeValue = sanitizedRecord.resumeSessionParams;
+        const rawResumeParams = rawResumeValue && typeof rawResumeValue === "object" && !Array.isArray(rawResumeValue)
+          ? rawResumeValue as Record<string, unknown>
+          : null;
+        const sanitizedResumeParams = sanitizedResumeValue
+          && typeof sanitizedResumeValue === "object"
+          && !Array.isArray(sanitizedResumeValue)
+          ? sanitizedResumeValue as Record<string, unknown>
+          : null;
+        if (
+          rawResumeParams
+          && sanitizedResumeParams
+          && (typeof write.companyId === "string" || identity)
+          && (typeof write.agentId === "string" || identity)
+        ) {
+          sanitizedRecord.resumeSessionParams = restoreDeterministicPaperclipSessionKey({
+            companyId: typeof write.companyId === "string" ? write.companyId : identity!.companyId,
+            agentId: typeof write.agentId === "string" ? write.agentId : identity!.agentId,
+            rawParams: rawResumeParams,
+            sanitizedParams: sanitizedResumeParams,
+          });
+        }
+      }
+      sanitized[key] = sanitizedRecord;
+    }
+  }
+  return sanitized as T;
+}
+
+export function sanitizeHeartbeatRunPatchForStorage(
+  patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+  identity?: { companyId: string; agentId: string },
+): Partial<typeof heartbeatRuns.$inferInsert> | undefined {
+  if (!patch) return patch;
+  return sanitizeHeartbeatRunWriteForStorage(patch, identity);
+}
+
+function sanitizeHeartbeatWakeupWriteForStorage<
+  T extends Partial<typeof agentWakeupRequests.$inferInsert>,
+>(write: T): T {
+  const sanitized: Partial<typeof agentWakeupRequests.$inferInsert> = { ...write };
+  for (const key of ["reason", "error"] as const) {
+    const value = sanitized[key];
+    if (typeof value === "string") sanitized[key] = redactSensitiveText(value);
+  }
+  const payload = sanitized.payload;
+  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+    sanitized.payload = sanitizeHeartbeatStorageCopy(payload as Record<string, unknown>);
+  }
+  return sanitized as T;
+}
+
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
@@ -6521,6 +6649,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     lastRunId: string | null;
     lastError: string | null;
   }) {
+    const sessionParamsJson = sanitizeHeartbeatTaskSessionParamsForStorage(input);
+    const lastError = input.lastError ? redactSensitiveText(input.lastError) : input.lastError;
     const existing = await getTaskSession(
       input.companyId,
       input.agentId,
@@ -6531,10 +6661,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return db
         .update(agentTaskSessions)
         .set({
-          sessionParamsJson: input.sessionParamsJson,
+          sessionParamsJson,
           sessionDisplayId: input.sessionDisplayId,
           lastRunId: input.lastRunId,
-          lastError: input.lastError,
+          lastError,
           updatedAt: new Date(),
         })
         .where(eq(agentTaskSessions.id, existing.id))
@@ -6549,10 +6679,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId: input.agentId,
         adapterType: input.adapterType,
         taskKey: input.taskKey,
-        sessionParamsJson: input.sessionParamsJson,
+        sessionParamsJson,
         sessionDisplayId: input.sessionDisplayId,
         lastRunId: input.lastRunId,
-        lastError: input.lastError,
+        lastError,
       })
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -6612,9 +6742,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    const sanitizedPatch = sanitizeHeartbeatRunPatchForStorage(patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -6649,9 +6780,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    const sanitizedPatch = sanitizeHeartbeatRunPatchForStorage(patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -6732,9 +6864,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     patch?: Partial<typeof agentWakeupRequests.$inferInsert>,
   ) {
     if (!wakeupRequestId) return;
+    const sanitizedPatch = patch ? sanitizeHeartbeatWakeupWriteForStorage(patch) : patch;
     await db
       .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
@@ -7203,7 +7336,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+      ? redactSensitiveText(redactCurrentUserText(event.message, currentUserRedactionOptions))
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)
@@ -7436,7 +7569,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           source: "automation",
@@ -7451,13 +7584,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: "system",
           requestedByActorId: null,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const queuedRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           invocationSource: "automation",
@@ -7470,7 +7603,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryOfRunId: run.id,
           issueCommentStatus: "not_applicable",
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
@@ -7663,7 +7796,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const queued = await db.transaction(async (tx) => {
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           source: "automation",
@@ -7677,13 +7810,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: "system",
           requestedByActorId: null,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const retryRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           invocationSource: "automation",
@@ -7696,7 +7829,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryOfRunId: run.id,
           processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
@@ -8413,7 +8546,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           source: "automation",
@@ -8434,13 +8567,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: null,
           idempotencyKey: maxTurnContinuationIdempotencyKey,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const scheduledRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           invocationSource: "automation",
@@ -8456,7 +8589,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           scheduledRetryReason: retryReason,
           continuationAttempt: readContinuationAttempt(retryContextSnapshot.livenessContinuationAttempt),
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
@@ -8675,11 +8808,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const updated = await db.transaction(async (tx) => {
       const row = await tx
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           scheduledRetryAt: now,
           contextSnapshot,
           updatedAt: now,
-        })
+        }, { companyId: scheduled.run.companyId, agentId: scheduled.run.agentId }))
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -8699,10 +8832,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
         await tx
           .update(agentWakeupRequests)
-          .set({
+          .set(sanitizeHeartbeatWakeupWriteForStorage({
             payload: wakeupPayload,
             updatedAt: now,
-          })
+          }))
           .where(eq(agentWakeupRequests.id, row.wakeupRequestId));
       }
 
@@ -9445,7 +9578,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        errorReason: nextStatus === "error"
+          ? truncateAgentErrorReason(failureReason ? redactSensitiveText(failureReason) : failureReason)
+          : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -9919,7 +10054,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         sessionId: session.legacySessionId,
         lastRunId: run.id,
         lastRunStatus: run.status,
-        lastError: result.errorMessage ?? null,
+        lastError: result.errorMessage ? redactSensitiveText(result.errorMessage) : null,
         totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
         totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
         totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
@@ -10976,10 +11111,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       context.executionWorkspaceId = persistedExecutionWorkspace.id;
       await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           contextSnapshot: context,
           updatedAt: new Date(),
-        })
+        }, { companyId: run.companyId, agentId: run.agentId }))
         .where(eq(heartbeatRuns.id, run.id));
     }
     const acquiredEnvironment = await envOrchestrator.acquireForRun({
@@ -11067,10 +11202,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
     await db
       .update(heartbeatRuns)
-      .set({
+      .set(sanitizeHeartbeatRunWriteForStorage({
         contextSnapshot: context,
         updatedAt: new Date(),
-      })
+      }, { companyId: run.companyId, agentId: run.agentId }))
       .where(eq(heartbeatRuns.id, run.id));
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,
@@ -11264,12 +11399,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const startedAt = run.startedAt ?? new Date();
       const runningWithSession = await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
           contextSnapshot: context,
           updatedAt: new Date(),
-        })
+        }, { companyId: run.companyId, agentId: run.agentId }))
         .where(eq(heartbeatRuns.id, run.id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -11475,10 +11610,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           runtimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
         await db
           .update(heartbeatRuns)
-          .set({
+          .set(sanitizeHeartbeatRunWriteForStorage({
             contextSnapshot: context,
             updatedAt: new Date(),
-          })
+          }, { companyId: run.companyId, agentId: run.agentId }))
           .where(eq(heartbeatRuns.id, run.id));
       }
       if (issueId && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
@@ -11776,10 +11911,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           combinedRuntimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
         await db
           .update(heartbeatRuns)
-          .set({
+          .set(sanitizeHeartbeatRunWriteForStorage({
             contextSnapshot: context,
             updatedAt: new Date(),
-          })
+          }, { companyId: run.companyId, agentId: run.agentId }))
           .where(eq(heartbeatRuns.id, run.id));
         if (issueId) {
           try {
@@ -11833,9 +11968,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
           : outcome === "succeeded"
             ? null
-            : redactCurrentUserText(
-                adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                currentUserRedactionOptions,
+            : redactSensitiveText(
+                redactCurrentUserText(
+                  adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                  currentUserRedactionOptions,
+                ),
               );
       const recordedResponsibleUserDenialCode =
         normalizeResponsibleUserDenialCode(latestRun?.errorCode);
@@ -11894,23 +12031,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
-      const persistedResultJson = mergeHeartbeatRunResultJson(
-        mergeRunStopMetadataForAgent(agent, outcome, {
-          resultJson: mergeModelProfileRunMetadata(
-            mergeAdapterRecoveryMetadata({
-              resultJson: {
-                ...parseObject(adapterResult.resultJson),
-                configFreshness: configFreshnessResultMetadata,
-              },
-              errorFamily: adapterResult.errorFamily ?? null,
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
-            }),
-            modelProfileApplication,
-          ),
-          errorCode: runErrorCode,
-          errorMessage: runErrorMessage,
-        }),
-        adapterResult.summary ?? null,
+      const persistedResultJson = sanitizeHeartbeatResultJsonForStorage(
+        mergeHeartbeatRunResultJson(
+          mergeRunStopMetadataForAgent(agent, outcome, {
+            resultJson: mergeModelProfileRunMetadata(
+              mergeAdapterRecoveryMetadata({
+                resultJson: {
+                  ...parseObject(adapterResult.resultJson),
+                  configFreshness: configFreshnessResultMetadata,
+                },
+                errorFamily: adapterResult.errorFamily ?? null,
+                retryNotBefore: adapterResult.retryNotBefore ?? null,
+              }),
+              modelProfileApplication,
+            ),
+            errorCode: runErrorCode,
+            errorMessage: runErrorMessage,
+          }),
+          adapterResult.summary ?? null,
+        ),
       );
 
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
@@ -12134,9 +12273,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
       );
     } catch (err) {
-      const message = redactCurrentUserText(
-        err instanceof Error ? err.message : "Unknown adapter failure",
-        await getCurrentUserRedactionOptions(),
+      const message = redactSensitiveText(
+        redactCurrentUserText(
+          err instanceof Error ? err.message : "Unknown adapter failure",
+          await getCurrentUserRedactionOptions(),
+        ),
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
       const configurationIncompleteFailure = isConfigurationIncompleteFailure(err) ? err : null;
@@ -12244,9 +12385,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
-          const message = redactCurrentUserText(
-            outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
-            await getCurrentUserRedactionOptions(),
+          const message = redactSensitiveText(
+            redactCurrentUserText(
+              outerErr instanceof Error ? outerErr.message : "Unknown setup failure",
+              await getCurrentUserRedactionOptions(),
+            ),
           );
           // A missing secret/env binding is a known pre-dispatch configuration gap,
           // not an opaque setup crash. Surface it with its own errorCode so the
@@ -12747,7 +12890,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const now = new Date();
         const newRun = await tx
           .insert(heartbeatRuns)
-          .values({
+          .values(sanitizeHeartbeatRunWriteForStorage({
             companyId: deferredAgent.companyId,
             agentId: deferredAgent.id,
             invocationSource: promotedSource,
@@ -12758,7 +12901,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
             continuationAttempt: promotedContinuationAttempt,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
@@ -12863,7 +13006,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const now = new Date();
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
-          .values({
+          .values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: issue.companyId,
             agentId: recoveryAgent.id,
             source: "automation",
@@ -12880,13 +13023,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorType: "system",
             requestedByActorId: null,
             updatedAt: now,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
         const queuedRun = await tx
           .insert(heartbeatRuns)
-          .values({
+          .values(sanitizeHeartbeatRunWriteForStorage({
             companyId: issue.companyId,
             agentId: recoveryAgent.id,
             invocationSource: "automation",
@@ -12908,7 +13051,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sessionIdBefore: recoverySessionBefore,
             retryOfRunId: run.id,
             updatedAt: now,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
@@ -13032,7 +13175,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: issue.companyId,
           agentId: recoveryAgent.id,
           source: "automation",
@@ -13046,13 +13189,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: "system",
           requestedByActorId: null,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const queuedRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: issue.companyId,
           agentId: recoveryAgent.id,
           invocationSource: "automation",
@@ -13064,7 +13207,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
@@ -13169,7 +13312,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
-      await db.insert(agentWakeupRequests).values({
+      await db.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
         companyId: agent.companyId,
         agentId,
         source,
@@ -13182,7 +13325,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey: opts.idempotencyKey ?? null,
         finishedAt: new Date(),
         ...patch,
-      });
+      }));
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
@@ -13429,7 +13572,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null);
 
         if (!issue) {
-          await tx.insert(agentWakeupRequests).values({
+          await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -13441,7 +13584,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
-          });
+          }));
           return { kind: "skipped" as const };
         }
 
@@ -13681,7 +13824,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
-          await tx.insert(agentWakeupRequests).values({
+          await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -13697,7 +13840,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
-          });
+          }));
           return { kind: "skipped" as const };
         }
 
@@ -13738,15 +13881,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
             const mergedRun = await tx
               .update(heartbeatRuns)
-              .set({
+              .set(sanitizeHeartbeatRunWriteForStorage({
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
-              })
+              }, { companyId: agent.companyId, agentId }))
               .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
               .returning()
               .then((rows) => rows[0] ?? availableActiveExecutionRun);
 
-            await tx.insert(agentWakeupRequests).values({
+            await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
               companyId: agent.companyId,
               agentId,
               source,
@@ -13760,7 +13903,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               runId: mergedRun.id,
               finishedAt: new Date(),
-            });
+            }));
 
             return { kind: "coalesced" as const, run: mergedRun };
           }
@@ -13803,17 +13946,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
               await tx
                 .update(agentWakeupRequests)
-                .set({
+                .set(sanitizeHeartbeatWakeupWriteForStorage({
                   payload: mergedDeferredPayload,
                   coalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
                   updatedAt: new Date(),
-                })
+                }))
                 .where(eq(agentWakeupRequests.id, existingDeferred.id));
 
               return { kind: "deferred" as const };
             }
 
-            await tx.insert(agentWakeupRequests).values({
+            await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
               companyId: agent.companyId,
               agentId,
               source,
@@ -13824,7 +13967,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
-            });
+            }));
 
             return { kind: "deferred" as const };
           }
@@ -13833,7 +13976,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
         if (dailyCapBlock) {
           const now = new Date();
-          await tx.insert(agentWakeupRequests).values({
+          await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -13852,7 +13995,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: now,
-          });
+          }));
           if (source === "timer") {
             await tx
               .update(agents)
@@ -13867,7 +14010,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
-          .values({
+          .values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -13878,13 +14021,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
         const newRun = await tx
           .insert(heartbeatRuns)
-          .values({
+          .values(sanitizeHeartbeatRunWriteForStorage({
             companyId: agent.companyId,
             agentId,
             invocationSource: source,
@@ -13895,7 +14038,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
@@ -13973,15 +14116,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       const mergedRun = await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
-        })
+        }, { companyId: agent.companyId, agentId }))
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
         .returning()
         .then((rows) => rows[0] ?? coalescedTargetRun);
 
-      await db.insert(agentWakeupRequests).values({
+      await db.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
         companyId: agent.companyId,
         agentId,
         source,
@@ -13995,7 +14138,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey: opts.idempotencyKey ?? null,
         runId: mergedRun.id,
         finishedAt: new Date(),
-      });
+      }));
       return mergedRun;
     }
 
@@ -14007,7 +14150,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
         const now = new Date();
-        await tx.insert(agentWakeupRequests).values({
+        await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: agent.companyId,
           agentId,
           source,
@@ -14026,7 +14169,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: opts.requestedByActorId ?? null,
           idempotencyKey: opts.idempotencyKey ?? null,
           finishedAt: now,
-        });
+        }));
         if (source === "timer") {
           await tx
             .update(agents)
@@ -14041,7 +14184,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: agent.companyId,
           agentId,
           source,
@@ -14052,13 +14195,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: opts.requestedByActorType ?? null,
           requestedByActorId: opts.requestedByActorId ?? null,
           idempotencyKey: opts.idempotencyKey ?? null,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const newRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: agent.companyId,
           agentId,
           invocationSource: source,
@@ -14069,7 +14212,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 

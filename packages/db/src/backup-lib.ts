@@ -1,4 +1,13 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  chmodSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -341,7 +350,7 @@ async function runPgDumpBackup(opts: {
   }
 
   await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
+    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile, { mode: 0o600 })),
     waitForChildExit(child, pgDumpBin),
   ]);
 }
@@ -437,7 +446,7 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
 }
 
 export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+  const filePromise = openFile(filePath, "w", 0o600);
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -533,7 +542,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     sqlClosed = true;
     await sql.end();
   };
-  mkdirSync(opts.backupDir, { recursive: true });
+  mkdirSync(opts.backupDir, { recursive: true, mode: 0o700 });
+  chmodSync(opts.backupDir, 0o700);
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
   const writer = createBufferedTextFileWriter(sqlFile);
@@ -548,6 +558,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           backupFile,
           connectTimeout,
         });
+        chmodSync(backupFile, 0o600);
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -957,8 +968,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const gzWriteStream = createWriteStream(backupFile, { mode: 0o600 });
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    chmodSync(backupFile, 0o600);
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;

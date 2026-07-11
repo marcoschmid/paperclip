@@ -276,10 +276,22 @@ function deriveBundleState(agent: AgentLike): BundleState {
 async function recoverManagedBundleState(agent: AgentLike, state: BundleState): Promise<BundleState> {
   const managedRootPath = resolveManagedInstructionsRoot(agent);
   const stat = await statIfExists(managedRootPath);
-  if (!stat?.isDirectory()) return state;
-
-  const files = await listFilesRecursive(managedRootPath);
-  if (files.length === 0) return state;
+  const files = stat?.isDirectory() ? await listFilesRecursive(managedRootPath) : [];
+  const configuredManagedRootMismatch = state.mode === "managed"
+    && state.rootPath !== null
+    && path.resolve(state.rootPath) !== managedRootPath;
+  if (!stat?.isDirectory() || files.length === 0) {
+    if (!configuredManagedRootMismatch) return state;
+    return {
+      ...state,
+      rootPath: managedRootPath,
+      resolvedEntryPath: path.resolve(managedRootPath, state.entryFile),
+      warnings: [
+        ...state.warnings,
+        `Recovered managed instructions target at ${managedRootPath}; ignoring stale configured root ${state.rootPath}.`,
+      ],
+    };
+  }
 
   const recoveredEntryFile = files.includes(state.entryFile)
     ? state.entryFile
@@ -417,16 +429,49 @@ function buildPersistedBundleConfig(
 async function writeBundleFiles(
   rootPath: string,
   files: Record<string, string>,
-  options?: { overwriteExisting?: boolean },
+  options?: { overwriteExisting?: boolean; privateFiles?: boolean },
 ) {
   for (const [relativePath, content] of Object.entries(files)) {
     const normalizedPath = normalizeRelativeFilePath(relativePath);
     const absolutePath = resolvePathWithinRoot(rootPath, normalizedPath);
     const existingStat = await statIfExists(absolutePath);
     if (existingStat?.isFile() && !options?.overwriteExisting) continue;
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, content, "utf8");
+    if (options?.privateFiles) {
+      await ensurePrivateDirectory(path.dirname(absolutePath));
+      await fs.writeFile(absolutePath, content, { encoding: "utf8", mode: 0o600 });
+      await fs.chmod(absolutePath, 0o600);
+    } else {
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      await fs.writeFile(absolutePath, content, "utf8");
+    }
   }
+}
+
+async function ensurePrivateDirectory(directoryPath: string) {
+  await fs.mkdir(directoryPath, { recursive: true, mode: 0o700 });
+  await fs.chmod(directoryPath, 0o700);
+}
+
+async function hardenManagedBundlePermissions(agent: AgentLike, rootPath: string) {
+  if (path.resolve(rootPath) !== resolveManagedInstructionsRoot(agent)) return;
+  async function hardenTree(currentPath: string) {
+    const currentStat = await fs.lstat(currentPath).catch(() => null);
+    if (!currentStat?.isDirectory() || currentStat.isSymbolicLink()) return;
+    await fs.chmod(currentPath, 0o700);
+    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const absolutePath = path.join(currentPath, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        await hardenTree(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const stat = await fs.stat(absolutePath);
+      await fs.chmod(absolutePath, (stat.mode & 0o100) === 0o100 ? 0o700 : 0o600);
+    }
+  }
+  await hardenTree(rootPath);
 }
 
 export function syncInstructionsBundleConfigFromFilePath(
@@ -462,6 +507,7 @@ export function agentInstructionsService() {
         warnings: [...state.warnings, `Instructions root does not exist: ${state.rootPath}`],
       }, []);
     }
+    if (state.mode === "managed") await hardenManagedBundlePermissions(agent, state.rootPath);
     const files = await listFilesRecursive(state.rootPath);
     const summaries = await Promise.all(files.map((relativePath) => readFileSummary(state.rootPath!, relativePath, state.entryFile)));
     return toBundle(agent, state, summaries);
@@ -512,11 +558,25 @@ export function agentInstructionsService() {
     const derived = deriveBundleState(agent);
     const current = await recoverManagedBundleState(agent, derived);
     if (current.rootPath && current.mode) {
-      const adapterConfig = buildPersistedBundleConfig(derived, current, options);
-      return {
-        adapterConfig,
-        state: deriveBundleState({ ...agent, adapterConfig }),
-      };
+      if (current.mode === "external") {
+        const adapterConfig = buildPersistedBundleConfig(derived, current, options);
+        return {
+          adapterConfig,
+          state: deriveBundleState({ ...agent, adapterConfig }),
+        };
+      }
+      const canonicalRoot = resolveManagedInstructionsRoot(agent);
+      const currentFiles = path.resolve(current.rootPath) === canonicalRoot
+        ? await listFilesRecursive(canonicalRoot)
+        : [];
+      if (path.resolve(current.rootPath) === canonicalRoot && currentFiles.length > 0) {
+        await hardenManagedBundlePermissions(agent, current.rootPath);
+        const adapterConfig = buildPersistedBundleConfig(derived, current, options);
+        return {
+          adapterConfig,
+          state: deriveBundleState({ ...agent, adapterConfig }),
+        };
+      }
     }
 
     const managedRoot = resolveManagedInstructionsRoot(agent);
@@ -527,16 +587,15 @@ export function agentInstructionsService() {
       entryFile,
       clearLegacyPromptTemplate: options?.clearLegacyPromptTemplate,
     });
-    await fs.mkdir(managedRoot, { recursive: true });
+    await ensurePrivateDirectory(managedRoot);
 
     const entryPath = resolvePathWithinRoot(managedRoot, entryFile);
     const entryStat = await statIfExists(entryPath);
     if (!entryStat?.isFile()) {
       const legacyInstructions = await readLegacyInstructions(agent, current.config);
-      if (legacyInstructions.trim().length > 0) {
-        await fs.mkdir(path.dirname(entryPath), { recursive: true });
-        await fs.writeFile(entryPath, legacyInstructions, "utf8");
-      }
+      await ensurePrivateDirectory(path.dirname(entryPath));
+      await fs.writeFile(entryPath, legacyInstructions, { encoding: "utf8", mode: 0o600 });
+      await fs.chmod(entryPath, 0o600);
     }
 
     return {
@@ -573,17 +632,20 @@ export function agentInstructionsService() {
       nextRootPath = resolvedRoot;
     }
 
-    await fs.mkdir(nextRootPath, { recursive: true });
+    if (nextMode === "managed") await ensurePrivateDirectory(nextRootPath);
+    else await fs.mkdir(nextRootPath, { recursive: true });
 
     const existingFiles = await listFilesRecursive(nextRootPath);
     const exported = await exportFiles(agent);
     if (existingFiles.length === 0) {
-      await writeBundleFiles(nextRootPath, exported.files);
+      await writeBundleFiles(nextRootPath, exported.files, { privateFiles: nextMode === "managed" });
     }
     const refreshedFiles = existingFiles.length === 0 ? await listFilesRecursive(nextRootPath) : existingFiles;
     if (!refreshedFiles.includes(nextEntryFile)) {
       const nextEntryContent = exported.files[nextEntryFile] ?? exported.files[exported.entryFile] ?? "";
-      await writeBundleFiles(nextRootPath, { [nextEntryFile]: nextEntryContent });
+      await writeBundleFiles(nextRootPath, { [nextEntryFile]: nextEntryContent }, {
+        privateFiles: nextMode === "managed",
+      });
     }
 
     const nextConfig = applyBundleConfig(state.config, {
@@ -622,8 +684,14 @@ export function agentInstructionsService() {
 
     const prepared = await ensureWritableBundle(agent, options);
     const absolutePath = resolvePathWithinRoot(prepared.state.rootPath!, relativePath);
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, content, "utf8");
+    if (prepared.state.mode === "managed") {
+      await ensurePrivateDirectory(path.dirname(absolutePath));
+      await fs.writeFile(absolutePath, content, { encoding: "utf8", mode: 0o600 });
+      await fs.chmod(absolutePath, 0o600);
+    } else {
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      await fs.writeFile(absolutePath, content, "utf8");
+    }
     const nextAgent = { ...agent, adapterConfig: prepared.adapterConfig };
     const [bundle, file] = await Promise.all([
       getBundle(nextAgent),
@@ -636,11 +704,11 @@ export function agentInstructionsService() {
     bundle: AgentInstructionsBundle;
     adapterConfig: Record<string, unknown>;
   }> {
-    const derived = deriveBundleState(agent);
-    const state = await recoverManagedBundleState(agent, derived);
     if (relativePath === LEGACY_PROMPT_TEMPLATE_PATH) {
       throw unprocessable("Cannot delete the legacy promptTemplate pseudo-file");
     }
+    const prepared = await ensureWritableBundle(agent);
+    const state = prepared.state;
     if (!state.rootPath) throw notFound("Agent instructions bundle is not configured");
     const normalizedPath = normalizeRelativeFilePath(relativePath);
     if (normalizedPath === state.entryFile) {
@@ -648,7 +716,7 @@ export function agentInstructionsService() {
     }
     const absolutePath = resolvePathWithinRoot(state.rootPath, normalizedPath);
     await fs.rm(absolutePath, { force: true });
-    const adapterConfig = buildPersistedBundleConfig(derived, state);
+    const adapterConfig = prepared.adapterConfig;
     const bundle = await getBundle({ ...agent, adapterConfig });
     return { bundle, adapterConfig };
   }
@@ -662,6 +730,7 @@ export function agentInstructionsService() {
     if (state.rootPath) {
       const stat = await statIfExists(state.rootPath);
       if (stat?.isDirectory()) {
+        if (state.mode === "managed") await hardenManagedBundlePermissions(agent, state.rootPath);
         const relativePaths = await listFilesRecursive(state.rootPath);
         const files = Object.fromEntries(await Promise.all(relativePaths.map(async (relativePath) => {
           const absolutePath = resolvePathWithinRoot(state.rootPath!, relativePath);
@@ -697,7 +766,7 @@ export function agentInstructionsService() {
     if (options?.replaceExisting) {
       await fs.rm(rootPath, { recursive: true, force: true });
     }
-    await fs.mkdir(rootPath, { recursive: true });
+    await ensurePrivateDirectory(rootPath);
 
     const normalizedEntries = Object.entries(files).map(([relativePath, content]) => [
       normalizeRelativeFilePath(relativePath),
@@ -705,11 +774,15 @@ export function agentInstructionsService() {
     ] as const);
     for (const [relativePath, content] of normalizedEntries) {
       const absolutePath = resolvePathWithinRoot(rootPath, relativePath);
-      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-      await fs.writeFile(absolutePath, content, "utf8");
+      await ensurePrivateDirectory(path.dirname(absolutePath));
+      await fs.writeFile(absolutePath, content, { encoding: "utf8", mode: 0o600 });
+      await fs.chmod(absolutePath, 0o600);
     }
     if (!normalizedEntries.some(([relativePath]) => relativePath === entryFile)) {
-      await fs.writeFile(resolvePathWithinRoot(rootPath, entryFile), "", "utf8");
+      const entryPath = resolvePathWithinRoot(rootPath, entryFile);
+      await ensurePrivateDirectory(path.dirname(entryPath));
+      await fs.writeFile(entryPath, "", { encoding: "utf8", mode: 0o600 });
+      await fs.chmod(entryPath, 0o600);
     }
 
     const adapterConfig = applyBundleConfig(asRecord(agent.adapterConfig), {

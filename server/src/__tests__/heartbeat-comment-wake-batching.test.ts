@@ -179,6 +179,317 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     runningProcesses.clear();
   });
 
+  it("keeps raw comment wake content for adapter execution while redacting stored payload and context copies", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const token = `pcp_comment_storage_${randomUUID().replace(/-/g, "")}`;
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+    let heartbeatRunId: string | null = null;
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Storage Sanitization",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Storage Sanitization Gateway",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: { "x-openclaw-token": "gateway-test-token" },
+          payloadTemplate: { message: "wake now" },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Keep adapter context raw",
+        status: "todo",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+      const comment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorUserId: "user-1",
+          body: `Adapter must receive this comment unchanged: ${token}`,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      const wakePayload = {
+        issueId,
+        commentId: comment.id,
+        rawHint: { value: token },
+      };
+      const wakeContext = {
+        issueId,
+        taskId: issueId,
+        commentId: comment.id,
+        wakeReason: "issue_commented",
+        rawHint: { value: token },
+      };
+
+      const run = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: wakePayload,
+        contextSnapshot: wakeContext,
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+
+      expect(run).not.toBeNull();
+      heartbeatRunId = run?.id ?? null;
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+
+      const adapterPayload = gateway.getAgentPayloads()[0] ?? {};
+      expect(String(adapterPayload.message ?? "")).toContain(token);
+      expect(wakePayload.rawHint.value).toBe(token);
+      expect(wakeContext.rawHint.value).toBe(token);
+
+      const [storedRun, storedWake] = await Promise.all([
+        db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)).then((rows) => rows[0]),
+        db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, run!.wakeupRequestId!))
+          .then((rows) => rows[0]),
+      ]);
+      expect(JSON.stringify(storedRun?.contextSnapshot)).not.toContain(token);
+      expect(JSON.stringify(storedWake?.payload)).not.toContain(token);
+    } finally {
+      gateway.releaseFirstWait();
+      if (heartbeatRunId) {
+        await waitFor(async () => {
+          const status = await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, heartbeatRunId!))
+            .then((rows) => rows[0]?.status ?? null);
+          return status !== "queued" && status !== "running";
+        }, 30_000).catch(() => undefined);
+      }
+      await gateway.close();
+    }
+  });
+
+  it("redacts coalesced context and wake payload storage copies without mutating callers", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const token = `pcp_coalesced_storage_${randomUUID().replace(/-/g, "")}`;
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Coalesced Storage Sanitization",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Coalesced Agent",
+      role: "engineer",
+      status: "running",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+    });
+    runningProcesses.set(runId, { child: {} as never, graceSec: 0, processGroupId: null });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Coalesce storage copy",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "coalesced agent",
+      executionLockedAt: new Date(),
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const wakePayload = { issueId, rawHint: { value: token } };
+    const wakeContext = {
+      issueId,
+      taskId: issueId,
+      wakeReason: "runtime_context_update",
+      rawHint: { value: token },
+    };
+
+    const coalescedRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "runtime_context_update",
+      payload: wakePayload,
+      contextSnapshot: wakeContext,
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat",
+    });
+
+    expect(coalescedRun?.id).toBe(runId);
+    const [storedRun, storedWake] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]),
+      db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.runId, runId), eq(agentWakeupRequests.status, "coalesced")))
+        .then((rows) => rows[0]),
+    ]);
+    expect(JSON.stringify(storedRun?.contextSnapshot)).not.toContain(token);
+    expect(JSON.stringify(storedWake?.payload)).not.toContain(token);
+    expect(wakePayload.rawHint.value).toBe(token);
+    expect(wakeContext.rawHint.value).toBe(token);
+  });
+
+  it("redacts both insertion and coalesced updates of deferred wake storage copies", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const firstToken = `pcp_deferred_first_${randomUUID().replace(/-/g, "")}`;
+    const secondToken = `pcp_deferred_second_${randomUUID().replace(/-/g, "")}`;
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Deferred Storage Sanitization",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Deferred Agent",
+      role: "engineer",
+      status: "running",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+    });
+    runningProcesses.set(runId, { child: {} as never, graceSec: 0, processGroupId: null });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Defer storage copies",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "deferred-agent",
+      executionLockedAt: new Date(),
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const [firstComment, secondComment] = await db
+      .insert(issueComments)
+      .values([
+        { companyId, issueId, authorUserId: "user-1", body: "First deferred comment" },
+        { companyId, issueId, authorUserId: "user-1", body: "Second deferred comment" },
+      ])
+      .returning();
+
+    for (const [comment, token] of [[firstComment, firstToken], [secondComment, secondToken]] as const) {
+      const wakePayload = { issueId, commentId: comment.id, rawHint: { value: token } };
+      const wakeContext = {
+        issueId,
+        taskId: issueId,
+        commentId: comment.id,
+        wakeReason: "issue_commented",
+        rawHint: { value: token },
+      };
+      const result = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: wakePayload,
+        contextSnapshot: wakeContext,
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+      expect(result).toBeNull();
+      expect(wakePayload.rawHint.value).toBe(token);
+      expect(wakeContext.rawHint.value).toBe(token);
+      if (token === firstToken) {
+        const firstDeferred = await db
+          .select({ payload: agentWakeupRequests.payload })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            ),
+          )
+          .then((rows) => rows[0]);
+        expect(JSON.stringify(firstDeferred?.payload)).not.toContain(firstToken);
+      }
+    }
+
+    const deferredWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ),
+      );
+    expect(deferredWakes).toHaveLength(1);
+    expect(deferredWakes[0]?.coalescedCount).toBe(1);
+    const storedPayload = JSON.stringify(deferredWakes[0]?.payload);
+    expect(storedPayload).not.toContain(firstToken);
+    expect(storedPayload).not.toContain(secondToken);
+  });
+
   it("defers approval-approved wakes for a running issue so the assignee resumes after the run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

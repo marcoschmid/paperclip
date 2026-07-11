@@ -446,6 +446,7 @@ export function companySkillRoutes(db: Db) {
         entityId: result.id,
         details: {
           slug: result.slug,
+          compatibility: result.compatibility,
           categories: result.categories,
           sharingScope: result.sharingScope,
         },

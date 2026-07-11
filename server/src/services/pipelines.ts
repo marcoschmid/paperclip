@@ -43,6 +43,7 @@ import {
   type RoutineRevisionSnapshotV1,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { sanitizeRecord } from "../redaction.js";
 import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
@@ -1491,7 +1492,7 @@ async function writeCaseEvent(
       ...eventActorPatch(input.actor),
       fromStageId: input.fromStageId ?? null,
       toStageId: input.toStageId ?? null,
-      payload: input.payload ?? {},
+      payload: sanitizeRecord(input.payload ?? {}),
     })
     .returning();
   return event!;

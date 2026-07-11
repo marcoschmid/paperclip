@@ -39,4 +39,8 @@ export const API = {
   joinRequests: `${API_PREFIX}/join-requests`,
   members: `${API_PREFIX}/members`,
   admin: `${API_PREFIX}/admin`,
+  instanceMaintenanceStaleWakeupsPreview:
+    `${API_PREFIX}/instance/maintenance/stale-wakeups/preview`,
+  instanceMaintenanceStaleWakeupsRun:
+    `${API_PREFIX}/instance/maintenance/stale-wakeups/run`,
 } as const;

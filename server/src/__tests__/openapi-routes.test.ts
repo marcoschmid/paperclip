@@ -159,6 +159,40 @@ describe("openapi routes", () => {
         name: { type: "string" },
       },
     });
+    expect(
+      res.body.paths["/api/instance/maintenance/stale-wakeups/preview"].post.requestBody.content["application/json"].schema,
+    ).toMatchObject({
+      type: "object",
+      properties: {
+        requestIds: {
+          type: "array",
+          minItems: 1,
+          maxItems: 500,
+          items: { type: "string", format: "uuid" },
+        },
+        staleBefore: { type: "string", format: "date-time" },
+      },
+      required: ["requestIds", "staleBefore"],
+    });
+    expect(
+      res.body.paths["/api/instance/maintenance/stale-wakeups/run"].post.requestBody.content["application/json"].schema,
+    ).toMatchObject({
+      properties: {
+        reason: { type: "string", minLength: 1, maxLength: 1000 },
+      },
+      required: ["requestIds", "staleBefore", "reason"],
+    });
+    expect(
+      res.body.paths["/api/instance/maintenance/stale-wakeups/run"].post.responses["200"].content["application/json"].schema,
+    ).toMatchObject({
+      type: "object",
+      properties: {
+        cancelledRequestIds: {
+          type: "array",
+          items: { type: "string", format: "uuid" },
+        },
+      },
+    });
   });
 
   it("covers the mounted server routes exactly", () => {
@@ -187,6 +221,10 @@ describe("openapi routes", () => {
       actor: "board",
       instanceAdmin: true,
     });
+    expect(spec.paths["/api/instance/maintenance/stale-wakeups/preview"].post["x-paperclip-authorization"])
+      .toEqual({ actor: "board", instanceAdmin: true });
+    expect(spec.paths["/api/instance/maintenance/stale-wakeups/run"].post["x-paperclip-authorization"])
+      .toEqual({ actor: "board", instanceAdmin: true });
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["201"]).toBeDefined();
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["403"]).toBeDefined();
     expect(spec.paths["/api/instance/database-backups"].post.responses["201"]).toBeDefined();

@@ -24,6 +24,10 @@ function makeAgent(adapterConfig: Record<string, unknown>): TestAgent {
   };
 }
 
+function permissionBits(mode: number) {
+  return mode & 0o777;
+}
+
 describe("agent instructions service", () => {
   const originalPaperclipHome = process.env.PAPERCLIP_HOME;
   const originalPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
@@ -79,6 +83,10 @@ describe("agent instructions service", () => {
     expect(result.bundle.files.map((file) => file.path)).toEqual(["AGENTS.md", "docs/TOOLS.md"]);
     await expect(fs.readFile(path.join(result.bundle.managedRootPath, "AGENTS.md"), "utf8")).resolves.toBe("# External Agent\n");
     await expect(fs.readFile(path.join(result.bundle.managedRootPath, "docs", "TOOLS.md"), "utf8")).resolves.toBe("## Tools\n");
+    expect(permissionBits((await fs.stat(result.bundle.managedRootPath)).mode)).toBe(0o700);
+    expect(permissionBits((await fs.stat(path.join(result.bundle.managedRootPath, "docs"))).mode)).toBe(0o700);
+    expect(permissionBits((await fs.stat(path.join(result.bundle.managedRootPath, "AGENTS.md"))).mode)).toBe(0o600);
+    expect(permissionBits((await fs.stat(path.join(result.bundle.managedRootPath, "docs", "TOOLS.md"))).mode)).toBe(0o600);
   });
 
   it("creates the target entry file when switching to a new external root", async () => {
@@ -191,7 +199,92 @@ describe("agent instructions service", () => {
     expect(bundle.rootPath).toBe(managedRoot);
     expect(bundle.files.map((file) => file.path)).toEqual(["AGENTS.md"]);
     expect(exported.files).toEqual({ "AGENTS.md": "# Recovered Agent\n" });
+    expect(permissionBits((await fs.stat(managedRoot)).mode)).toBe(0o700);
+    expect(permissionBits((await fs.stat(path.join(managedRoot, "AGENTS.md"))).mode)).toBe(0o600);
   });
+
+  it("never hardens a stale configured root outside the canonical managed root", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-safe-harden-");
+    const staleRoot = await makeTempDir("paperclip-agent-instructions-safe-harden-stale-");
+    cleanupDirs.add(paperclipHome);
+    cleanupDirs.add(staleRoot);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+
+    const staleEntry = path.join(staleRoot, "AGENTS.md");
+    await fs.writeFile(staleEntry, "# External content\n", { mode: 0o644 });
+    await fs.chmod(staleRoot, 0o755);
+    await fs.chmod(staleEntry, 0o644);
+
+    const svc = agentInstructionsService();
+    const agent = makeAgent({
+      instructionsBundleMode: "managed",
+      instructionsRootPath: staleRoot,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: staleEntry,
+    });
+
+    await svc.getBundle(agent);
+
+    expect(permissionBits((await fs.stat(staleRoot)).mode)).toBe(0o755);
+    expect(permissionBits((await fs.stat(staleEntry)).mode)).toBe(0o644);
+  });
+
+  it.each(["missing", "empty"])(
+    "heals a stale managed root into the canonical %s root before writes or deletes",
+    async (canonicalState) => {
+      const paperclipHome = await makeTempDir(`paperclip-agent-instructions-safe-write-${canonicalState}-`);
+      const staleRoot = await makeTempDir(`paperclip-agent-instructions-safe-write-${canonicalState}-stale-`);
+      cleanupDirs.add(paperclipHome);
+      cleanupDirs.add(staleRoot);
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+
+      const managedRoot = path.join(
+        paperclipHome,
+        "instances",
+        "test-instance",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-1",
+        "instructions",
+      );
+      if (canonicalState === "empty") await fs.mkdir(managedRoot, { recursive: true });
+      const staleEntry = path.join(staleRoot, "AGENTS.md");
+      const staleDeleteTarget = path.join(staleRoot, "obsolete.md");
+      await fs.writeFile(staleEntry, "# Stale managed content\n", { mode: 0o644 });
+      await fs.writeFile(staleDeleteTarget, "keep external\n", { mode: 0o644 });
+      await fs.chmod(staleRoot, 0o755);
+
+      const svc = agentInstructionsService();
+      const agent = makeAgent({
+        instructionsBundleMode: "managed",
+        instructionsRootPath: staleRoot,
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: staleEntry,
+      });
+
+      const written = await svc.writeFile(agent, "docs/TOOLS.md", "## Canonical tools\n");
+      const healedAgent = { ...agent, adapterConfig: written.adapterConfig };
+      await fs.writeFile(path.join(managedRoot, "obsolete.md"), "delete canonical\n", { mode: 0o600 });
+      await svc.deleteFile(healedAgent, "obsolete.md");
+
+      await expect(fs.readFile(path.join(managedRoot, "AGENTS.md"), "utf8"))
+        .resolves.toBe("# Stale managed content\n");
+      await expect(fs.readFile(path.join(managedRoot, "docs", "TOOLS.md"), "utf8"))
+        .resolves.toBe("## Canonical tools\n");
+      await expect(fs.stat(path.join(managedRoot, "obsolete.md"))).rejects.toThrow();
+      await expect(fs.readFile(staleDeleteTarget, "utf8")).resolves.toBe("keep external\n");
+      expect(permissionBits((await fs.stat(staleRoot)).mode)).toBe(0o755);
+      expect(permissionBits((await fs.stat(staleEntry)).mode)).toBe(0o644);
+      expect(written.adapterConfig).toMatchObject({
+        instructionsBundleMode: "managed",
+        instructionsRootPath: managedRoot,
+        instructionsFilePath: path.join(managedRoot, "AGENTS.md"),
+      });
+    },
+  );
 
   it("prefers the managed bundle on disk when managed metadata points at a stale root", async () => {
     const paperclipHome = await makeTempDir("paperclip-agent-instructions-stale-managed-");
@@ -274,6 +367,7 @@ describe("agent instructions service", () => {
       instructionsFilePath: path.join(managedRoot, "AGENTS.md"),
     });
     await expect(fs.readFile(path.join(managedRoot, "docs", "TOOLS.md"), "utf8")).resolves.toBe("## Tools\n");
+    expect(permissionBits((await fs.stat(path.join(managedRoot, "docs", "TOOLS.md"))).mode)).toBe(0o600);
   });
 
   it("heals stale managed metadata when deleting bundle files", async () => {

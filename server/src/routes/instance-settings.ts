@@ -1,19 +1,29 @@
-import { Router, type Request } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   issueGraphLivenessAutoRecoveryRequestSchema,
   patchInstanceSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
+  staleWakeupMaintenancePreviewRequestSchema,
+  staleWakeupMaintenanceRunRequestSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { forbidden, unauthorized } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { heartbeatService, instanceSettingsService, logActivity } from "../services/index.js";
+import {
+  heartbeatService,
+  instanceSettingsService,
+  logActivity,
+  staleWakeupMaintenanceService,
+} from "../services/index.js";
 import { environmentService } from "../services/environments.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
 
 function assertCanManageInstanceSettings(req: Request) {
+  if (req.actor.type === "none") {
+    throw unauthorized("Board authentication required");
+  }
   if (req.actor.type !== "board") {
     throw forbidden("Board access required");
   }
@@ -23,11 +33,17 @@ function assertCanManageInstanceSettings(req: Request) {
   throw forbidden("Instance admin access required");
 }
 
+function requireCanManageInstanceSettings(req: Request, _res: Response, next: NextFunction) {
+  assertCanManageInstanceSettings(req);
+  next();
+}
+
 export function instanceSettingsRoutes(db: Db) {
   const router = Router();
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
   const heartbeat = heartbeatService(db);
+  const staleWakeups = staleWakeupMaintenanceService(db);
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);
@@ -191,6 +207,30 @@ export function instanceSettingsRoutes(db: Db) {
         ),
       );
       res.json(result);
+    },
+  );
+
+  router.post(
+    "/instance/maintenance/stale-wakeups/preview",
+    requireCanManageInstanceSettings,
+    validate(staleWakeupMaintenancePreviewRequestSchema),
+    async (req, res) => {
+      res.json(await staleWakeups.preview(req.body));
+    },
+  );
+
+  router.post(
+    "/instance/maintenance/stale-wakeups/run",
+    requireCanManageInstanceSettings,
+    validate(staleWakeupMaintenanceRunRequestSchema),
+    async (req, res) => {
+      const actor = getActorInfo(req);
+      res.json(await staleWakeups.run(req.body, {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+      }));
     },
   );
 

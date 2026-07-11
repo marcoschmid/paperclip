@@ -3033,6 +3033,9 @@ export function companySkillService(db: Db) {
       updatedAt: new Date(),
     };
 
+    if (Object.prototype.hasOwnProperty.call(input, "compatibility")) {
+      values.compatibility = input.compatibility;
+    }
     if (Object.prototype.hasOwnProperty.call(input, "description")) {
       values.description = normalizeStoreText(input.description, 2000);
     }

@@ -4,7 +4,12 @@ import { workspaceOperations } from "@paperclipai/db";
 import type { WorkspaceOperation, WorkspaceOperationPhase, WorkspaceOperationStatus } from "@paperclipai/shared";
 import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
 import { notFound } from "../errors.js";
-import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import {
+  redactCurrentUserText,
+  redactCurrentUserValue,
+  type CurrentUserRedactionOptions,
+} from "../log-redaction.js";
+import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 
@@ -50,6 +55,21 @@ function combineMetadata(
     ...(base ?? {}),
     ...(patch ?? {}),
   };
+}
+
+export function sanitizeWorkspaceOperationTextForStorage(
+  value: string,
+  currentUserRedactionOptions: CurrentUserRedactionOptions,
+) {
+  return redactSensitiveText(redactCurrentUserText(value, currentUserRedactionOptions));
+}
+
+export function sanitizeWorkspaceOperationMetadataForStorage(
+  value: Record<string, unknown> | null,
+  currentUserRedactionOptions: CurrentUserRedactionOptions,
+) {
+  const userRedacted = redactCurrentUserValue(value, currentUserRedactionOptions);
+  return redactEventPayload(userRedacted as Record<string, unknown> | null);
 }
 
 export interface WorkspaceOperationRecorder {
@@ -123,7 +143,7 @@ export function workspaceOperationService(db: Db) {
           let stderrExcerpt = "";
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
-            const sanitizedChunk = redactCurrentUserText(chunk, currentUserRedactionOptions);
+            const sanitizedChunk = sanitizeWorkspaceOperationTextForStorage(chunk, currentUserRedactionOptions);
             if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
             if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
             await logStore.append(handle, {
@@ -140,15 +160,19 @@ export function workspaceOperationService(db: Db) {
             heartbeatRunId: input.heartbeatRunId ?? null,
             issueId: input.issueId ?? null,
             phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
+            command: recordInput.command
+              ? sanitizeWorkspaceOperationTextForStorage(recordInput.command, currentUserRedactionOptions)
+              : null,
+            cwd: recordInput.cwd
+              ? sanitizeWorkspaceOperationTextForStorage(recordInput.cwd, currentUserRedactionOptions)
+              : null,
             status: "running",
             logStore: handle.store,
             logRef: handle.logRef,
-            metadata: redactCurrentUserValue(
+            metadata: sanitizeWorkspaceOperationMetadataForStorage(
               recordInput.metadata ?? null,
               currentUserRedactionOptions,
-            ) as Record<string, unknown> | null,
+            ),
             startedAt,
           });
           createdIds.push(id);
@@ -171,10 +195,10 @@ export function workspaceOperationService(db: Db) {
                 logBytes: finalized.bytes,
                 logSha256: finalized.sha256,
                 logCompressed: finalized.compressed,
-                metadata: redactCurrentUserValue(
+                metadata: sanitizeWorkspaceOperationMetadataForStorage(
                   combineMetadata(recordInput.metadata, result.metadata),
                   currentUserRedactionOptions,
-                ) as Record<string, unknown> | null,
+                ),
                 finishedAt,
                 updatedAt: finishedAt,
               })

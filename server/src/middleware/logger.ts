@@ -1,11 +1,20 @@
 import path from "node:path";
-import fs from "node:fs";
+import * as fs from "node:fs";
 import pino from "pino";
 import { pinoHttp } from "pino-http";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
-import { redactSensitive } from "./redact-sensitive.js";
+import {
+  redactHttpPayload,
+  redactHttpErrorPayload,
+  redactHttpQuery,
+  redactHttpUrl,
+  serializeHttpRequest,
+  serializeHttpResponse,
+} from "./http-log-redaction.js";
+import { redactSensitiveText, sanitizeLogArguments } from "../redaction.js";
+import { rotateLogFileAtStartup } from "./log-file-rotation.js";
 
 function resolveServerLogDir(): string {
   const envOverride = process.env.PAPERCLIP_LOG_DIR?.trim();
@@ -18,9 +27,17 @@ function resolveServerLogDir(): string {
 }
 
 const logDir = resolveServerLogDir();
-fs.mkdirSync(logDir, { recursive: true });
+fs.mkdirSync(logDir, { recursive: true, mode: 0o700 });
+fs.chmodSync(logDir, 0o700);
 
 const logFile = path.join(logDir, "server.log");
+rotateLogFileAtStartup(logFile, {
+  maxBytes: Number(process.env.PAPERCLIP_LOG_MAX_BYTES) || 100 * 1024 * 1024,
+  retentionFiles: Number(process.env.PAPERCLIP_LOG_RETENTION_FILES) || 5,
+});
+const logFileDescriptor = fs.openSync(logFile, "a", 0o600);
+fs.closeSync(logFileDescriptor);
+fs.chmodSync(logFile, 0o600);
 
 const sharedOpts = {
   translateTime: "SYS:HH:MM:ss",
@@ -30,7 +47,28 @@ const sharedOpts = {
 
 export const logger = pino({
   level: "debug",
-  redact: ["req.headers.authorization"],
+  hooks: {
+    logMethod(inputArgs, method) {
+      return Reflect.apply(method, this, sanitizeLogArguments(inputArgs));
+    },
+  },
+  redact: [
+    "req.headers.authorization",
+    "req.headers.cookie",
+    "req.headers['set-cookie']",
+    "req.headers['x-api-key']",
+    "req.headers['x-paperclip-token']",
+    "req.headers['x-paperclip-api-key']",
+    "req.headers['x-board-api-key']",
+    "req.headers['x-agent-token']",
+    "req.headers['x-openclaw-token']",
+    "req.headers['x-openclaw-auth']",
+    "req.headers['x-paperclip-cloud-tenant-token']",
+    "req.headers['x-paperclip-dev-server-status-token']",
+    "req.headers['x-hermes-session-key']",
+    "req.query.gatewayToken",
+    "res.headers['set-cookie']",
+  ],
 }, pino.transport({
   targets: [
     {
@@ -48,6 +86,10 @@ export const logger = pino({
 
 export const httpLogger = pinoHttp({
   logger,
+  serializers: {
+    req: serializeHttpRequest,
+    res: serializeHttpResponse,
+  },
   customLogLevel(_req, res, err) {
     if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
       return "silent";
@@ -57,34 +99,34 @@ export const httpLogger = pinoHttp({
     return "info";
   },
   customSuccessMessage(req, res) {
-    return `${req.method} ${req.url} ${res.statusCode}`;
+    return `${req.method} ${redactHttpUrl(req.url) ?? ""} ${res.statusCode}`;
   },
   customErrorMessage(req, res, err) {
     const ctx = (res as any).__errorContext;
     const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
-    return `${req.method} ${req.url} ${res.statusCode} — ${errMsg}`;
+    return `${req.method} ${redactHttpUrl(req.url) ?? ""} ${res.statusCode} — ${redactSensitiveText(errMsg)}`;
   },
   customProps(req, res) {
     if (res.statusCode >= 400) {
       const ctx = (res as any).__errorContext;
       if (ctx) {
         return {
-          errorContext: ctx.error,
-          reqBody: redactSensitive(ctx.reqBody),
-          reqParams: redactSensitive(ctx.reqParams),
-          reqQuery: redactSensitive(ctx.reqQuery),
+          errorContext: redactHttpErrorPayload(ctx.error),
+          reqBody: redactHttpPayload(ctx.reqBody),
+          reqParams: redactHttpPayload(ctx.reqParams),
+          reqQuery: redactHttpQuery(ctx.reqQuery),
         };
       }
       const props: Record<string, unknown> = {};
       const { body, params, query } = req as any;
       if (body && typeof body === "object" && Object.keys(body).length > 0) {
-        props.reqBody = redactSensitive(body);
+        props.reqBody = redactHttpPayload(body);
       }
       if (params && typeof params === "object" && Object.keys(params).length > 0) {
-        props.reqParams = redactSensitive(params);
+        props.reqParams = redactHttpPayload(params);
       }
       if (query && typeof query === "object" && Object.keys(query).length > 0) {
-        props.reqQuery = redactSensitive(query);
+        props.reqQuery = redactHttpQuery(query);
       }
       if ((req as any).route?.path) {
         props.routePath = (req as any).route.path;

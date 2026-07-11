@@ -76,6 +76,80 @@ export const issueGraphLivenessAutoRecoveryRequestSchema = z.object({
     .optional(),
 }).strict();
 
+export const staleWakeupMaintenanceClassificationSchema = z.enum([
+  "request_not_found",
+  "status_not_eligible",
+  "run_already_linked",
+  "requested_after_cutoff",
+  "eligible_no_resolvable_issue",
+  "eligible_terminal_issue",
+  "issue_not_terminal",
+]);
+
+const staleWakeupMaintenanceSelectionShape = {
+  requestIds: z.array(z.string().uuid().transform((value) => value.toLowerCase())).min(1).max(500),
+  staleBefore: z.string().datetime({ offset: true }),
+};
+
+function requireUniqueWakeupRequestIds(
+  value: { requestIds: string[] },
+  ctx: z.RefinementCtx,
+) {
+  if (new Set(value.requestIds).size !== value.requestIds.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["requestIds"],
+      message: "requestIds must be unique",
+    });
+  }
+}
+
+export const staleWakeupMaintenancePreviewRequestSchema = z.object({
+  ...staleWakeupMaintenanceSelectionShape,
+}).strict().superRefine(requireUniqueWakeupRequestIds);
+
+export const staleWakeupMaintenanceRunRequestSchema = z.object({
+  ...staleWakeupMaintenanceSelectionShape,
+  reason: z.string().trim().min(1).max(1000),
+}).strict().superRefine(requireUniqueWakeupRequestIds);
+
+/** @deprecated Use the operation-specific preview/run request schema. */
+export const staleWakeupMaintenanceRequestSchema = staleWakeupMaintenanceRunRequestSchema;
+
+export const staleWakeupMaintenanceClassificationItemSchema = z.object({
+  requestId: z.string().uuid(),
+  eligible: z.boolean(),
+  classification: staleWakeupMaintenanceClassificationSchema,
+  wakeupStatus: z.string().nullable(),
+  runId: z.string().uuid().nullable(),
+  requestedAt: z.string().datetime().nullable(),
+  issueId: z.string().nullable(),
+  issueStatus: z.string().nullable(),
+}).strict();
+
+export const staleWakeupMaintenancePreviewSchema = z.object({
+  staleBefore: z.string().datetime(),
+  generatedAt: z.string().datetime(),
+  totals: z.object({
+    requested: z.number().int().nonnegative(),
+    eligible: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+  }).strict(),
+  classifications: z.array(staleWakeupMaintenanceClassificationItemSchema),
+}).strict();
+
+export const staleWakeupMaintenanceRunSchema = z.object({
+  staleBefore: z.string().datetime(),
+  completedAt: z.string().datetime(),
+  totals: z.object({
+    requested: z.number().int().nonnegative(),
+    cancelled: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+  }).strict(),
+  cancelledRequestIds: z.array(z.string().uuid()),
+  skipped: z.array(staleWakeupMaintenanceClassificationItemSchema),
+}).strict();
+
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
 export type PatchInstanceGeneralSettings = z.infer<typeof patchInstanceGeneralSettingsSchema>;
 export type InstanceExperimentalSettings = z.infer<typeof instanceExperimentalSettingsSchema>;
@@ -84,6 +158,22 @@ export type PatchInstanceSettings = z.infer<typeof patchInstanceSettingsSchema>;
 export type IssueGraphLivenessAutoRecoveryRequest = z.infer<
   typeof issueGraphLivenessAutoRecoveryRequestSchema
 >;
+export type StaleWakeupMaintenanceClassification = z.infer<
+  typeof staleWakeupMaintenanceClassificationSchema
+>;
+export type StaleWakeupMaintenancePreviewRequest = z.infer<
+  typeof staleWakeupMaintenancePreviewRequestSchema
+>;
+export type StaleWakeupMaintenanceRunRequest = z.infer<
+  typeof staleWakeupMaintenanceRunRequestSchema
+>;
+/** @deprecated Use StaleWakeupMaintenanceRunRequest. */
+export type StaleWakeupMaintenanceRequest = StaleWakeupMaintenanceRunRequest;
+export type StaleWakeupMaintenanceClassificationItem = z.infer<
+  typeof staleWakeupMaintenanceClassificationItemSchema
+>;
+export type StaleWakeupMaintenancePreview = z.infer<typeof staleWakeupMaintenancePreviewSchema>;
+export type StaleWakeupMaintenanceRun = z.infer<typeof staleWakeupMaintenanceRunSchema>;
 
 export const instanceSettingsSchema = z.object({
   id: z.string().uuid(),

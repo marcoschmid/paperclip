@@ -62,15 +62,73 @@ export interface LogActivityInput {
   details?: Record<string, unknown> | null;
 }
 
-export async function logActivity(db: Db, input: LogActivityInput) {
-  const currentUserRedactionOptions = {
-    enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
-  };
-  const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
-  const redactedDetails = sanitizedDetails
-    ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
-    : null;
-  await db.insert(activityLog).values({
+export type PreparedLoggedActivity = {
+  input: LogActivityInput;
+  redactedDetails: Record<string, unknown> | null;
+};
+
+export type LogActivitiesOptions = {
+  censorUsernameInLogs?: boolean;
+  publish?: boolean;
+};
+
+export function publishLoggedActivities(prepared: PreparedLoggedActivity[]) {
+  for (const { input, redactedDetails } of prepared) {
+    publishLiveEvent({
+      companyId: input.companyId,
+      type: "activity.logged",
+      payload: {
+        actorType: input.actorType,
+        actorId: input.actorId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+        details: redactedDetails,
+      },
+    });
+
+    const pluginEventType = eventTypeForActivityAction(input.action);
+    if (pluginEventType) {
+      const event: PluginEvent = {
+        eventId: randomUUID(),
+        eventType: pluginEventType,
+        occurredAt: new Date().toISOString(),
+        actorId: input.actorId,
+        actorType: input.actorType,
+        entityId: input.entityId,
+        entityType: input.entityType,
+        companyId: input.companyId,
+        payload: {
+          ...redactedDetails,
+          agentId: input.agentId ?? null,
+          runId: input.runId ?? null,
+        },
+      };
+      publishPluginDomainEvent(event);
+    }
+  }
+}
+
+export async function logActivities(
+  db: Db,
+  inputs: LogActivityInput[],
+  options?: LogActivitiesOptions,
+): Promise<PreparedLoggedActivity[]> {
+  if (inputs.length === 0) return [];
+  const censorUsernameInLogs = options?.censorUsernameInLogs
+    ?? (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs;
+  const currentUserRedactionOptions = { enabled: censorUsernameInLogs };
+  const prepared = inputs.map((input) => {
+    const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
+    const redactedDetails = sanitizedDetails
+      ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions) as Record<string, unknown>
+      : null;
+    return { input, redactedDetails };
+  });
+
+  await db.insert(activityLog).values(prepared.map(({ input, redactedDetails }) => ({
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -80,40 +138,12 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     agentId: input.agentId ?? null,
     runId: input.runId ?? null,
     details: redactedDetails,
-  });
+  })));
 
-  publishLiveEvent({
-    companyId: input.companyId,
-    type: "activity.logged",
-    payload: {
-      actorType: input.actorType,
-      actorId: input.actorId,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId,
-      agentId: input.agentId ?? null,
-      runId: input.runId ?? null,
-      details: redactedDetails,
-    },
-  });
+  if (options?.publish !== false) publishLoggedActivities(prepared);
+  return prepared;
+}
 
-  const pluginEventType = eventTypeForActivityAction(input.action);
-  if (pluginEventType) {
-    const event: PluginEvent = {
-      eventId: randomUUID(),
-      eventType: pluginEventType,
-      occurredAt: new Date().toISOString(),
-      actorId: input.actorId,
-      actorType: input.actorType,
-      entityId: input.entityId,
-      entityType: input.entityType,
-      companyId: input.companyId,
-      payload: {
-        ...redactedDetails,
-        agentId: input.agentId ?? null,
-        runId: input.runId ?? null,
-      },
-    };
-    publishPluginDomainEvent(event);
-  }
+export async function logActivity(db: Db, input: LogActivityInput) {
+  return (await logActivities(db, [input]))[0];
 }

@@ -16,6 +16,10 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
  */
 
 const mockTransport = vi.hoisted(() => vi.fn(() => ({ write: vi.fn() })));
+const mockPinoHttp = vi.hoisted(() => vi.fn(() => vi.fn()));
+const mockOpenSync = vi.hoisted(() => vi.fn(() => 7));
+const mockCloseSync = vi.hoisted(() => vi.fn());
+const mockChmodSync = vi.hoisted(() => vi.fn());
 const mockPino = vi.hoisted(() => {
   const fn = vi.fn(() => ({
     info: vi.fn(),
@@ -31,14 +35,20 @@ const mockPino = vi.hoisted(() => {
 // Mock fs so the module-level mkdirSync call is a no-op in tests.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, mkdirSync: vi.fn() };
+  return {
+    ...actual,
+    mkdirSync: vi.fn(),
+    openSync: mockOpenSync,
+    closeSync: mockCloseSync,
+    chmodSync: mockChmodSync,
+  };
 });
 
 vi.mock("pino", () => ({
   default: mockPino,
 }));
 vi.mock("pino-http", () => ({
-  pinoHttp: vi.fn(() => vi.fn()),
+  pinoHttp: mockPinoHttp,
 }));
 vi.mock("../config-file.js", () => ({
   readConfigFile: vi.fn(() => null),
@@ -63,6 +73,41 @@ describe("logger translateTime respects TZ environment variable", () => {
     for (const target of targets) {
       expect(target.options.translateTime).toBe("SYS:HH:MM:ss");
     }
+    expect(mockOpenSync).toHaveBeenCalledWith("/tmp/paperclip-test-logs/server.log", "a", 0o600);
+    expect(mockCloseSync).toHaveBeenCalledWith(7);
+    expect(mockChmodSync).toHaveBeenCalledWith("/tmp/paperclip-test-logs/server.log", 0o600);
+    const loggerOptions = mockPino.mock.calls[0][0] as {
+      hooks?: { logMethod?: (args: unknown[], method: (...values: unknown[]) => unknown) => unknown };
+    };
+    const method = vi.fn();
+    const token = "pcp_logger_hook_secret";
+    loggerOptions.hooks?.logMethod?.([{ output: token }, token], method);
+    expect(method).toHaveBeenCalledOnce();
+    expect(JSON.stringify(method.mock.calls)).not.toContain(token);
+  });
+
+  it("redacts credential-bearing URLs in success and error messages", async () => {
+    vi.resetModules();
+    await import("../middleware/logger.js");
+
+    const opts = mockPinoHttp.mock.calls[0][0] as {
+      customSuccessMessage: (req: { method: string; url: string }, res: { statusCode: number }) => string;
+      customErrorMessage: (
+        req: { method: string; url: string },
+        res: { statusCode: number },
+        err: { message: string },
+      ) => string;
+    };
+    const secret = "pcp_board_secret_value";
+    expect(opts.customSuccessMessage(
+      { method: "GET", url: `/invite/${secret}` },
+      { statusCode: 200 },
+    )).not.toContain(secret);
+    expect(opts.customErrorMessage(
+      { method: "GET", url: `/api/cli-auth/poll?token=${secret}` },
+      { statusCode: 401 },
+      { message: `bad token ${secret}` },
+    )).not.toContain(secret);
   });
 
   it("SYS: prefix produces timezone-sensitive output: UTC epoch formats differently under UTC vs UTC+8", () => {

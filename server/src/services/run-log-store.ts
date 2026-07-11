@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { redactSensitiveText } from "../redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -50,10 +51,11 @@ function resolveWithin(basePath: string, relativePath: string) {
   return resolved;
 }
 
-function createLocalFileRunLogStore(basePath: string): RunLogStore {
+export function createLocalFileRunLogStore(basePath: string): RunLogStore {
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    await fs.chmod(dir, 0o700);
   }
 
   async function readFileRange(filePath: string, offset: number, limitBytes: number): Promise<RunLogReadResult> {
@@ -101,7 +103,8 @@ function createLocalFileRunLogStore(basePath: string): RunLogStore {
       await ensureDir(relDir);
 
       const absPath = resolveWithin(basePath, relPath);
-      await fs.writeFile(absPath, "", "utf8");
+      await fs.writeFile(absPath, "", { encoding: "utf8", mode: 0o600 });
+      await fs.chmod(absPath, 0o600);
 
       return { store: "local_file", logRef: relPath };
     },
@@ -112,10 +115,10 @@ function createLocalFileRunLogStore(basePath: string): RunLogStore {
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        chunk: redactSensitiveText(event.chunk),
       });
       const persisted = `${line}\n`;
-      await fs.appendFile(absPath, persisted, "utf8");
+      await fs.appendFile(absPath, persisted, { encoding: "utf8", mode: 0o600 });
       return Buffer.byteLength(persisted, "utf8");
     },
 

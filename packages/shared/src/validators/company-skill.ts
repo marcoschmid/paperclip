@@ -147,6 +147,7 @@ export const companySkillForkSchema = z.object({
 }).default({});
 
 export const companySkillUpdateSchema = z.object({
+  compatibility: companySkillCompatibilitySchema.optional(),
   description: z.string().nullable().optional(),
   iconUrl: z.string().nullable().optional(),
   color: z.string().nullable().optional(),

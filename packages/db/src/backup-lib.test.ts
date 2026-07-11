@@ -133,6 +133,8 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         expect(result.backupFile).toMatch(/paperclip-test-.*\.sql\.gz$/);
         expect(result.sizeBytes).toBeGreaterThan(0);
         expect(fs.existsSync(result.backupFile)).toBe(true);
+        expect(fs.statSync(result.backupFile).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(backupDir).mode & 0o777).toBe(0o700);
 
         await runDatabaseRestore({
           connectionString: restoreConnectionString,

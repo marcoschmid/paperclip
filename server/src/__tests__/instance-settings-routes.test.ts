@@ -15,6 +15,10 @@ const mockHeartbeatService = vi.hoisted(() => ({
   buildIssueGraphLivenessAutoRecoveryPreview: vi.fn(),
   reconcileIssueGraphLiveness: vi.fn(),
 }));
+const mockStaleWakeupMaintenanceService = vi.hoisted(() => ({
+  preview: vi.fn(),
+  run: vi.fn(),
+}));
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
@@ -25,6 +29,7 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => mockInstanceSettingsService,
     logActivity: mockLogActivity,
+    staleWakeupMaintenanceService: () => mockStaleWakeupMaintenanceService,
   }));
   vi.doMock("../services/environments.js", () => ({
     environmentService: () => mockEnvironmentService,
@@ -65,6 +70,8 @@ describe("instance settings routes", () => {
     mockInstanceSettingsService.listCompanyIds.mockReset();
     mockHeartbeatService.buildIssueGraphLivenessAutoRecoveryPreview.mockReset();
     mockHeartbeatService.reconcileIssueGraphLiveness.mockReset();
+    mockStaleWakeupMaintenanceService.preview.mockReset();
+    mockStaleWakeupMaintenanceService.run.mockReset();
     mockEnvironmentService.getById.mockReset();
     mockLogActivity.mockReset();
     mockInstanceSettingsService.get.mockResolvedValue({
@@ -178,6 +185,19 @@ describe("instance settings routes", () => {
       skippedAutoRecoveryDisabled: 0,
       skippedOutsideLookback: 0,
       escalationIssueIds: ["issue-2"],
+    });
+    mockStaleWakeupMaintenanceService.preview.mockResolvedValue({
+      staleBefore: "2026-05-01T00:00:00.000Z",
+      generatedAt: "2026-07-11T12:00:00.000Z",
+      totals: { requested: 1, eligible: 0, skipped: 1 },
+      classifications: [],
+    });
+    mockStaleWakeupMaintenanceService.run.mockResolvedValue({
+      staleBefore: "2026-05-01T00:00:00.000Z",
+      completedAt: "2026-07-11T12:00:00.000Z",
+      totals: { requested: 1, cancelled: 0, skipped: 1 },
+      cancelledRequestIds: [],
+      skipped: [],
     });
     mockEnvironmentService.getById.mockResolvedValue({
       id: "env-1",
