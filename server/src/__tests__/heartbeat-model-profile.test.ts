@@ -35,8 +35,8 @@ describe("heartbeat model profile application", () => {
       configSource: "adapter_default",
       fallbackReason: null,
       adapterConfig: {
-        model: "gpt-5.3-codex-spark",
-        modelReasoningEffort: "high",
+        model: "gpt-5.6-luna",
+        modelReasoningEffort: "low",
       },
     });
   });

@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest";
 import { buildCodexExecArgs } from "./codex-args.js";
 
 describe("buildCodexExecArgs", () => {
+  it("enables Codex fast mode overrides for GPT-5.6", () => {
+    const result = buildCodexExecArgs({
+      model: "gpt-5.6",
+      fastMode: true,
+    });
+
+    expect(result.fastModeApplied).toBe(true);
+    expect(result.fastModeIgnoredReason).toBeNull();
+    expect(result.args).toContain("gpt-5.6");
+    expect(result.args).toContain('service_tier="fast"');
+  });
+
   it("enables Codex fast mode overrides for GPT-5.4", () => {
     const result = buildCodexExecArgs({
       model: "gpt-5.4",
@@ -98,7 +110,7 @@ describe("buildCodexExecArgs", () => {
     expect(result.fastModeRequested).toBe(true);
     expect(result.fastModeApplied).toBe(false);
     expect(result.fastModeIgnoredReason).toContain(
-      "currently only supported on gpt-5.5, gpt-5.4 or manually configured model IDs",
+      "currently only supported on gpt-5.6, gpt-5.5, gpt-5.4 or manually configured model IDs",
     );
     expect(result.args).toEqual([
       "exec",
