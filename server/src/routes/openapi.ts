@@ -460,6 +460,38 @@ const jsonBody = (schema: z.ZodTypeAny) => ({
 
 const r = responses;
 
+const upsertDecisionSchema = z
+  .object({
+    sourceProjectSlug: z.string().min(1),
+    sourceKey: z.string().min(1).max(200),
+    sourceHash: z.string().min(1),
+    title: z.string().min(1),
+    decision: z.string().min(1),
+    context: z.string().nullable().optional(),
+    consequences: z.string().nullable().optional(),
+    status: z.enum(["proposed", "accepted", "deprecated", "superseded"]).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    supersededBy: z.string().uuid().nullable().optional(),
+    decidedAt: z.coerce.date().nullable().optional(),
+    createdByAgentId: z.string().uuid().nullable().optional(),
+    createdByUserId: z.string().nullable().optional(),
+  })
+  .strict();
+
+const upsertProjectDocumentSchema = z
+  .object({
+    body: z.string(),
+    title: z.string().nullable().optional(),
+    format: z.string().min(1).optional(),
+    changeSummary: z.string().nullable().optional(),
+    tags: z.array(z.unknown()).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    createdByAgentId: z.string().uuid().nullable().optional(),
+    createdByUserId: z.string().nullable().optional(),
+    createdByRunId: z.string().uuid().nullable().optional(),
+  })
+  .strict();
+
 const externalObjectSummariesBodySchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
 }).strict();
@@ -2023,6 +2055,66 @@ registry.registerPath({
   summary: "Delete a project",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/projects/{projectId}/decisions",
+  tags: ["projects"],
+  summary: "List project decisions",
+  request: { params: z.object({ companyId: z.string(), projectId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/projects/{projectId}/decisions/{sourceKey}",
+  tags: ["projects"],
+  summary: "Get a project decision by source key",
+  request: { params: z.object({ companyId: z.string(), projectId: z.string(), sourceKey: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/projects/{projectId}/decisions",
+  tags: ["projects"],
+  summary: "Upsert a project decision",
+  request: {
+    params: z.object({ companyId: z.string(), projectId: z.string() }),
+    body: jsonBody(upsertDecisionSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/projects/{projectId}/documents",
+  tags: ["projects"],
+  summary: "List project-memory documents",
+  request: { params: z.object({ companyId: z.string(), projectId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/projects/{projectId}/documents/{key}",
+  tags: ["projects"],
+  summary: "Get a project-memory document by key",
+  request: { params: z.object({ companyId: z.string(), projectId: z.string(), key: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/projects/{projectId}/documents/{key}",
+  tags: ["projects"],
+  summary: "Upsert a project-memory document",
+  request: {
+    params: z.object({ companyId: z.string(), projectId: z.string(), key: z.string() }),
+    body: jsonBody(upsertProjectDocumentSchema),
+  },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
