@@ -2810,7 +2810,7 @@ async function startLocalRuntimeService(input: {
     command,
     cwd: serviceCwd,
     envFingerprint: serviceIdentityFingerprint,
-    port: port ?? identityPort,
+    port: identityPort,
     url,
   });
   if (adoptedRecord) {

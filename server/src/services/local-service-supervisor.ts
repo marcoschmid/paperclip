@@ -391,6 +391,23 @@ export async function terminateLocalService(
 
 export async function readLocalServicePortOwner(port: number) {
   if (!Number.isInteger(port) || port <= 0 || process.platform === "win32") return null;
+  if (process.platform === "darwin") {
+    try {
+      const { stdout } = await execFileAsync("netstat", ["-anv", "-p", "tcp"]);
+      const portSuffix = new RegExp(`[.:]${port}$`);
+      for (const line of stdout.split("\n")) {
+        const columns = line.trim().split(/\s+/);
+        if (!columns[0]?.startsWith("tcp") || columns[5] !== "LISTEN") continue;
+        if (!portSuffix.test(columns[3] ?? "")) continue;
+        const processColumn = columns.find((column) => /:\d+$/.test(column));
+        const pid = processColumn ? Number.parseInt(processColumn.slice(processColumn.lastIndexOf(":") + 1), 10) : NaN;
+        if (Number.isInteger(pid) && pid > 0) return pid;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
   try {
     const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
     const firstPid = stdout

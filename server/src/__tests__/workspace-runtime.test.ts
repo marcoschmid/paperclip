@@ -3120,6 +3120,63 @@ describe("ensureRuntimeServicesForRun", () => {
     expect(services).toEqual([]);
   });
 
+  it("does not scan the OS port owner when starting a freshly allocated auto-port service", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-auto-port-"));
+    const fakeBin = path.join(workspaceRoot, "fake-bin");
+    const lsofMarker = path.join(workspaceRoot, "lsof-called");
+    await fs.mkdir(fakeBin, { recursive: true });
+    await fs.writeFile(
+      path.join(fakeBin, "lsof"),
+      `#!/bin/sh\n: > ${JSON.stringify(lsofMarker)}\nexit 1\n`,
+      { mode: 0o755 },
+    );
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${originalPath ?? ""}`;
+    const runId = "run-auto-port-no-owner-scan";
+    leasedRunIds.add(runId);
+
+    try {
+      const services = await ensureRuntimeServicesForRun({
+        runId,
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+        issue: null,
+        workspace: buildWorkspace(workspaceRoot),
+        config: {
+          workspaceRuntime: {
+            services: [
+              {
+                name: "web",
+                command:
+                  "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+                port: { type: "auto" },
+                readiness: {
+                  type: "http",
+                  urlTemplate: "http://127.0.0.1:{{port}}",
+                  timeoutSec: 5,
+                  intervalMs: 100,
+                },
+                lifecycle: "ephemeral",
+              },
+            ],
+          },
+        },
+        adapterEnv: {},
+      });
+
+      expect(services).toHaveLength(1);
+      await expect(fs.stat(lsofMarker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await releaseRuntimeServicesForRun(runId);
+      leasedRunIds.delete(runId);
+      process.env.PATH = originalPath;
+    }
+  }, 10_000);
+
   it("reuses shared runtime services across runs and starts a new service after release", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-workspace-"));
     const workspace = buildWorkspace(workspaceRoot);
