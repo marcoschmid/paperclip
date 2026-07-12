@@ -436,6 +436,33 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
+  it("accepts a project workspace nested inside a git checkout", async () => {
+    const repoRoot = await createGitCheckout({ withRemote: false });
+    const nestedProjectCwd = path.join(repoRoot, "projects", "techops", "paperclip");
+    const input = buildWorkspaceValidationInput();
+
+    try {
+      await fs.mkdir(nestedProjectCwd, { recursive: true });
+
+      await expect(assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          resolvedWorkspace: buildResolvedWorkspace({ cwd: nestedProjectCwd }),
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            baseCwd: nestedProjectCwd,
+            cwd: nestedProjectCwd,
+          },
+          persistedExecutionWorkspace: {
+            ...input.persistedExecutionWorkspace!,
+            cwd: nestedProjectCwd,
+          },
+        }),
+      )).resolves.toBeUndefined();
+    } finally {
+      await fs.rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   it("does not apply the git-sensitive workspace guard to non-local execution targets", async () => {
     const input = buildWorkspaceValidationInput();
 

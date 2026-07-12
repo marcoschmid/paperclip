@@ -1457,15 +1457,6 @@ function isConfigurationIncompleteFailedRun(
   return run?.errorCode === CONFIGURATION_INCOMPLETE_FAILURE_CODE;
 }
 
-async function hasGitMetadata(cwd: string | null | undefined) {
-  const normalized = readNonEmptyString(cwd);
-  if (!normalized) return false;
-  return fs
-    .lstat(path.resolve(normalized, ".git"))
-    .then((entry) => entry.isDirectory() || entry.isFile())
-    .catch(() => false);
-}
-
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
@@ -1750,7 +1741,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && !await hasGitMetadata(effectiveCwd)) {
+  if (workspaceExpectation && effectiveCwd && !await isGitCheckout(effectiveCwd)) {
     fail(
       "missing_git_metadata",
       `Issue ${issue.identifier ?? issue.id} expected a git workspace for ${input.adapterType}, but "${effectiveCwd}" has no .git metadata.`,
