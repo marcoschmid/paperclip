@@ -448,36 +448,67 @@ describe("realizeExecutionWorkspace", () => {
     const expectedRemoteHead = await readGit(sourceRepo, ["rev-parse", "master"]);
     expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).not.toBe(expectedRemoteHead);
 
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: null,
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
+    const traceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-git-trace-"));
+    const tracePath = path.join(traceDir, "trace.json");
+    const previousGitTrace = process.env.GIT_TRACE2_EVENT;
+    let workspace!: RealizedExecutionWorkspace;
+    process.env.GIT_TRACE2_EVENT = tracePath;
+    try {
+      workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: null,
         },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-447",
-        title: "Add Worktree Support",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-447",
+          title: "Add Worktree Support",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } finally {
+      if (previousGitTrace === undefined) delete process.env.GIT_TRACE2_EVENT;
+      else process.env.GIT_TRACE2_EVENT = previousGitTrace;
+    }
+
+    const defaultBaseFetches = (await fs.readFile(tracePath, "utf8"))
+      .split("\n")
+      .filter((line) => line.includes('"argv":["git","fetch","--prune","origin","+refs/heads/master:refs/remotes/origin/master"]'));
 
     expect(workspace.baseRefSha).toBe(expectedRemoteHead);
     expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(expectedRemoteHead);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(expectedRemoteHead);
+    expect(defaultBaseFetches).toHaveLength(1);
+  });
+
+  it("warns when the default remote base cannot refresh and only a stale tracking ref remains", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const staleRemoteHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);
+    const missingRemoteRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-missing-remote-"));
+    const missingRemotePath = path.join(missingRemoteRoot, "missing.git");
+    await runGit(repoRoot, ["remote", "set-url", "origin", missingRemotePath]);
+
+    const workspace = await realizeWorktreeForTest(repoRoot, null);
+
+    expect(workspace.baseRefSha).toBe(staleRemoteHead);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(staleRemoteHead);
+    expect(workspace.warnings).toEqual([
+      expect.stringContaining("Could not refresh base ref origin/master"),
+    ]);
   });
 
   it("creates and reuses a git worktree for an issue-scoped branch", async () => {

@@ -968,11 +968,14 @@ async function resolveAuthoritativeBaseRef(
   configuredBaseRef: string | null,
 ): Promise<{ baseRef: string; warnings: string[]; refreshed: boolean }> {
   const warnings: string[] = [];
-  const detectOrHead = async () => (await detectDefaultBranch(repoRoot)) ?? "HEAD";
 
   const configured = configuredBaseRef?.trim();
   if (!configured || configured === "HEAD") {
-    return { baseRef: await detectOrHead(), warnings, refreshed: false };
+    return await detectDefaultBranch(repoRoot) ?? {
+      baseRef: "HEAD",
+      warnings,
+      refreshed: false,
+    };
   }
 
   if (parseRemoteTrackingRef(configured)) {
@@ -1154,12 +1157,27 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
-async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
+async function detectDefaultBranch(repoRoot: string): Promise<{
+  baseRef: string;
+  warnings: string[];
+  refreshed: boolean;
+} | null> {
+  const inspectCandidate = async (candidate: string) => {
+    const remoteTracking = parseRemoteTrackingRef(candidate);
+    const warnings = remoteTracking
+      ? await refreshRemoteTrackingBaseRef(repoRoot, candidate)
+      : [];
+    if (!await resolveBaseRefSha(repoRoot, candidate)) return null;
+    return {
+      baseRef: candidate,
+      warnings,
+      refreshed: remoteTracking !== null,
+    };
+  };
+
   const originMasterRef = "origin/master";
-  await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef);
-  if (await resolveBaseRefSha(repoRoot, originMasterRef)) {
-    return originMasterRef;
-  }
+  const originMaster = await inspectCandidate(originMasterRef);
+  if (originMaster) return originMaster;
 
   // Try the explicit remote HEAD first (set by git clone or git remote set-head)
   try {
@@ -1168,8 +1186,8 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
       repoRoot,
     );
     if (remoteHead) {
-      await refreshRemoteTrackingBaseRef(repoRoot, remoteHead);
-      if (await resolveBaseRefSha(repoRoot, remoteHead)) return remoteHead;
+      const detectedRemoteHead = await inspectCandidate(remoteHead);
+      if (detectedRemoteHead) return detectedRemoteHead;
     }
   } catch {
     // Not set — fall through to heuristic
@@ -1177,13 +1195,8 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
 
   // Fallback: check for common default branch names on the remote
   for (const candidate of ["origin/master", "origin/main", "main", "master"]) {
-    try {
-      await refreshRemoteTrackingBaseRef(repoRoot, candidate);
-      await runGit(["rev-parse", "--verify", `${candidate}^{commit}`], repoRoot);
-      return candidate;
-    } catch {
-      // Not found — try next
-    }
+    const detected = await inspectCandidate(candidate);
+    if (detected) return detected;
   }
 
   return null;
@@ -2072,7 +2085,9 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ) {
       throw error;
     }
-    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    const baseRef = input.workspace.baseRef
+      ?? (await detectDefaultBranch(repoRoot))?.baseRef
+      ?? "HEAD";
     const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
