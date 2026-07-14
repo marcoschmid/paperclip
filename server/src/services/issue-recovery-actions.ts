@@ -8,6 +8,11 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
+import { assertHistoricalAgentTombstoneActiveReference } from "./agent-retirement-historical-tombstones.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -95,6 +100,13 @@ function isUniqueRecoveryActionConflict(error: unknown) {
 
 export function issueRecoveryActionService(db: Db) {
   const upsertQueues = new Map<string, Promise<void>>();
+  const supportsWriteTransactions = typeof (db as Db & { transaction?: Db["transaction"] }).transaction === "function";
+
+  async function withWriteTransaction<T>(task: (tx: DbOrTransaction) => Promise<T>): Promise<T> {
+    return supportsWriteTransactions
+      ? db.transaction((tx) => task(tx))
+      : task(db);
+  }
 
   async function runExclusiveUpsert<T>(
     input: UpsertIssueRecoveryActionInput,
@@ -175,43 +187,56 @@ export function issueRecoveryActionService(db: Db) {
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
   ): Promise<IssueRecoveryAction> {
+    assertHistoricalAgentTombstoneActiveReference(input.ownerAgentId);
     const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
+    assertHistoricalAgentTombstoneActiveReference(existing?.ownerAgentId);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
-      const [updated] = await db
-        .update(issueRecoveryActions)
-        .set({
-          recoveryIssueId: input.recoveryIssueId ?? null,
-          kind: input.kind,
-          status: "active",
-          ownerType,
-          ownerAgentId: input.ownerAgentId ?? null,
-          ownerUserId: input.ownerUserId ?? null,
-          previousOwnerAgentId: input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
-          returnOwnerAgentId: input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
-          cause: input.cause,
-          fingerprint: input.fingerprint,
-          evidence: input.evidence ?? existing.evidence,
-          nextAction: input.nextAction,
-          wakePolicy: input.wakePolicy ?? null,
-          monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: existing.attemptCount + 1,
-          maxAttempts: input.maxAttempts ?? null,
-          timeoutAt: input.timeoutAt ?? null,
-          lastAttemptAt: input.lastAttemptAt ?? now,
-          outcome: null,
-          resolutionNote: null,
-          resolvedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issueRecoveryActions.id, existing.id),
-            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-          ),
-        )
-        .returning();
+      const [updated] = await withWriteTransaction(async (tx) => {
+        const ownerAgentId = input.ownerAgentId && supportsWriteTransactions
+          ? canonicalizeAgentReferenceId(input.ownerAgentId)
+          : input.ownerAgentId ?? null;
+        if (ownerAgentId && supportsWriteTransactions) {
+          await lockAgentLifecycleReference(tx as Db, {
+            companyId: input.companyId,
+            agentId: ownerAgentId,
+          });
+        }
+        return tx
+          .update(issueRecoveryActions)
+          .set({
+            recoveryIssueId: input.recoveryIssueId ?? null,
+            kind: input.kind,
+            status: "active",
+            ownerType,
+            ownerAgentId,
+            ownerUserId: input.ownerUserId ?? null,
+            previousOwnerAgentId: input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
+            returnOwnerAgentId: input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
+            cause: input.cause,
+            fingerprint: input.fingerprint,
+            evidence: input.evidence ?? existing.evidence,
+            nextAction: input.nextAction,
+            wakePolicy: input.wakePolicy ?? null,
+            monitorPolicy: input.monitorPolicy ?? null,
+            attemptCount: existing.attemptCount + 1,
+            maxAttempts: input.maxAttempts ?? null,
+            timeoutAt: input.timeoutAt ?? null,
+            lastAttemptAt: input.lastAttemptAt ?? now,
+            outcome: null,
+            resolutionNote: null,
+            resolvedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, existing.id),
+              inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+            ),
+          )
+          .returning();
+      });
       if (!updated) {
         return retryUpsertSourceScoped(input, retryCount);
       }
@@ -219,31 +244,42 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
-      const [created] = await db
-        .insert(issueRecoveryActions)
-        .values({
-          companyId: input.companyId,
-          sourceIssueId: input.sourceIssueId,
-          recoveryIssueId: input.recoveryIssueId ?? null,
-          kind: input.kind,
-          status: "active",
-          ownerType,
-          ownerAgentId: input.ownerAgentId ?? null,
-          ownerUserId: input.ownerUserId ?? null,
-          previousOwnerAgentId: input.previousOwnerAgentId ?? null,
-          returnOwnerAgentId: input.returnOwnerAgentId ?? null,
-          cause: input.cause,
-          fingerprint: input.fingerprint,
-          evidence: input.evidence ?? {},
-          nextAction: input.nextAction,
-          wakePolicy: input.wakePolicy ?? null,
-          monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: 1,
-          maxAttempts: input.maxAttempts ?? null,
-          timeoutAt: input.timeoutAt ?? null,
-          lastAttemptAt: input.lastAttemptAt ?? now,
-        })
-        .returning();
+      const [created] = await withWriteTransaction(async (tx) => {
+        const ownerAgentId = input.ownerAgentId && supportsWriteTransactions
+          ? canonicalizeAgentReferenceId(input.ownerAgentId)
+          : input.ownerAgentId ?? null;
+        if (ownerAgentId && supportsWriteTransactions) {
+          await lockAgentLifecycleReference(tx as Db, {
+            companyId: input.companyId,
+            agentId: ownerAgentId,
+          });
+        }
+        return tx
+          .insert(issueRecoveryActions)
+          .values({
+            companyId: input.companyId,
+            sourceIssueId: input.sourceIssueId,
+            recoveryIssueId: input.recoveryIssueId ?? null,
+            kind: input.kind,
+            status: "active",
+            ownerType,
+            ownerAgentId,
+            ownerUserId: input.ownerUserId ?? null,
+            previousOwnerAgentId: input.previousOwnerAgentId ?? null,
+            returnOwnerAgentId: input.returnOwnerAgentId ?? null,
+            cause: input.cause,
+            fingerprint: input.fingerprint,
+            evidence: input.evidence ?? {},
+            nextAction: input.nextAction,
+            wakePolicy: input.wakePolicy ?? null,
+            monitorPolicy: input.monitorPolicy ?? null,
+            attemptCount: 1,
+            maxAttempts: input.maxAttempts ?? null,
+            timeoutAt: input.timeoutAt ?? null,
+            lastAttemptAt: input.lastAttemptAt ?? now,
+          })
+          .returning();
+      });
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;

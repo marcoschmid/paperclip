@@ -1,8 +1,10 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentPortfolioMaintenanceGates,
+  agentWakeupRequests,
   agents,
   companies,
   companySecretBindings,
@@ -20,6 +22,7 @@ import {
   projectWorkspaces,
   projects,
   routineDocuments,
+  routineRunDeliveries,
   routineRuns,
   routines,
   routineTriggers,
@@ -37,6 +40,7 @@ import { secretService } from "../services/secrets.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 const originalSecretsProviderEnv = process.env.PAPERCLIP_SECRETS_PROVIDER;
 
 if (!embeddedPostgresSupport.supported) {
@@ -73,7 +77,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await db.delete(documentRevisions);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
+    await db.delete(agentPortfolioMaintenanceGates);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
@@ -95,11 +101,17 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         triggerDetail?: string;
         reason?: string | null;
         payload?: Record<string, unknown> | null;
+        idempotencyKey?: string | null;
         requestedByActorType?: "user" | "agent" | "system";
         requestedByActorId?: string | null;
         contextSnapshot?: Record<string, unknown>;
       },
     ) => Promise<unknown>;
+    persistCustomWakeEvidence?: boolean;
+    routineDeliveryMaxAttempts?: number;
+    routineDeliveryNow?: () => Date;
+    routineDeliveryClaimLeaseMs?: number;
+    routineDeliveryRetryBaseMs?: number;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -113,6 +125,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         triggerDetail?: string;
         reason?: string | null;
         payload?: Record<string, unknown> | null;
+        idempotencyKey?: string | null;
         requestedByActorType?: "user" | "agent" | "system";
         requestedByActorId?: string | null;
         contextSnapshot?: Record<string, unknown>;
@@ -147,10 +160,18 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
 
     const svc = routineService(db, {
+      routineDeliveryMaxAttempts: opts?.routineDeliveryMaxAttempts,
+      routineDeliveryNow: opts?.routineDeliveryNow,
+      routineDeliveryClaimLeaseMs: opts?.routineDeliveryClaimLeaseMs,
+      routineDeliveryRetryBaseMs: opts?.routineDeliveryRetryBaseMs,
       heartbeat: {
         wakeup: async (wakeupAgentId, wakeupOpts) => {
           wakeups.push({ agentId: wakeupAgentId, opts: wakeupOpts });
-          if (opts?.wakeup) return opts.wakeup(wakeupAgentId, wakeupOpts);
+          const customResult = opts?.wakeup
+            ? await opts.wakeup(wakeupAgentId, wakeupOpts)
+            : undefined;
+          if (opts?.wakeup && (customResult === null || customResult === undefined)) return customResult;
+          if (opts?.wakeup && opts.persistCustomWakeEvidence === false) return customResult;
           const issueId =
             (typeof wakeupOpts.payload?.issueId === "string" && wakeupOpts.payload.issueId) ||
             (typeof wakeupOpts.contextSnapshot?.issueId === "string" && wakeupOpts.contextSnapshot.issueId) ||
@@ -161,17 +182,48 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
             .from(issues)
             .where(eq(issues.id, issueId))
             .then((rows) => rows[0] ?? null);
-          const queuedRunId = randomUUID();
-          await db.insert(heartbeatRuns).values({
-            id: queuedRunId,
+          const customRunId = customResult && typeof customResult === "object" &&
+            "id" in customResult && typeof customResult.id === "string"
+            ? customResult.id
+            : null;
+          const existingRun = customRunId
+            ? await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, customRunId)).then((rows) => rows[0] ?? null)
+            : null;
+          const queuedRunId = existingRun?.id ?? customRunId ?? randomUUID();
+          const wakeupRequestId = randomUUID();
+          await db.insert(agentWakeupRequests).values({
+            id: wakeupRequestId,
             companyId,
             agentId: wakeupAgentId,
-            invocationSource: wakeupOpts.source ?? "assignment",
+            source: wakeupOpts.source ?? "assignment",
             triggerDetail: wakeupOpts.triggerDetail ?? null,
+            reason: wakeupOpts.reason ?? null,
+            payload: wakeupOpts.payload ?? { issueId },
             status: "queued",
-            responsibleUserId: issue?.responsibleUserId ?? defaultResponsibleUserId,
-            contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+            requestedByActorType: wakeupOpts.requestedByActorType ?? null,
+            requestedByActorId: wakeupOpts.requestedByActorId ?? null,
+            idempotencyKey: wakeupOpts.idempotencyKey ?? null,
+            runId: queuedRunId,
           });
+          if (existingRun) {
+            await db.update(heartbeatRuns).set({
+              wakeupRequestId,
+              contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+            }).where(eq(heartbeatRuns.id, queuedRunId));
+          } else {
+            await db.insert(heartbeatRuns).values({
+              id: queuedRunId,
+              companyId,
+              agentId: wakeupAgentId,
+              invocationSource: wakeupOpts.source ?? "assignment",
+              triggerDetail: wakeupOpts.triggerDetail ?? null,
+              status: "queued",
+              responsibleUserId: issue?.responsibleUserId ?? defaultResponsibleUserId,
+              wakeupRequestId,
+              contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+            });
+          }
           await db
             .update(issues)
             .set({
@@ -235,6 +287,104 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(projectRoutines.map((entry) => entry.id)).toEqual([routine.id]);
     expect(allRoutines.map((entry) => entry.id)).toEqual(expect.arrayContaining([routine.id, otherRoutine.id]));
+  });
+
+  it("blocks historical tombstone assignment on active routine create and patch without partial writes", async () => {
+    const { companyId, projectId, routine, svc } = await seedFixture();
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const revisionsBefore = await svc.listRevisions(routine.id);
+
+    await expect(svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "Must not be created",
+        description: null,
+        assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    )).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    await expect(svc.update(routine.id, {
+      assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+    }, {})).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    const forbiddenCreate = await db
+      .select({ id: routines.id })
+      .from(routines)
+      .where(eq(routines.title, "Must not be created"));
+    expect(forbiddenCreate).toHaveLength(0);
+    await expect(svc.get(routine.id)).resolves.toMatchObject({
+      assigneeAgentId: routine.assigneeAgentId,
+      latestRevisionNumber: routine.latestRevisionNumber,
+    });
+    await expect(svc.listRevisions(routine.id)).resolves.toHaveLength(revisionsBefore.length);
+
+    const disabledTrigger = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 8 * * *",
+      timezone: "UTC",
+      enabled: false,
+    }, {});
+    await db
+      .update(routines)
+      .set({ assigneeAgentId: HISTORICAL_TOMBSTONE_ID })
+      .where(eq(routines.id, routine.id));
+    const triggerCountBefore = (await db.select().from(routineTriggers)).length;
+    const revisionCountBefore = (await svc.listRevisions(routine.id)).length;
+
+    await expect(svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+      enabled: true,
+    }, {})).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+    await expect(svc.updateTrigger(disabledTrigger.trigger.id, { enabled: true }, {}))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          code: "historical_agent_tombstone_active_reference_forbidden",
+          agentId: HISTORICAL_TOMBSTONE_ID,
+        },
+      });
+
+    await expect(db.select().from(routineTriggers)).resolves.toHaveLength(triggerCountBefore);
+    await expect(svc.getTrigger(disabledTrigger.trigger.id)).resolves.toMatchObject({ enabled: false });
+    await expect(svc.listRevisions(routine.id)).resolves.toHaveLength(revisionCountBefore);
   });
 
   it("creates a fresh execution issue when the previous routine issue is open but idle", async () => {
@@ -684,10 +834,60 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(revisions[0]?.snapshot.triggers).toHaveLength(0);
   });
 
+  it("applies trigger and revision CAS atomically and rejects stale or racing writers without partial history", async () => {
+    const { routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 8 * * *",
+      timezone: "UTC",
+    }, {});
+    const baseRevisionId = created.revision.id;
+    const before = await svc.listRevisions(routine.id);
+
+    const stale = await svc.updateTrigger(created.trigger.id, {
+      enabled: false,
+      baseRevisionId: routine.latestRevisionId,
+    }, {}).catch((error) => error);
+    expect(stale).toMatchObject({
+      status: 409,
+      details: { currentRevisionId: baseRevisionId },
+    });
+    expect((await svc.getTrigger(created.trigger.id))?.enabled).toBe(true);
+    expect(await svc.listRevisions(routine.id)).toHaveLength(before.length);
+
+    const raced = await Promise.allSettled([
+      svc.updateTrigger(created.trigger.id, {
+        label: "winner-a",
+        baseRevisionId,
+      }, {}),
+      svc.updateTrigger(created.trigger.id, {
+        label: "winner-b",
+        baseRevisionId,
+      }, {}),
+    ]);
+    expect(raced.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejected = raced.find((result) => result.status === "rejected");
+    expect(rejected).toMatchObject({
+      status: "rejected",
+      reason: { status: 409 },
+    });
+    const after = await svc.listRevisions(routine.id);
+    expect(after).toHaveLength(before.length + 1);
+    const currentRoutine = await svc.get(routine.id);
+    expect(currentRoutine?.latestRevisionId).toBe(after[0]?.id);
+    const winner = raced.find((result) => result.status === "fulfilled");
+    if (winner?.status === "fulfilled") {
+      expect(winner.value?.revision.id).toBe(currentRoutine?.latestRevisionId);
+    }
+  });
+
   it("wakes the assignee when a routine creates a fresh execution issue", async () => {
     const { agentId, routine, svc, wakeups } = await seedFixture();
 
     const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+    expect(await db.select().from(routineRunDeliveries).where(eq(routineRunDeliveries.routineRunId, run.id)))
+      .toEqual([expect.objectContaining({ status: "delivered", lastError: null })]);
 
     expect(run.status).toBe("issue_created");
     expect(run.linkedIssueId).toBeTruthy();
@@ -698,6 +898,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
           source: "assignment",
           triggerDetail: "system",
           reason: "issue_assigned",
+          idempotencyKey: expect.stringMatching(/^routine-delivery:/),
           payload: { issueId: run.linkedIssueId, mutation: "create" },
           requestedByActorType: undefined,
           requestedByActorId: null,
@@ -705,6 +906,123 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         },
       },
     ]);
+  });
+
+  it("uses the injected delivery clock for dispatch and delivery timestamps", async () => {
+    const clock = new Date("2035-01-02T03:04:05.000Z");
+    const { routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+    });
+
+    const dispatched = await svc.runRoutine(routine.id, { source: "manual" });
+    const [run] = await db.select().from(routineRuns).where(eq(routineRuns.id, dispatched.id));
+    const [delivery] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, dispatched.id));
+
+    expect(run?.triggeredAt.getTime()).toBe(clock.getTime());
+    expect(delivery?.availableAt.getTime()).toBe(clock.getTime());
+    expect(delivery?.deliveredAt?.getTime()).toBe(clock.getTime());
+  });
+
+  it("publishes the execution issue and linked routine-run receipt in one commit before wakeup", async () => {
+    let observed: {
+      issueId: string;
+      originRunId: string | null;
+      runId: string | null;
+      runStatus: string | null;
+      linkedIssueId: string | null;
+    } | null = null;
+    const { routine, svc } = await seedFixture({
+      wakeup: async (_agentId, wakeupOpts) => {
+        const issueId = typeof wakeupOpts.payload?.issueId === "string"
+          ? wakeupOpts.payload.issueId
+          : null;
+        expect(issueId).toBeTruthy();
+        const issue = await db
+          .select({ id: issues.id, originRunId: issues.originRunId })
+          .from(issues)
+          .where(eq(issues.id, issueId!))
+          .then((rows) => rows[0] ?? null);
+        const receipt = issue?.originRunId
+          ? await db
+              .select({
+                id: routineRuns.id,
+                status: routineRuns.status,
+                linkedIssueId: routineRuns.linkedIssueId,
+              })
+              .from(routineRuns)
+              .where(sql`${routineRuns.id}::text = ${issue.originRunId}`)
+              .then((rows) => rows[0] ?? null)
+          : null;
+        observed = {
+          issueId: issue?.id ?? issueId!,
+          originRunId: issue?.originRunId ?? null,
+          runId: receipt?.id ?? null,
+          runStatus: receipt?.status ?? null,
+          linkedIssueId: receipt?.linkedIssueId ?? null,
+        };
+        return { id: randomUUID() };
+      },
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+    expect(run.status).toBe("issue_created");
+    expect(observed).toEqual({
+      issueId: run.linkedIssueId,
+      originRunId: run.id,
+      runId: run.id,
+      runStatus: "received",
+      linkedIssueId: run.linkedIssueId,
+    });
+  });
+
+  it("deduplicates a repeated idempotency key while the first wakeup is still pending", async () => {
+    let reportWakeStarted!: () => void;
+    const wakeStarted = new Promise<void>((resolve) => {
+      reportWakeStarted = resolve;
+    });
+    let releaseWake!: () => void;
+    const releaseWakeGate = new Promise<void>((resolve) => {
+      releaseWake = resolve;
+    });
+    const { routine, svc } = await seedFixture({
+      wakeup: async () => {
+        reportWakeStarted();
+        await releaseWakeGate;
+        return { id: randomUUID() };
+      },
+    });
+    const idempotencyKey = `pending-wake-${randomUUID()}`;
+
+    try {
+      const firstPromise = svc.runRoutine(routine.id, {
+        source: "manual",
+        idempotencyKey,
+      });
+      await wakeStarted;
+      const duplicate = await svc.runRoutine(routine.id, {
+        source: "manual",
+        idempotencyKey,
+      });
+      releaseWake();
+      const first = await firstPromise;
+
+      expect(duplicate.id).toBe(first.id);
+      expect(first.status).toBe("issue_created");
+      const persistedRuns = await db
+        .select()
+        .from(routineRuns)
+        .where(eq(routineRuns.idempotencyKey, idempotencyKey));
+      expect(persistedRuns).toHaveLength(1);
+      const persistedIssues = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.originId, routine.id));
+      expect(persistedIssues).toEqual([{ id: first.linkedIssueId }]);
+    } finally {
+      releaseWake();
+    }
   });
 
   it("records the manual board runner on fresh routine issues so they appear in that user's inbox", async () => {
@@ -784,7 +1102,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       wakeup: async () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
         wakeupResolved = true;
-        return null;
+        return { id: randomUUID() };
       },
     });
 
@@ -1546,8 +1864,179 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues).toHaveLength(1);
   });
 
+  it("keeps Agent before Routine lock order when dispatch races trigger revision update", async () => {
+    const { routine, svc } = await seedFixture();
+    const createdTrigger = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 8 * * *",
+      timezone: "UTC",
+      enabled: true,
+    }, {});
+    const agentId = routine.assigneeAgentId!;
+    const blockerDb = createDb(tempDb!.connectionString);
+    const updateDb = createDb(tempDb!.connectionString);
+    const dispatchDb = createDb(tempDb!.connectionString);
+    const observerDb = createDb(tempDb!.connectionString);
+    await updateDb.execute(sql`set lock_timeout = '3s'`);
+    await dispatchDb.execute(sql`set lock_timeout = '3s'`);
+    const updateSvc = routineService(updateDb, { heartbeat: { wakeup: async () => null } });
+    const dispatchSvc = routineService(dispatchDb, { heartbeat: { wakeup: async () => null } });
+    let releaseAgentLock!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      releaseAgentLock = resolve;
+    });
+    let reportAgentLocked!: () => void;
+    const agentLockedGate = new Promise<void>((resolve) => {
+      reportAgentLocked = resolve;
+    });
+    const blocker = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`set local lock_timeout = '3s'`);
+      await tx.execute(sql`select id from agents where id = ${agentId} for update`);
+      reportAgentLocked();
+      await releaseGate;
+    });
+
+    const waitForBlockedLocks = async (minimum: number) => {
+      for (let attempt = 0; attempt < 250; attempt += 1) {
+        const [row] = await observerDb.execute<{ waiting: number }>(sql`
+          select count(*)::int as waiting from pg_locks where granted = false
+        `);
+        if ((row?.waiting ?? 0) >= minimum) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error(`Timed out waiting for ${minimum} blocked locks`);
+    };
+
+    try {
+      await agentLockedGate;
+      const triggerUpdateOutcome = updateSvc.updateTrigger(createdTrigger.trigger.id, {
+        label: "revision-race-winner",
+        baseRevisionId: createdTrigger.revision.id,
+      }, {}).then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      );
+      await waitForBlockedLocks(1);
+
+      const dispatchOutcome = dispatchSvc.runRoutine(routine.id, {
+        source: "manual",
+      }).then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      );
+      await waitForBlockedLocks(2);
+      releaseAgentLock();
+      await blocker;
+
+      const [triggerUpdate, dispatch] = await Promise.all([triggerUpdateOutcome, dispatchOutcome]);
+      expect(triggerUpdate.status).toBe("fulfilled");
+      expect(dispatch.status).toBe("rejected");
+      if (dispatch.status === "rejected") {
+        expect(dispatch.error).toMatchObject({
+          status: 409,
+          details: {
+            code: "routine_dispatch_snapshot_drift",
+            field: "latestRevisionId",
+          },
+        });
+      }
+      await expect(
+        db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id)),
+      ).resolves.toHaveLength(0);
+      await expect(
+        db.select().from(issues).where(eq(issues.originId, routine.id)),
+      ).resolves.toHaveLength(0);
+    } finally {
+      releaseAgentLock();
+      await blocker.catch(() => undefined);
+      await Promise.all([
+        blockerDb.$client.end(),
+        updateDb.$client.end(),
+        dispatchDb.$client.end(),
+        observerDb.$client.end(),
+      ]);
+    }
+  }, 20_000);
+
+  it("lets Agent-first termination win a concurrent dispatch without deadlock or partial run", async () => {
+    const { routine } = await seedFixture();
+    const agentId = routine.assigneeAgentId!;
+    const blockerDb = createDb(tempDb!.connectionString);
+    const dispatchDb = createDb(tempDb!.connectionString);
+    const observerDb = createDb(tempDb!.connectionString);
+    await dispatchDb.execute(sql`set lock_timeout = '3s'`);
+    const dispatchSvc = routineService(dispatchDb, { heartbeat: { wakeup: async () => null } });
+    let allowDependencyLock!: () => void;
+    const dependencyLockGate = new Promise<void>((resolve) => {
+      allowDependencyLock = resolve;
+    });
+    let reportAgentLocked!: () => void;
+    const agentLockedGate = new Promise<void>((resolve) => {
+      reportAgentLocked = resolve;
+    });
+    const blocker = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`set local lock_timeout = '3s'`);
+      await tx.execute(sql`select id from agents where id = ${agentId} for update`);
+      reportAgentLocked();
+      await dependencyLockGate;
+      await tx.execute(sql`select id from routines where id = ${routine.id} for update`);
+      await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+    });
+
+    try {
+      await agentLockedGate;
+      let dispatchSettled = false;
+      const dispatchOutcome = dispatchSvc.runRoutine(routine.id, {
+        source: "manual",
+      }).then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      ).finally(() => {
+        dispatchSettled = true;
+      });
+
+      let observedBlockedLock = false;
+      for (let attempt = 0; attempt < 250 && !dispatchSettled; attempt += 1) {
+        const [row] = await observerDb.execute<{ blocked: boolean }>(sql`
+          select exists(select 1 from pg_locks where granted = false) as blocked
+        `);
+        if (row?.blocked) {
+          observedBlockedLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(observedBlockedLock).toBe(true);
+      allowDependencyLock();
+      await blocker;
+      const dispatch = await dispatchOutcome;
+      expect(dispatch.status).toBe("rejected");
+      if (dispatch.status === "rejected") {
+        expect(dispatch.error).toMatchObject({
+          status: 409,
+          details: { code: "agent_lifecycle_reference_forbidden", reason: "terminated" },
+        });
+      }
+      await expect(
+        db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id)),
+      ).resolves.toHaveLength(0);
+      await expect(
+        db.select().from(issues).where(eq(issues.originId, routine.id)),
+      ).resolves.toHaveLength(0);
+    } finally {
+      allowDependencyLock();
+      await blocker.catch(() => undefined);
+      await Promise.all([
+        blockerDb.$client.end(),
+        dispatchDb.$client.end(),
+        observerDb.$client.end(),
+      ]);
+    }
+  }, 20_000);
+
   it("fails the run and cleans up the execution issue when wakeup queueing fails", async () => {
     const { routine, svc } = await seedFixture({
+      routineDeliveryMaxAttempts: 1,
       wakeup: async () => {
         throw new Error("queue unavailable");
       },
@@ -1565,6 +2054,641 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.originId, routine.id));
 
     expect(routineIssues).toHaveLength(0);
+  });
+
+  it("treats a heartbeat noop as a skipped delivery and never marks issue_created", async () => {
+    const { routine, svc } = await seedFixture({
+      routineDeliveryMaxAttempts: 1,
+      wakeup: async () => null,
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const delivery = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id)).then((rows) => rows[0]);
+
+    expect(run.status).toBe("failed");
+    expect(run.linkedIssueId).toBeNull();
+    expect(delivery).toMatchObject({ status: "failed", issueId: null, attemptCount: 1 });
+    expect(delivery?.lastError).toContain("heartbeat_noop");
+  });
+
+  it("does not finalize a queued receipt without exact durable wake evidence", async () => {
+    const { routine, svc } = await seedFixture({
+      routineDeliveryMaxAttempts: 3,
+      routineDeliveryRetryBaseMs: 0,
+      persistCustomWakeEvidence: false,
+      wakeup: async () => ({ id: randomUUID() }),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const delivery = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id)).then((rows) => rows[0]);
+
+    expect(run.status).toBe("received");
+    expect(delivery).toMatchObject({
+      status: "pending",
+      attemptCount: 1,
+      deliveredAt: null,
+    });
+    expect(delivery?.lastError).toMatch(/exact durable wake evidence/i);
+  });
+
+  it("redacts and bounds adapter failures before storing delivery diagnostics", async () => {
+    const secret = "sk-live-routine-delivery-secret";
+    const { routine, svc } = await seedFixture({
+      routineDeliveryMaxAttempts: 1,
+      wakeup: async () => {
+        throw new Error(`export OPENAI_API_KEY=${secret} ${"x".repeat(2_000)}`);
+      },
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const [delivery] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id));
+
+    expect(delivery).toMatchObject({ status: "failed" });
+    expect(delivery?.lastError).not.toContain(secret);
+    expect(delivery?.lastError?.length).toBeLessThanOrEqual(1_024);
+  });
+
+  it("defers a paused assignee without consuming another delivery attempt or invoking heartbeat", async () => {
+    let clock = new Date("2026-07-14T15:00:00.000Z");
+    let wakeCalls = 0;
+    const { agentId, routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      wakeup: async () => {
+        wakeCalls += 1;
+        throw new Error("seed pending delivery");
+      },
+    });
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const [before] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const callsBefore = wakeCalls;
+    clock = new Date(clock.getTime() + 1_000);
+
+    await svc.processRunDelivery(before!.id);
+
+    const [after] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.id, before!.id));
+    expect(after).toMatchObject({ status: "pending", attemptCount: before!.attemptCount });
+    expect(after?.availableAt.getTime()).toBe(clock.getTime() + 30_000);
+    expect(after?.lastError).toMatch(/agent is paused/i);
+    expect(wakeCalls).toBe(callsBefore);
+  });
+
+  it("defers a maintenance-gated assignee without consuming another delivery attempt", async () => {
+    let clock = new Date("2026-07-14T15:10:00.000Z");
+    let wakeCalls = 0;
+    const { companyId, agentId, routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      wakeup: async () => {
+        wakeCalls += 1;
+        throw new Error("seed pending delivery");
+      },
+    });
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const [before] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id));
+    await db.insert(agentPortfolioMaintenanceGates).values({
+      companyId,
+      agentId,
+      operationId: `test-${randomUUID()}`,
+      expectedSnapshotFingerprint: "snapshot",
+      recoveryFingerprint: "recovery",
+      receiptId: `receipt-${randomUUID()}`,
+      stage: "quiesced",
+      issuedByUserId: "test-board-user",
+    });
+    const callsBefore = wakeCalls;
+    clock = new Date(clock.getTime() + 1_000);
+
+    await svc.processRunDelivery(before!.id);
+
+    const [after] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.id, before!.id));
+    expect(after).toMatchObject({ status: "pending", attemptCount: before!.attemptCount });
+    expect(after?.lastError).toMatch(/maintenance gate/i);
+    expect(wakeCalls).toBe(callsBefore);
+  });
+
+  it("retries a durable pending delivery and finalizes only after wake acceptance", async () => {
+    let clock = new Date("2026-07-14T10:00:00.000Z");
+    let failWake = true;
+    const { routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      routineDeliveryMaxAttempts: 3,
+      wakeup: async () => {
+        if (failWake) throw new Error("transient queue outage");
+        return { id: randomUUID() };
+      },
+    });
+
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    const pending = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, first.id)).then((rows) => rows[0]);
+    expect(first.status).toBe("received");
+    expect(pending).toMatchObject({ status: "pending", attemptCount: 1 });
+
+    failWake = false;
+    clock = new Date(clock.getTime() + 1_000);
+    const result = await svc.reconcileRunDeliveries();
+    const [run] = await db.select().from(routineRuns).where(eq(routineRuns.id, first.id));
+    const [delivery] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, first.id));
+    expect(result).toMatchObject({ scanned: 1, delivered: 1 });
+    expect(run?.status).toBe("issue_created");
+    expect(delivery).toMatchObject({ status: "delivered", attemptCount: 2, lastError: null });
+  });
+
+  it("allows only one worker to own a non-expired delivery claim", async () => {
+    let clock = new Date("2026-07-14T11:00:00.000Z");
+    let phase: "fail" | "block" = "fail";
+    let acceptedWakeCount = 0;
+    let reportStarted!: () => void;
+    const started = new Promise<void>((resolve) => { reportStarted = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      routineDeliveryClaimLeaseMs: 60_000,
+      wakeup: async () => {
+        if (phase === "fail") throw new Error("seed pending delivery");
+        acceptedWakeCount += 1;
+        reportStarted();
+        await gate;
+        return { id: randomUUID() };
+      },
+    });
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const delivery = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id)).then((rows) => rows[0])!;
+    phase = "block";
+    clock = new Date(clock.getTime() + 1_000);
+
+    const firstWorker = svc.processRunDelivery(delivery.id);
+    await started;
+    const secondWorker = svc.processRunDelivery(delivery.id);
+    release();
+    await Promise.all([firstWorker, secondWorker]);
+
+    expect(acceptedWakeCount).toBe(1);
+    expect(await db.select().from(routineRunDeliveries).where(eq(routineRunDeliveries.id, delivery.id)))
+      .toEqual([expect.objectContaining({ status: "delivered", attemptCount: 2 })]);
+  });
+
+  it("starts a full claim lease from the post-lock clock and prevents a waiting worker from stealing it", async () => {
+    let clock = new Date("2035-02-03T04:05:06.000Z");
+    let phase: "fail" | "block" = "fail";
+    let acceptedWakeCount = 0;
+    let reportWakeStarted!: () => void;
+    const wakeStarted = new Promise<void>((resolve) => { reportWakeStarted = resolve; });
+    let releaseWake!: () => void;
+    const wakeGate = new Promise<void>((resolve) => { releaseWake = resolve; });
+    const { agentId, routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      routineDeliveryClaimLeaseMs: 60_000,
+      wakeup: async () => {
+        if (phase === "fail") throw new Error("seed pending delivery");
+        acceptedWakeCount += 1;
+        reportWakeStarted();
+        await wakeGate;
+        return { id: randomUUID() };
+      },
+    });
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const [delivery] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id));
+    phase = "block";
+    clock = new Date(clock.getTime() + 1_000);
+
+    const blockerDb = createDb(tempDb!.connectionString);
+    const observerDb = createDb(tempDb!.connectionString);
+    let reportAgentLocked!: () => void;
+    const agentLocked = new Promise<void>((resolve) => { reportAgentLocked = resolve; });
+    let releaseAgentLock!: () => void;
+    const agentLockGate = new Promise<void>((resolve) => { releaseAgentLock = resolve; });
+    const blocker = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`select id from agents where id = ${agentId} for update`);
+      reportAgentLocked();
+      await agentLockGate;
+    });
+    let firstWorker: Promise<unknown> | null = null;
+    let secondWorker: Promise<unknown> | null = null;
+
+    try {
+      await agentLocked;
+      firstWorker = svc.processRunDelivery(delivery!.id);
+      let observedBlockedLock = false;
+      for (let attempt = 0; attempt < 250; attempt += 1) {
+        const [row] = await observerDb.execute<{ blocked: boolean }>(sql`
+          select exists(select 1 from pg_locks where granted = false) as blocked
+        `);
+        if (row?.blocked) {
+          observedBlockedLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(observedBlockedLock).toBe(true);
+
+      clock = new Date(clock.getTime() + 120_000);
+      const lockedNow = new Date(clock);
+      releaseAgentLock();
+      await blocker;
+      await wakeStarted;
+
+      const [claimed] = await db.select().from(routineRunDeliveries)
+        .where(eq(routineRunDeliveries.id, delivery!.id));
+      expect(claimed).toMatchObject({ status: "claimed", attemptCount: 2 });
+      expect(claimed?.claimedAt?.getTime()).toBe(lockedNow.getTime());
+      expect(claimed?.claimExpiresAt?.getTime()).toBe(lockedNow.getTime() + 60_000);
+
+      secondWorker = svc.processRunDelivery(delivery!.id);
+      const secondOutcome = await Promise.race([
+        secondWorker.then(() => "completed" as const),
+        new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 500)),
+      ]);
+      expect(secondOutcome).toBe("completed");
+      expect(acceptedWakeCount).toBe(1);
+
+      releaseWake();
+      await Promise.all([firstWorker, secondWorker]);
+      await expect(db.select().from(routineRunDeliveries)
+        .where(eq(routineRunDeliveries.id, delivery!.id)))
+        .resolves.toEqual([expect.objectContaining({ status: "delivered", attemptCount: 2 })]);
+    } finally {
+      releaseAgentLock();
+      releaseWake();
+      await blocker.catch(() => undefined);
+      await Promise.allSettled([firstWorker, secondWorker].filter(Boolean) as Promise<unknown>[]);
+      await Promise.all([blockerDb.$client.end(), observerDb.$client.end()]);
+    }
+  }, 20_000);
+
+  it.each(["paused", "maintenance-gated"] as const)(
+    "defers a %s assignee from the post-lock clock without a hot loop",
+    async (deferMode) => {
+      let clock = new Date("2035-03-04T05:06:07.000Z");
+      let wakeCalls = 0;
+      const { companyId, agentId, routine, svc } = await seedFixture({
+        routineDeliveryNow: () => new Date(clock),
+        routineDeliveryRetryBaseMs: 0,
+        wakeup: async () => {
+          wakeCalls += 1;
+          throw new Error("seed pending delivery");
+        },
+      });
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+      const [delivery] = await db.select().from(routineRunDeliveries)
+        .where(eq(routineRunDeliveries.routineRunId, run.id));
+      if (deferMode === "paused") {
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      } else {
+        await db.insert(agentPortfolioMaintenanceGates).values({
+          companyId,
+          agentId,
+          operationId: `test-${randomUUID()}`,
+          expectedSnapshotFingerprint: "snapshot",
+          recoveryFingerprint: "recovery",
+          receiptId: `receipt-${randomUUID()}`,
+          stage: "quiesced",
+          issuedByUserId: "test-board-user",
+        });
+      }
+      const wakeCallsBeforeDefer = wakeCalls;
+      clock = new Date(clock.getTime() + 1_000);
+
+      const blockerDb = createDb(tempDb!.connectionString);
+      const observerDb = createDb(tempDb!.connectionString);
+      let reportAgentLocked!: () => void;
+      const agentLocked = new Promise<void>((resolve) => { reportAgentLocked = resolve; });
+      let releaseAgentLock!: () => void;
+      const agentLockGate = new Promise<void>((resolve) => { releaseAgentLock = resolve; });
+      const blocker = blockerDb.transaction(async (tx) => {
+        await tx.execute(sql`select id from agents where id = ${agentId} for update`);
+        reportAgentLocked();
+        await agentLockGate;
+      });
+      let worker: Promise<unknown> | null = null;
+
+      try {
+        await agentLocked;
+        worker = svc.processRunDelivery(delivery!.id);
+        let observedBlockedLock = false;
+        for (let attempt = 0; attempt < 250; attempt += 1) {
+          const [row] = await observerDb.execute<{ blocked: boolean }>(sql`
+            select exists(select 1 from pg_locks where granted = false) as blocked
+          `);
+          if (row?.blocked) {
+            observedBlockedLock = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(observedBlockedLock).toBe(true);
+
+        clock = new Date(clock.getTime() + 120_000);
+        const lockedNow = new Date(clock);
+        releaseAgentLock();
+        await blocker;
+        await worker;
+
+        const [afterFirstDefer] = await db.select().from(routineRunDeliveries)
+          .where(eq(routineRunDeliveries.id, delivery!.id));
+        expect(afterFirstDefer).toMatchObject({
+          status: "pending",
+          attemptCount: delivery!.attemptCount,
+        });
+        expect(afterFirstDefer?.availableAt.getTime()).toBe(lockedNow.getTime() + 30_000);
+        expect(wakeCalls).toBe(wakeCallsBeforeDefer);
+
+        await svc.processRunDelivery(delivery!.id);
+        const [afterImmediateRetry] = await db.select().from(routineRunDeliveries)
+          .where(eq(routineRunDeliveries.id, delivery!.id));
+        expect(afterImmediateRetry?.availableAt.getTime()).toBe(afterFirstDefer?.availableAt.getTime());
+        expect(afterImmediateRetry?.updatedAt.getTime()).toBe(afterFirstDefer?.updatedAt.getTime());
+        expect(wakeCalls).toBe(wakeCallsBeforeDefer);
+      } finally {
+        releaseAgentLock();
+        await blocker.catch(() => undefined);
+        if (worker) await worker.catch(() => undefined);
+        await Promise.all([blockerDb.$client.end(), observerDb.$client.end()]);
+      }
+    },
+    20_000,
+  );
+
+  it("adopts exact durable wake evidence after a claimed-worker crash", async () => {
+    let clock = new Date("2026-07-14T12:00:00.000Z");
+    let wakeCalls = 0;
+    const { companyId, agentId, routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      routineDeliveryClaimLeaseMs: 1_000,
+      wakeup: async () => {
+        wakeCalls += 1;
+        throw new Error("seed pending delivery");
+      },
+    });
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const pending = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id)).then((rows) => rows[0])!;
+    clock = new Date(clock.getTime() + 1_000);
+    const claimed = await svc.claimRunDelivery(pending.id);
+    expect(claimed?.delivery.status).toBe("claimed");
+
+    const wakeupRequestId = randomUUID();
+    const heartbeatRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: pending.issueId, mutation: "create" },
+      status: "queued",
+      idempotencyKey: pending.wakeupIdempotencyKey,
+      runId: heartbeatRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      responsibleUserId: randomUUID(),
+      wakeupRequestId,
+      contextSnapshot: { issueId: pending.issueId },
+    });
+    const callsBeforeRecovery = wakeCalls;
+    clock = new Date(clock.getTime() + 2_000);
+
+    const result = await svc.reconcileRunDeliveries();
+    const [delivery] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.id, pending.id));
+    expect(result).toMatchObject({ delivered: 1 });
+    expect(wakeCalls).toBe(callsBeforeRecovery);
+    expect(delivery).toMatchObject({
+      status: "delivered",
+      deliveredWakeupRequestId: wakeupRequestId,
+      deliveredHeartbeatRunId: heartbeatRunId,
+    });
+  });
+
+  it("retains delivered wake evidence while the delivery receipt references it", async () => {
+    const { routine, svc } = await seedFixture();
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const [delivery] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id));
+
+    const deletion = await db.delete(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, delivery!.deliveredHeartbeatRunId!))
+      .then(() => null, (error: unknown) => error);
+
+    expect(deletion).toBeTruthy();
+    expect(String((deletion as { cause?: unknown }).cause ?? deletion))
+      .toMatch(/routine_delivery_heartbeat_evidence_is_immutable/i);
+    await expect(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, delivery!.deliveredHeartbeatRunId!)))
+      .resolves.toEqual([{ id: delivery!.deliveredHeartbeatRunId }]);
+  });
+
+  it("fails a leader and every coalesced follower atomically when delivery is skipped", async () => {
+    let clock = new Date("2026-07-14T13:00:00.000Z");
+    let noop = false;
+    const { companyId, routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      wakeup: async () => {
+        if (!noop) throw new Error("seed pending delivery");
+        return null;
+      },
+    });
+    const leader = await svc.runRoutine(routine.id, { source: "manual" });
+    const followerId = randomUUID();
+    await db.insert(routineRuns).values({
+      id: followerId,
+      companyId,
+      routineId: routine.id,
+      source: "manual",
+      status: "coalesced",
+      linkedIssueId: leader.linkedIssueId,
+      coalescedIntoRunId: leader.id,
+      completedAt: clock,
+    });
+    const delivery = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, leader.id)).then((rows) => rows[0])!;
+    noop = true;
+    clock = new Date(clock.getTime() + 1_000);
+    await svc.processRunDelivery(delivery.id);
+
+    const runs = await db.select().from(routineRuns).where(sql`${routineRuns.id} in (${leader.id}, ${followerId})`);
+    expect(runs).toHaveLength(2);
+    expect(runs.every((row) => row.status === "failed" && row.linkedIssueId === null)).toBe(true);
+    expect(await db.select().from(issues).where(eq(issues.id, leader.linkedIssueId!))).toHaveLength(0);
+  });
+
+  it("rolls back follower cleanup when the delivery terminal CAS is suppressed", async () => {
+    let clock = new Date("2026-07-14T15:20:00.000Z");
+    let noop = false;
+    const { companyId, routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      routineDeliveryMaxAttempts: 3,
+      wakeup: async () => {
+        if (!noop) throw new Error("seed pending delivery");
+        return null;
+      },
+    });
+    const leader = await svc.runRoutine(routine.id, { source: "manual" });
+    const [delivery] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, leader.id));
+    const followerId = randomUUID();
+    await db.insert(routineRuns).values({
+      id: followerId,
+      companyId,
+      routineId: routine.id,
+      source: "manual",
+      status: "coalesced",
+      linkedIssueId: leader.linkedIssueId,
+      coalescedIntoRunId: leader.id,
+      completedAt: clock,
+    });
+    await db.execute(sql.raw(`
+      create or replace function suppress_routine_delivery_failed_cas() returns trigger
+      language plpgsql as $$ begin return null; end $$;
+      create trigger suppress_routine_delivery_failed_cas_trigger
+      before update on routine_run_deliveries
+      for each row when (new.status = 'failed')
+      execute function suppress_routine_delivery_failed_cas();
+    `));
+    noop = true;
+    clock = new Date(clock.getTime() + 1_000);
+
+    try {
+      await svc.processRunDelivery(delivery!.id);
+    } finally {
+      await db.execute(sql.raw(`
+        drop trigger if exists suppress_routine_delivery_failed_cas_trigger on routine_run_deliveries;
+        drop function if exists suppress_routine_delivery_failed_cas();
+      `));
+    }
+
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, followerId)))
+      .resolves.toEqual([expect.objectContaining({
+        status: "coalesced",
+        linkedIssueId: leader.linkedIssueId,
+        coalescedIntoRunId: leader.id,
+      })]);
+    await expect(db.select().from(routineRunDeliveries).where(eq(routineRunDeliveries.id, delivery!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "pending" })]);
+    await expect(db.select().from(issues).where(eq(issues.id, leader.linkedIssueId!)))
+      .resolves.toHaveLength(1);
+  });
+
+  it("quarantines one poisoned delivery and continues the reconciliation batch", async () => {
+    let clock = new Date("2026-07-14T15:30:00.000Z");
+    let failWake = true;
+    const { routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      wakeup: async () => {
+        if (failWake) throw new Error("seed pending delivery");
+        return { id: randomUUID() };
+      },
+    });
+    await db.update(routines).set({ concurrencyPolicy: "always_enqueue" })
+      .where(eq(routines.id, routine.id));
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+    const [poison] = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, first.id));
+    await db.execute(sql.raw(`
+      create sequence routine_delivery_poison_once_seq start 1;
+      create or replace function poison_routine_delivery_once() returns trigger
+      language plpgsql as $$
+      begin
+        if nextval('routine_delivery_poison_once_seq') = 1 then
+          raise exception 'synthetic_delivery_poison';
+        end if;
+        return new;
+      end $$;
+      create trigger poison_routine_delivery_once_trigger
+      before update on routine_run_deliveries
+      for each row when (new.id = '${poison!.id}'::uuid)
+      execute function poison_routine_delivery_once();
+    `));
+    failWake = false;
+    clock = new Date(clock.getTime() + 1_000);
+
+    let result;
+    try {
+      result = await svc.reconcileRunDeliveries();
+    } finally {
+      await db.execute(sql.raw(`
+        drop trigger if exists poison_routine_delivery_once_trigger on routine_run_deliveries;
+        drop function if exists poison_routine_delivery_once();
+        drop sequence if exists routine_delivery_poison_once_seq;
+      `));
+    }
+
+    expect(result).toMatchObject({ scanned: 2, delivered: 1, quarantined: 1 });
+    await expect(db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.id, poison!.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: "pending",
+        attemptCount: poison!.attemptCount,
+        lastError: expect.stringMatching(/quarantined.*synthetic_delivery_poison/i),
+      })]);
+    await expect(db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, second.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "delivered" })]);
+  });
+
+  it("rejects cross-company delivery drift at the database boundary without invoking heartbeat", async () => {
+    let clock = new Date("2026-07-14T14:00:00.000Z");
+    let wakeCalls = 0;
+    const { routine, svc } = await seedFixture({
+      routineDeliveryNow: () => new Date(clock),
+      routineDeliveryRetryBaseMs: 0,
+      wakeup: async () => {
+        wakeCalls += 1;
+        throw new Error("seed pending delivery");
+      },
+    });
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const delivery = await db.select().from(routineRunDeliveries)
+      .where(eq(routineRunDeliveries.routineRunId, run.id)).then((rows) => rows[0])!;
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other tenant",
+      issuePrefix: `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const callsBefore = wakeCalls;
+    const driftWrite = await db.update(routineRunDeliveries).set({ companyId: otherCompanyId })
+      .where(eq(routineRunDeliveries.id, delivery.id)).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(driftWrite).toBeTruthy();
+    expect(String((driftWrite as { cause?: unknown }).cause ?? driftWrite))
+      .toMatch(/routine_run_delivery_identity_mismatch/i);
+    await expect(db.select({ companyId: routineRunDeliveries.companyId })
+      .from(routineRunDeliveries).where(eq(routineRunDeliveries.id, delivery.id)))
+      .resolves.toEqual([{ companyId: routine.companyId }]);
+    expect(wakeCalls).toBe(callsBefore);
   });
 
   it("accepts standard second-precision webhook timestamps for HMAC triggers", async () => {

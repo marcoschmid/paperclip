@@ -20,8 +20,16 @@ import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import {
+  assertHistoricalAgentTombstoneActiveReference,
+  isHistoricalAgentTombstoneId,
+} from "./agent-retirement-historical-tombstones.js";
 import { issueService } from "./issues.js";
 import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
 const TASK_WATCHDOG_SUBTREE_MAX_DEPTH = 100;
@@ -433,6 +441,7 @@ async function assertWatchedIssue(dbOrTx: any, companyId: string, issueId: strin
 }
 
 async function assertWatchdogAgentInvokable(dbOrTx: any, companyId: string, agentId: string) {
+  assertHistoricalAgentTombstoneActiveReference(agentId);
   const agent = await dbOrTx
     .select({
       id: agents.id,
@@ -669,27 +678,33 @@ export async function upsertIssueWatchdogForIssue(
   issueId: string,
   input: IssueWatchdogUpsertInput,
 ): Promise<{ watchdog: IssueWatchdog; created: boolean }> {
-  await assertWatchedIssue(dbOrTx, companyId, issueId);
-  await assertWatchdogAgentInvokable(dbOrTx, companyId, input.agentId);
+  const upsertInTransaction = async (tx: any): Promise<{ watchdog: IssueWatchdog; created: boolean }> => {
+    await assertWatchedIssue(tx, companyId, issueId);
+    await assertWatchdogAgentInvokable(tx, companyId, input.agentId);
+    await lockAgentLifecycleReference(tx as Db, {
+      companyId,
+      agentId: input.agentId,
+    });
+    const watchdogAgentId = canonicalizeAgentReferenceId(input.agentId);
 
-  const now = new Date();
-  const existing = await dbOrTx
+    const now = new Date();
+    const existing = await tx
     .select()
     .from(issueWatchdogs)
     .where(and(eq(issueWatchdogs.companyId, companyId), eq(issueWatchdogs.issueId, issueId)))
     .then((rows: IssueWatchdogRow[]) => rows[0] ?? null);
 
   if (existing) {
-    const updated = await updateIssueWatchdogRow(dbOrTx, existing, input, now);
+    const updated = await updateIssueWatchdogRow(tx, existing, { ...input, agentId: watchdogAgentId }, now);
     return { watchdog: toIssueWatchdog(updated), created: false };
   }
 
-  const insertResult: { row: IssueWatchdogRow; created: boolean } = await dbOrTx
+    const insertResult: { row: IssueWatchdogRow; created: boolean } = await tx
     .insert(issueWatchdogs)
     .values({
       companyId,
       issueId,
-      watchdogAgentId: input.agentId,
+      watchdogAgentId,
       instructions: normalizeInstructions(input.instructions),
       status: "active",
       createdByAgentId: input.actor?.agentId ?? null,
@@ -705,16 +720,21 @@ export async function upsertIssueWatchdogForIssue(
     .then((rows: IssueWatchdogRow[]) => ({ row: rows[0], created: true }))
     .catch(async (error: unknown) => {
       if (!isIssueWatchdogUniqueConflict(error)) throw error;
-      const winner = await dbOrTx
+      const winner = await tx
         .select()
         .from(issueWatchdogs)
         .where(and(eq(issueWatchdogs.companyId, companyId), eq(issueWatchdogs.issueId, issueId)))
         .then((rows: IssueWatchdogRow[]) => rows[0] ?? null);
       if (!winner) throw error;
-      const updated = await updateIssueWatchdogRow(dbOrTx, winner, input, now);
+      const updated = await updateIssueWatchdogRow(tx, winner, { ...input, agentId: watchdogAgentId }, now);
       return { row: updated, created: false };
     });
-  return { watchdog: toIssueWatchdog(insertResult.row), created: insertResult.created };
+    return { watchdog: toIssueWatchdog(insertResult.row), created: insertResult.created };
+  };
+
+  return typeof dbOrTx.transaction === "function"
+    ? dbOrTx.transaction(upsertInTransaction)
+    : upsertInTransaction(dbOrTx);
 }
 
 export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) {
@@ -1276,6 +1296,9 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
   }
 
   async function evaluateWatchdog(row: IssueWatchdogRow, opts: { runId?: string | null } = {}) {
+    if (isHistoricalAgentTombstoneId(row.watchdogAgentId)) {
+      return { state: "skipped" as const, reason: "historical_watchdog_agent_tombstone" };
+    }
     const watchdog = await markTerminalWatchdogIssueReviewed(row, opts);
     const sourceIssue = await db
       .select()
@@ -1472,6 +1495,12 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       return {
         allowed: false as const,
         reason: "Task-watchdog run context is not backed by an active persisted watchdog.",
+      };
+    }
+    if (isHistoricalAgentTombstoneId(watchdog.watchdogAgentId)) {
+      return {
+        allowed: false as const,
+        reason: "Task-watchdog run context references a historical agent tombstone.",
       };
     }
 

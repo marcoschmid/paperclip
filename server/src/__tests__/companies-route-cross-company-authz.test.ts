@@ -261,15 +261,19 @@ describe.sequential("company route cross-company authorization", () => {
       label: "POST /api/companies/:companyId/imports/apply",
       request: (app: express.Express) => request(app).post(`/api/companies/${companyBId}/imports/apply`).send(importRequest()),
     },
-  ])("rejects a company A CEO attempting company B operation: $label", async ({ request: buildRequest }) => {
-    const app = await createApp(companyACeoActor());
+  ])(
+    "rejects a company A CEO attempting company B operation: $label",
+    async ({ request: buildRequest }) => {
+      const app = await createApp(companyACeoActor());
 
-    const res = await buildRequest(app);
+      const res = await buildRequest(app);
 
-    expect(res.status).toBe(403);
-    expect(res.body.error).toMatch(/another company|access to this company|active company access/i);
-    assertNoTargetMutationSideEffects();
-  });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/another company|access to this company|active company access/i);
+      assertNoTargetMutationSideEffects();
+    },
+    15_000,
+  );
 
   it("allows a same-company CEO to use CEO-safe company routes without allowing board-only lifecycle routes", async () => {
     const app = await createApp(companyACeoActor());

@@ -73,6 +73,7 @@ import {
   parseProjectExecutionWorkspacePolicy,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { isHistoricalAgentTombstoneId } from "./agent-retirement-historical-tombstones.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -81,6 +82,11 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+  lockAgentLifecycleReferences,
+} from "./agent-lifecycle-fence.js";
 import {
   summarizeIssueWatchdog,
   upsertIssueWatchdogForIssue,
@@ -2160,8 +2166,11 @@ async function listIssueBlockerAttentionMap(
       explicitWaitingIssueIds.add(parsed.leafIssueId);
     }
 
-    const recoveryActionRows: Array<{ sourceIssueId: string }> = await dbOrTx
-      .select({ sourceIssueId: issueRecoveryActions.sourceIssueId })
+    const recoveryActionRows: Array<{ sourceIssueId: string; ownerAgentId: string | null }> = await dbOrTx
+      .select({
+        sourceIssueId: issueRecoveryActions.sourceIssueId,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+      })
       .from(issueRecoveryActions)
       .where(
         and(
@@ -2170,7 +2179,11 @@ async function listIssueBlockerAttentionMap(
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
         ),
       );
-    for (const row of recoveryActionRows) explicitWaitingIssueIds.add(row.sourceIssueId);
+    for (const row of recoveryActionRows) {
+      if (!isHistoricalAgentTombstoneId(row.ownerAgentId)) {
+        explicitWaitingIssueIds.add(row.sourceIssueId);
+      }
+    }
   }
 
   const agentRows: IssueBlockerAttentionAgentRow[] = agentIds.size > 0
@@ -5617,7 +5630,23 @@ export function issueService(db: Db) {
         children: data.children,
       });
 
+      const initialClaimSnapshot = await db
+        .select({ id: issuePlanDecompositions.id })
+        .from(issuePlanDecompositions)
+        .where(and(
+          eq(issuePlanDecompositions.companyId, sourceIssue.companyId),
+          eq(issuePlanDecompositions.sourceIssueId, sourceIssue.id),
+          eq(issuePlanDecompositions.acceptedPlanRevisionId, data.acceptedPlanRevisionId),
+        ))
+        .then((rows) => rows[0] ?? null);
+
       const initialClaim = await db.transaction(async (tx) => {
+        if (!initialClaimSnapshot && data.actorAgentId) {
+          await lockAgentLifecycleReference(tx as unknown as Db, {
+            companyId: sourceIssue.companyId,
+            agentId: data.actorAgentId,
+          });
+        }
         await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${sourceIssue.id} for update`);
 
         const belongsToPlanDocument = await tx
@@ -5656,6 +5685,12 @@ export function issueService(db: Db) {
 
         const now = new Date();
         if (!existing) {
+          if (initialClaimSnapshot) {
+            throw conflict("Accepted-plan decomposition claim changed during initialization", {
+              code: "accepted_plan_decomposition_claim_drift",
+              expectedClaimId: initialClaimSnapshot.id,
+            });
+          }
           const [created] = await tx
             .insert(issuePlanDecompositions)
             .values({
@@ -5668,7 +5703,9 @@ export function issueService(db: Db) {
               requestedChildCount: data.children.length,
               requestedChildren: data.children as unknown as Record<string, unknown>[],
               childIssueIds: [],
-              ownerAgentId: data.actorAgentId ?? null,
+              ownerAgentId: data.actorAgentId
+                ? canonicalizeAgentReferenceId(data.actorAgentId)
+                : null,
               ownerUserId: data.actorUserId ?? null,
               ownerRunId: data.actorRunId ?? null,
               updatedAt: now,
@@ -5689,7 +5726,20 @@ export function issueService(db: Db) {
       const newlyCreatedIssues: Array<typeof issues.$inferSelect> = [];
 
       while (true) {
+        const childIdsBeforeStep = normalizeIssuePlanDecompositionChildIds(currentClaim.childIssueIds);
+        const nextChildBeforeStep = data.children[childIdsBeforeStep.length] ?? null;
+        const stepCanRemainInFlight = currentClaim.status !== "completed"
+          && childIdsBeforeStep.length + 1 < data.children.length;
+        const prospectiveAgentIds = [
+          ...(stepCanRemainInFlight ? [currentClaim.ownerAgentId, data.actorAgentId] : []),
+          nextChildBeforeStep?.assigneeAgentId ?? null,
+          nextChildBeforeStep?.watchdog?.agentId ?? null,
+        ].filter((agentId): agentId is string => Boolean(agentId));
         const step = await db.transaction(async (tx) => {
+          const prelockedAgentReferences = await lockAgentLifecycleReferences(tx as unknown as Db, {
+            companyId: sourceIssue.companyId,
+            agentIds: prospectiveAgentIds,
+          });
           await tx.execute(
             sql`select ${issuePlanDecompositions.id}
                 from ${issuePlanDecompositions}
@@ -5759,6 +5809,16 @@ export function issueService(db: Db) {
             actorUserId: data.actorUserId,
             actorRunId: data.actorRunId,
           });
+          if (nextStatus === "in_flight" && ownerPatch.ownerAgentId) {
+            const ownerAgentId = canonicalizeAgentReferenceId(ownerPatch.ownerAgentId);
+            if (!prelockedAgentReferences.has(ownerAgentId)) {
+              throw conflict("Accepted-plan decomposition owner changed during progress update", {
+                code: "accepted_plan_decomposition_owner_drift",
+                ownerAgentId,
+              });
+            }
+            ownerPatch.ownerAgentId = ownerAgentId;
+          }
           const [updatedClaim] = await tx
             .update(issuePlanDecompositions)
             .set({
@@ -5902,6 +5962,15 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       return db.transaction(async (tx) => {
+        const activeAgentIds = [issueData.assigneeAgentId, watchdog?.agentId]
+          .filter((agentId): agentId is string => Boolean(agentId));
+        await lockAgentLifecycleReferences(tx as unknown as Db, {
+          companyId,
+          agentIds: activeAgentIds,
+        });
+        if (issueData.assigneeAgentId) {
+          issueData.assigneeAgentId = canonicalizeAgentReferenceId(issueData.assigneeAgentId);
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
         let executionWorkspaceId = issueData.executionWorkspaceId ?? null;
@@ -6174,7 +6243,10 @@ export function issueService(db: Db) {
       }
       const shouldValidateNextAssignee =
         Boolean(nextAssigneeAgentId) &&
-        (issueData.assigneeAgentId !== undefined || patch.status === "in_progress");
+        (
+          issueData.assigneeAgentId !== undefined ||
+          !["done", "cancelled"].includes(issueData.status ?? existing.status)
+        );
       if (shouldValidateNextAssignee) {
         await assertAssignableAgent(dbOrTx as Db, existing.companyId, nextAssigneeAgentId, { kind: "work" });
       }
@@ -6248,6 +6320,15 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (shouldValidateNextAssignee && nextAssigneeAgentId) {
+          await lockAgentLifecycleReference(tx as Db, {
+            companyId: existing.companyId,
+            agentId: nextAssigneeAgentId,
+          });
+          if (issueData.assigneeAgentId !== undefined) {
+            patch.assigneeAgentId = canonicalizeAgentReferenceId(nextAssigneeAgentId);
+          }
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -6452,27 +6533,33 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await db.transaction(async (tx) => {
+        await lockAgentLifecycleReference(tx as unknown as Db, {
+          companyId: issueCompany.companyId,
+          agentId,
+        });
+        return tx
+          .update(issues)
+          .set({
+            assigneeAgentId: canonicalizeAgentReferenceId(agentId),
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
@@ -6554,6 +6641,7 @@ export function issueService(db: Db) {
         const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
         if (stale) {
           const now = new Date();
+          const expectedExecutionRunId = current.executionRunId;
           const adoptionSet: Record<string, unknown> = {
             assigneeAgentId: agentId,
             checkoutRunId,
@@ -6566,19 +6654,28 @@ export function issueService(db: Db) {
           if (current.status !== "in_progress") {
             adoptionSet.startedAt = now;
           }
-          const adopted = await db
-            .update(issues)
-            .set(adoptionSet)
-            .where(
-              and(
-                eq(issues.id, id),
-                inArray(issues.status, expectedStatuses),
-                eq(issues.executionRunId, current.executionRunId),
-                or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
+          const adopted = await db.transaction(async (tx) => {
+            await lockAgentLifecycleReference(tx as unknown as Db, {
+              companyId: issueCompany.companyId,
+              agentId,
+            });
+            return tx
+              .update(issues)
+              .set({
+                ...adoptionSet,
+                assigneeAgentId: canonicalizeAgentReferenceId(agentId),
+              })
+              .where(
+                and(
+                  eq(issues.id, id),
+                  inArray(issues.status, expectedStatuses),
+                  eq(issues.executionRunId, expectedExecutionRunId),
+                  or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+          });
           if (adopted) {
             const [enriched] = await withIssueLabels(db, [adopted]);
             return enriched;

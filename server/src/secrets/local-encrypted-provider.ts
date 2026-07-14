@@ -1,5 +1,19 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { resolveDefaultSecretsKeyFilePath } from "../home-paths.js";
 import type {
@@ -45,7 +59,91 @@ function decodeMasterKey(raw: string): Buffer | null {
   return null;
 }
 
-function loadOrCreateMasterKey(): Buffer {
+function readMasterKeyFile(keyPath: string): Buffer {
+  const descriptor = openSync(keyPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0) {
+      throw badRequest(`Secrets master key must be a regular 0600 file at ${keyPath}`);
+    }
+    const decoded = decodeMasterKey(readFileSync(descriptor, "utf8"));
+    if (!decoded) throw badRequest(`Invalid secrets master key at ${keyPath}`);
+    return decoded;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function fsyncDirectory(target: string) {
+  const descriptor = openSync(target, constants.O_RDONLY);
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function createMasterKeyAtomically(keyPath: string): Buffer {
+  const dir = path.dirname(keyPath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const lockPath = `${keyPath}.lock`;
+  let lockDescriptor: number;
+  try {
+    lockDescriptor = openSync(
+      lockPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "EEXIST" && existsSync(keyPath)) {
+      return readMasterKeyFile(keyPath);
+    }
+    throw badRequest(`Could not acquire secrets master key first-write lock at ${lockPath}`);
+  }
+
+  const tempPath = `${keyPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  try {
+    writeFileSync(lockDescriptor, `${process.pid}\n`, "utf8");
+    fsyncSync(lockDescriptor);
+    if (existsSync(keyPath)) return readMasterKeyFile(keyPath);
+
+    const generated = randomBytes(32);
+    const tempDescriptor = openSync(
+      tempPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    try {
+      writeFileSync(tempDescriptor, generated.toString("base64"), "utf8");
+      fsyncSync(tempDescriptor);
+    } finally {
+      closeSync(tempDescriptor);
+    }
+    if (existsSync(keyPath)) {
+      unlinkSync(tempPath);
+      return readMasterKeyFile(keyPath);
+    }
+    renameSync(tempPath, keyPath);
+    chmodSync(keyPath, 0o600);
+    fsyncDirectory(dir);
+    return generated;
+  } finally {
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+    } catch {
+      // The key path is authoritative; an orphaned unique temp is non-active.
+    }
+    closeSync(lockDescriptor);
+    try {
+      unlinkSync(lockPath);
+      fsyncDirectory(dir);
+    } catch {
+      // A stale lock fails future first writes closed instead of replacing a key.
+    }
+  }
+}
+
+function loadMasterKey(options: { createIfMissing: boolean }): Buffer {
   const envKeyRaw = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
   if (envKeyRaw && envKeyRaw.trim().length > 0) {
     const fromEnv = decodeMasterKey(envKeyRaw);
@@ -59,25 +157,26 @@ function loadOrCreateMasterKey(): Buffer {
 
   const keyPath = resolveMasterKeyFilePath();
   if (existsSync(keyPath)) {
-    enforceKeyFilePermissionsBestEffort(keyPath);
-    const raw = readFileSync(keyPath, "utf8");
-    const decoded = decodeMasterKey(raw);
-    if (!decoded) {
-      throw badRequest(`Invalid secrets master key at ${keyPath}`);
-    }
-    return decoded;
+    return readMasterKeyFile(keyPath);
   }
+  if (!options.createIfMissing) {
+    throw badRequest(`Secrets master key must exist before gateway secret externalization at ${keyPath}`);
+  }
+  return createMasterKeyAtomically(keyPath);
+}
 
-  const dir = path.dirname(keyPath);
-  mkdirSync(dir, { recursive: true });
-  const generated = randomBytes(32);
-  writeFileSync(keyPath, generated.toString("base64"), { encoding: "utf8", mode: 0o600 });
-  try {
-    chmodSync(keyPath, 0o600);
-  } catch {
-    // best effort
-  }
-  return generated;
+function loadOrCreateMasterKey(): Buffer {
+  return loadMasterKey({ createIfMissing: true });
+}
+
+export function getLocalEncryptedMasterKeyProof(): { fingerprintSha256: string } {
+  const masterKey = loadMasterKey({ createIfMissing: false });
+  return { fingerprintSha256: createHash("sha256").update(masterKey).digest("hex") };
+}
+
+export function createLocalEncryptedProofReceipt(value: string): string {
+  const masterKey = loadMasterKey({ createIfMissing: false });
+  return `v1:hmac-sha256:${createHmac("sha256", masterKey).update(value).digest("hex")}`;
 }
 
 function enforceKeyFilePermissionsBestEffort(keyPath: string) {

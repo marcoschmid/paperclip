@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -17,6 +18,7 @@ import {
   projectWorkspaces,
   projects,
   workspaceRuntimeServices,
+  workspaceRuntimeStartClaims,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
@@ -27,6 +29,7 @@ import {
   ensureRuntimeServicesForRun,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
+  persistAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
@@ -38,7 +41,17 @@ import {
   stopRuntimeServicesForExecutionWorkspace,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
-import { readLocalServicePortOwner, writeLocalServiceRegistryRecord } from "../services/local-service-supervisor.ts";
+import {
+  findLocalServiceRegistryRecordByRuntimeServiceId,
+  isProcessGroupAlive,
+  isPidAlive,
+  listLocalServiceRegistryRecordsStrict,
+  removeLocalServiceRegistryRecord,
+  readLocalServicePortOwner,
+  terminateLocalService,
+  writeLocalServiceRegistryRecord,
+} from "../services/local-service-supervisor.ts";
+import { agentService } from "../services/agents.ts";
 import { resolvePaperclipConfigPath } from "../paths.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.ts";
@@ -88,6 +101,8 @@ function workspaceBranchIncoherenceFingerprintForTest(input: {
 }
 
 const leasedRunIds = new Set<string>();
+let suiteRegistryDir = "";
+let previousSuiteRegistryDir: string | undefined;
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -97,6 +112,18 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 const provisionWorktreeScriptPath = new URL("../../../scripts/provision-worktree.sh", import.meta.url);
+
+beforeAll(async () => {
+  previousSuiteRegistryDir = process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR;
+  suiteRegistryDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-runtime-registry-"));
+  process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR = suiteRegistryDir;
+});
+
+afterAll(async () => {
+  if (previousSuiteRegistryDir === undefined) delete process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR;
+  else process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR = previousSuiteRegistryDir;
+  await fs.rm(suiteRegistryDir, { recursive: true, force: true });
+});
 
 async function runGit(cwd: string, args: string[]) {
   await execFileAsync("git", args, { cwd });
@@ -266,6 +293,8 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
+  await fs.rm(suiteRegistryDir, { recursive: true, force: true });
+  await fs.mkdir(suiteRegistryDir, { recursive: true, mode: 0o700 });
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -703,7 +732,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.warnings).toEqual([
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
-  });
+  }, 15_000);
 
   it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
     const repoRoot = await createTempRepo();
@@ -1780,6 +1809,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
       await fs.mkdir(worktreeRoot, { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
+      await fs.symlink(process.execPath, path.join(fakeBin, "node"));
       await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
       await fs.chmod(scriptPath, 0o755);
       await fs.writeFile(
@@ -1827,7 +1857,7 @@ describe("realizeExecutionWorkspace", () => {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
@@ -1944,7 +1974,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.realpath(path.join(repoRoot, "packages", "shared")),
     );
     },
-    15_000,
+    30_000,
   );
 
   it("records worktree setup and provision operations when a recorder is provided", async () => {
@@ -3935,13 +3965,86 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   afterEach(async () => {
+    await db.delete(workspaceRuntimeStartClaims);
     await db.delete(workspaceRuntimeServices);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(heartbeatRuns);
+    await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companies);
+  });
+
+  it("fails closed before mutation or signaling when registry JSON is truncated", async () => {
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-corrupt-registry-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `corrupt-registry-${randomUUID()}`;
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const runtimeServiceId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Corrupt registry company",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Corrupt registry owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(workspaceRuntimeServices).values({
+      id: runtimeServiceId,
+      companyId,
+      scopeType: "agent",
+      scopeId: ownerAgentId,
+      serviceName: "corrupt-registry-service",
+      status: "stopped",
+      lifecycle: "shared",
+      provider: "local_process",
+      providerRef: null,
+      ownerAgentId,
+      healthStatus: "unknown",
+    });
+    const registryDir = suiteRegistryDir;
+    const corruptRegistryPath = path.resolve(registryDir, "truncated.json");
+    await fs.mkdir(registryDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(corruptRegistryPath, '{"version":2,"runtimeServiceId":', {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    let terminationCalls = 0;
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+        terminateLocalService: async () => {
+          terminationCalls += 1;
+        },
+      })).rejects.toThrow(/registry.*(invalid|corrupt|parse)/i);
+      expect(terminationCalls).toBe(0);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, runtimeServiceId))
+        .then((rows) => rows[0])).resolves.toMatchObject({
+        status: "stopped",
+        healthStatus: "unknown",
+      });
+      await expect(fs.readFile(corruptRegistryPath, "utf8")).resolves.toContain('"version":2');
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
   });
 
   it("adopts a live auto-port shared service after runtime state is reset", async () => {
@@ -4005,7 +4108,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
             {
               name: "web",
               command:
-                "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+                "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\" & node -e \"setInterval(() => {}, 1000)\" & wait",
               port: { type: "auto" },
               readiness: {
                 type: "http",
@@ -4029,28 +4132,1446 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     const service = services[0];
     expect(service?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
+    const initialRegistry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(initialRegistry?.processGroupId).toEqual(expect.any(Number));
+    expect(initialRegistry?.pid).not.toBe(initialRegistry?.processGroupId);
+    expect(initialRegistry?.metadata).toMatchObject({ companyId, ownerAgentId: agentId });
+    const processGroupId = initialRegistry!.processGroupId!;
 
-    await fs.rm(paperclipHome, { recursive: true, force: true });
-    await resetRuntimeServicesForTests();
+    try {
+      await resetRuntimeServicesForTests();
 
-    const result = await reconcilePersistedRuntimeServicesOnStartup(db);
-    expect(result).toMatchObject({ reconciled: 1, adopted: 1, stopped: 0 });
+      const result = await reconcilePersistedRuntimeServicesOnStartup(db);
+      expect(result).toMatchObject({ reconciled: 1, adopted: 1, stopped: 0 });
 
-    const persisted = await db
-      .select()
-      .from(workspaceRuntimeServices)
-      .where(eq(workspaceRuntimeServices.id, service!.id))
-      .then((rows) => rows[0] ?? null);
-    expect(persisted?.status).toBe("running");
-    expect(persisted?.providerRef).toMatch(/^\d+$/);
+      const persisted = await db
+        .select()
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id))
+        .then((rows) => rows[0] ?? null);
+      expect(persisted?.status).toBe("running");
+      expect(persisted?.providerRef).toBe(String(processGroupId));
 
-    await stopRuntimeServicesForExecutionWorkspace({
+      // The listener is the strongly recorded PID while the shell is the group
+      // leader. If the listener exits but another group member survives, the
+      // registry remains material evidence and startup must stop before any DB
+      // mutation or process signal.
+      process.kill(initialRegistry!.pid, "SIGKILL");
+      for (let attempt = 0; attempt < 50 && isPidAlive(initialRegistry!.pid); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(isProcessGroupAlive(processGroupId)).toBe(true);
+      await resetRuntimeServicesForTests();
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+        terminateLocalService: async () => {
+          throw new Error("startup must not signal an unresolved process group");
+        },
+      })).rejects.toThrow(/leader.*not running.*process group.*alive/i);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id))
+        .then((rows) => rows[0])).resolves.toMatchObject({
+        status: "running",
+        healthStatus: "healthy",
+      });
+      await expect(findLocalServiceRegistryRecordByRuntimeServiceId({
+        runtimeServiceId: service!.id,
+        profileKind: "workspace-runtime",
+      })).rejects.toThrow(/leader.*not running.*process group.*alive/i);
+      expect(isProcessGroupAlive(processGroupId)).toBe(true);
+
+      // Registry loss is a separate ambiguity. The persisted providerRef must
+      // still retain the group boundary and prevent false absence.
+      await removeLocalServiceRegistryRecord(initialRegistry!.serviceKey);
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/process absence is unproven/);
+      expect(isProcessGroupAlive(processGroupId)).toBe(true);
+    } finally {
+      try {
+        process.kill(-processGroupId, "SIGKILL");
+      } catch {
+        // The process group may have exited between the proof and cleanup.
+      }
+      for (let attempt = 0; attempt < 50 && isProcessGroupAlive(processGroupId); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      leasedRunIds.delete(runId);
+      await resetRuntimeServicesForTests();
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects cross-tenant bindings but exactly cleans a company-bound registry-to-DB crash orphan", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-registry-orphan-"));
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-registry-orphan-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `runtime-registry-orphan-${randomUUID()}`;
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values([
+      { id: companyId, name: "Registry owner", issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false },
+      { id: otherCompanyId, name: "Other tenant", issuePrefix: `X${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false },
+    ]);
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Registry owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    leasedRunIds.add(runId);
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    const [service] = await ensureRuntimeServicesForRun({
       db,
-      executionWorkspaceId,
-      workspaceCwd: workspace.cwd,
+      runId,
+      agent: { id: agentId, name: "Registry owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+    });
+    const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(registry).not.toBeNull();
+    const processGroupId = registry!.processGroupId!;
+    await resetRuntimeServicesForTests();
+    let terminationCalls = 0;
+
+    try {
+      await writeLocalServiceRegistryRecord({
+        ...registry!,
+        metadata: { ...registry!.metadata, companyId: otherCompanyId },
+      });
+      await expect(startRuntimeServicesForWorkspaceControl({
+        actor: { id: agentId, name: "Registry owner", companyId },
+        issue: null,
+        workspace,
+        config: {
+          workspaceRuntime: {
+            services: [{
+              name: "web",
+              command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+              port: { type: "auto" },
+              readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+              lifecycle: "shared",
+              reuseScope: "agent",
+              stopPolicy: { type: "manual" },
+            }],
+          },
+        },
+        adapterEnv: {},
+      })).rejects.toThrow(/cross-tenant adoption|matching company binding/i);
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+        terminateLocalService: async () => { terminationCalls += 1; },
+      })).rejects.toThrow(/registry.*company.*does not match|outside.*company|cross-tenant/i);
+      expect(terminationCalls).toBe(0);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id))
+        .then((rows) => rows[0])).resolves.toMatchObject({
+        status: "running",
+        healthStatus: "healthy",
+      });
+      expect(isProcessGroupAlive(processGroupId)).toBe(true);
+
+      await writeLocalServiceRegistryRecord({
+        ...registry!,
+        metadata: { ...registry!.metadata, companyId, ownerAgentId: agentId },
+      });
+      await db.delete(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id));
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+        terminateLocalService: async (...args) => {
+          terminationCalls += 1;
+          await terminateLocalService(...args);
+        },
+        afterOrphanClaimTerminalizedBeforeRegistryRemove: async () => {
+          throw new Error("deterministic post-commit registry removal interruption");
+        },
+      })).rejects.toThrow(/registry cleanup failed/);
+      expect(terminationCalls).toBe(1);
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({ runtimeServiceId: service!.id }));
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.serviceKey, registry!.serviceKey))
+        .then((rows) => rows[0])).resolves.toMatchObject({
+          status: "failed",
+          failureCode: "registry_orphan_cleaned",
+          runtimeServiceId: null,
+        });
+
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .resolves.toMatchObject({ reconciled: 0, adopted: 0, stopped: 0 });
+      await expect(findLocalServiceRegistryRecordByRuntimeServiceId({
+        runtimeServiceId: service!.id,
+        profileKind: "workspace-runtime",
+      })).resolves.toBeNull();
+      expect(isProcessGroupAlive(processGroupId)).toBe(false);
+    } finally {
+      try {
+        process.kill(-processGroupId, "SIGKILL");
+      } catch {
+        // The process group may already have exited.
+      }
+      for (let attempt = 0; attempt < 50 && isProcessGroupAlive(processGroupId); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await removeLocalServiceRegistryRecord(registry!.serviceKey);
+      leasedRunIds.delete(runId);
+      await resetRuntimeServicesForTests();
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes a workspace-control start before generic agent termination", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-lifecycle-"));
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-lifecycle-home-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `runtime-control-lifecycle-${randomUUID()}`;
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Workspace control lifecycle",
+      issuePrefix: `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Workspace control owner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    let markStarted!: () => void;
+    let releasePersist!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const persistGate = new Promise<void>((resolve) => { releasePersist = resolve; });
+    const start = startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: agentId, name: "Workspace control owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+      dependencies: {
+        afterLocalServiceStartedBeforePersist: async () => {
+          markStarted();
+          await persistGate;
+        },
+      },
+    });
+    await started;
+    const termination = agentService(db).terminate(agentId);
+    let statusWhileStartOwnsFence = "idle";
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      statusWhileStartOwnsFence = (await db.select({ status: agents.status }).from(agents)
+        .where(eq(agents.id, agentId)).then((rows) => rows[0]!.status));
+      if (statusWhileStartOwnsFence === "terminated") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    releasePersist();
+    const [startResult, terminationResult] = await Promise.allSettled([start, termination]);
+
+    try {
+      expect(statusWhileStartOwnsFence).toBe("idle");
+      expect(startResult.status).toBe("fulfilled");
+      expect(terminationResult).toMatchObject({
+        status: "rejected",
+        reason: { status: 409, details: { code: "agent_active_dependencies" } },
+      });
+      await expect(db.select().from(workspaceRuntimeServices)).resolves.toContainEqual(
+        expect.objectContaining({ ownerAgentId: agentId, status: "running" }),
+      );
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId: randomUUID(),
+        workspaceCwd: workspace.cwd,
+      }).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  for (const cleanupFails of [false, true]) {
+    it(`fails closed after cross-process lifecycle drift and ${cleanupFails ? "preserves evidence on cleanup failure" : "sends no unauthorized cleanup signal"}`, async () => {
+      const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-drift-"));
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-drift-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      process.env.PAPERCLIP_INSTANCE_ID = `runtime-control-drift-${randomUUID()}`;
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Lifecycle drift", issuePrefix: `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Lifecycle drift owner", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+      const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+      let markStarted!: () => void;
+      let releasePersist!: () => void;
+      const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      const persistGate = new Promise<void>((resolve) => { releasePersist = resolve; });
+      let startedRef: { id: string; providerRef: string | null } | null = null;
+      const start = startRuntimeServicesForWorkspaceControl({
+        db,
+        actor: { id: agentId, name: "Lifecycle drift owner", companyId },
+        issue: null,
+        workspace,
+        config: { workspaceRuntime: { services: [{ name: "web", command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"", port: { type: "auto" }, readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 }, lifecycle: "shared", reuseScope: "agent", stopPolicy: { type: "manual" } }] } },
+        adapterEnv: {},
+        dependencies: {
+          afterLocalServiceStartedBeforePersist: async (ref) => {
+            startedRef = { id: ref.id, providerRef: ref.providerRef };
+            markStarted();
+            await persistGate;
+          },
+          ...(cleanupFails ? {
+            terminateLocalService: async () => { throw new Error("synthetic failed-start cleanup"); },
+          } : {}),
+        },
+      });
+      await started;
+      const processGroupId = Number.parseInt(startedRef!.providerRef ?? "", 10);
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+      releasePersist();
+
+      try {
+        await expect(start).rejects.toThrow(cleanupFails
+          ? /synthetic failed-start cleanup|lifecycle/i
+          : /terminated.*active reference|lifecycle/i);
+        const rows = await db.select().from(workspaceRuntimeServices)
+          .where(eq(workspaceRuntimeServices.ownerAgentId, agentId));
+        expect(rows).toHaveLength(0);
+        const registry = await listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" });
+        expect(isProcessGroupAlive(processGroupId)).toBe(true);
+        const exactRegistry = registry.find((entry) => entry.runtimeServiceId === startedRef!.id);
+        expect(exactRegistry).toEqual(expect.objectContaining({ runtimeServiceId: startedRef!.id }));
+        await expect(db.select().from(workspaceRuntimeStartClaims)
+          .where(eq(workspaceRuntimeStartClaims.serviceKey, exactRegistry!.serviceKey))
+          .then((claimRows) => claimRows[0])).resolves.toMatchObject({
+          status: "starting",
+          runtimeServiceId: null,
+          ownerAgentId: agentId,
+        });
+      } finally {
+        try {
+          process.kill(-processGroupId, "SIGKILL");
+        } catch {
+          // Already cleaned up.
+        }
+        await Promise.resolve(start).catch(() => undefined);
+        await resetRuntimeServicesForTests();
+        await fs.rm(paperclipHome, { recursive: true, force: true });
+        await fs.rm(workspaceRoot, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("pre-persist cleanup sends no signal and preserves durable evidence after owner lifecycle drift", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-prepersist-fence-"));
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Pre-persist signal fence",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Pre-persist signal owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    let markStarted!: () => void;
+    let releasePersist!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const persistGate = new Promise<void>((resolve) => { releasePersist = resolve; });
+    let startedRef: { id: string; providerRef: string | null } | null = null;
+    let signalCount = 0;
+    const start = startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: agentId, name: "Pre-persist signal owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "prepersist-web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+      dependencies: {
+        afterLocalServiceStartedBeforePersist: async (ref) => {
+          startedRef = { id: ref.id, providerRef: ref.providerRef };
+          markStarted();
+          await persistGate;
+        },
+        terminateLocalService: async (_record, options) => {
+          if (options?.signalWithinFence) {
+            await options.signalWithinFence("SIGTERM", () => { signalCount += 1; });
+            return;
+          }
+          await options?.verifyBeforeSignal?.();
+          signalCount += 1;
+        },
+      },
+    });
+    await started;
+    const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: startedRef!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(registry).not.toBeNull();
+    const claimBefore = await db.select().from(workspaceRuntimeStartClaims)
+      .where(eq(workspaceRuntimeStartClaims.serviceKey, registry!.serviceKey))
+      .then((rows) => rows[0]!);
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+    releasePersist();
+
+    try {
+      await expect(start).rejects.toThrow(/lifecycle|terminated|fence|quarantined/i);
+      expect(signalCount).toBe(0);
+      expect(isProcessGroupAlive(registry!.processGroupId)).toBe(true);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, startedRef!.id)))
+        .resolves.toHaveLength(0);
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.id, claimBefore.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          claimId: claimBefore.claimId,
+          status: "starting",
+          runtimeServiceId: null,
+          ownerAgentId: agentId,
+          updatedAt: claimBefore.updatedAt,
+        });
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({
+          serviceKey: registry!.serviceKey,
+          runtimeServiceId: startedRef!.id,
+        }));
+    } finally {
+      try {
+        process.kill(-registry!.processGroupId!, "SIGKILL");
+      } catch {
+        // The vulnerable implementation may already have signaled the group.
+      }
+      await Promise.resolve(start).catch(() => undefined);
+      await removeLocalServiceRegistryRecord(registry!.serviceKey).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("preserves a starting claim when pre-signal registry snapshot capture fails", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-snapshot-quarantine-"));
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Snapshot quarantine runtime",
+      issuePrefix: `Q${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Snapshot quarantine owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    let spawned: {
+      serviceKey: string;
+      runtimeServiceId: string;
+      pid: number;
+      processGroupId: number;
+    } | null = null;
+    let terminateCalls = 0;
+    const start = startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: agentId, name: "Snapshot quarantine owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "snapshot-quarantine-web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT),'127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+      dependencies: {
+        afterLocalServiceSpawnedBeforeReadiness: async (details) => {
+          spawned = details;
+          await fs.writeFile(
+            path.join(suiteRegistryDir, `${details.serviceKey}.json`),
+            '{"version":2,"truncated":',
+            "utf8",
+          );
+          throw new Error("synthetic post-spawn snapshot capture failure");
+        },
+        terminateLocalService: async () => { terminateCalls += 1; },
+      },
     });
 
-    await expect(fetch(service!.url!)).rejects.toThrow();
+    try {
+      await expect(start).rejects.toThrow(/snapshot|cleanup|quarantined|registry/i);
+      expect(terminateCalls).toBe(0);
+      expect(spawned).not.toBeNull();
+      expect(isProcessGroupAlive(spawned!.processGroupId)).toBe(true);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, spawned!.runtimeServiceId)))
+        .resolves.toHaveLength(0);
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.serviceKey, spawned!.serviceKey)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          status: "starting",
+          runtimeServiceId: null,
+          ownerAgentId: agentId,
+        });
+      await expect(fs.readFile(
+        path.join(suiteRegistryDir, `${spawned!.serviceKey}.json`),
+        "utf8",
+      )).resolves.toContain('"truncated"');
+    } finally {
+      if (spawned) {
+        try {
+          process.kill(-spawned.processGroupId, "SIGKILL");
+        } catch {
+          // Expected manual cleanup for the deliberately quarantined spawn.
+        }
+        await fs.rm(path.join(suiteRegistryDir, `${spawned.serviceKey}.json`), { force: true });
+      }
+      await Promise.resolve(start).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("keeps a verified background descendant running when only the spawned shell leader exits", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-background-descendant-"));
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Background descendant runtime",
+      issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Background descendant owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    const [service] = await startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: agentId, name: "Background descendant owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "background-web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\" & sleep 1",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+    });
+    const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(registry).not.toBeNull();
+    expect(registry!.pid).not.toBe(registry!.processGroupId);
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1_300));
+      await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
+      expect(isPidAlive(registry!.pid)).toBe(true);
+      expect(isProcessGroupAlive(registry!.processGroupId)).toBe(true);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({ status: "running", healthStatus: "healthy" });
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.runtimeServiceId, service!.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({ status: "running", runtimeServiceId: service!.id });
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({
+          serviceKey: registry!.serviceKey,
+          runtimeServiceId: service!.id,
+          pid: registry!.pid,
+          processGroupId: registry!.processGroupId,
+        }));
+
+      await stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId: randomUUID(),
+        workspaceCwd: workspace.cwd,
+      });
+      expect(isProcessGroupAlive(registry!.processGroupId)).toBe(false);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({ status: "stopped", healthStatus: "unknown" });
+    } finally {
+      try {
+        process.kill(-registry!.processGroupId!, "SIGKILL");
+      } catch {
+        // The fenced stop normally removes the complete process group.
+      }
+      await removeLocalServiceRegistryRecord(registry!.serviceKey).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("sends no signal for an unhealthy adopted registry with a superseded start claim", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-unhealthy-claim-drift-"));
+    const unhealthyMarker = path.join(workspaceRoot, "unhealthy.marker");
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Unhealthy claim drift runtime",
+      issuePrefix: `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Unhealthy claim drift owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    const serviceConfig = {
+      workspaceRuntime: {
+        services: [{
+          name: "unhealthy-claim-web",
+          command: "node -e \"const fs=require('node:fs');require('node:http').createServer((req,res)=>{if(req.url==='/health'&&fs.existsSync('unhealthy.marker')){res.statusCode=503}res.end('ok')}).listen(Number(process.env.PORT),'127.0.0.1')\"",
+          port: { type: "auto" },
+          readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}/health", timeoutSec: 10, intervalMs: 100 },
+          expose: { type: "url", urlTemplate: "http://127.0.0.1:{{port}}/health" },
+          lifecycle: "shared",
+          reuseScope: "agent",
+          stopPolicy: { type: "manual" },
+        }],
+      },
+    };
+    const [service] = await startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: agentId, name: "Unhealthy claim drift owner", companyId },
+      issue: null,
+      workspace,
+      config: serviceConfig,
+      adapterEnv: {},
+    });
+    const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(registry).not.toBeNull();
+    const oldClaim = await db.select().from(workspaceRuntimeStartClaims)
+      .where(eq(workspaceRuntimeStartClaims.runtimeServiceId, service!.id))
+      .then((rows) => rows[0]!);
+    await fs.writeFile(unhealthyMarker, "unhealthy", "utf8");
+    await db.update(workspaceRuntimeServices).set({
+      status: "stopped",
+      healthStatus: "unknown",
+      stoppedAt: new Date(),
+      updatedAt: new Date(),
+    }).where(eq(workspaceRuntimeServices.id, service!.id));
+    await db.update(workspaceRuntimeStartClaims).set({
+      status: "failed",
+      failureCode: "synthetic_superseded_claim",
+      updatedAt: new Date(),
+    }).where(eq(workspaceRuntimeStartClaims.id, oldClaim.id));
+    await resetRuntimeServicesForTests();
+    let terminationCalls = 0;
+
+    try {
+      await expect(startRuntimeServicesForWorkspaceControl({
+        db,
+        actor: { id: agentId, name: "Unhealthy claim drift owner", companyId },
+        issue: null,
+        workspace,
+        config: serviceConfig,
+        adapterEnv: {},
+        dependencies: {
+          terminateLocalService: async () => { terminationCalls += 1; },
+        },
+      })).rejects.toThrow(/cleanup.*quarantined|claim|binding/i);
+      expect(terminationCalls).toBe(0);
+      expect(isPidAlive(registry!.pid)).toBe(true);
+      expect(isProcessGroupAlive(registry!.processGroupId)).toBe(true);
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({
+          serviceKey: registry!.serviceKey,
+          runtimeServiceId: service!.id,
+          metadata: expect.objectContaining({ startClaimId: oldClaim.claimId }),
+        }));
+      const currentClaim = await db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.serviceKey, registry!.serviceKey))
+        .then((rows) => rows[0]!);
+      expect(currentClaim).toMatchObject({
+        status: "starting",
+        runtimeServiceId: null,
+        ownerAgentId: agentId,
+      });
+      expect(currentClaim.claimId).not.toBe(oldClaim.claimId);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({ status: "stopped", healthStatus: "unknown" });
+    } finally {
+      try {
+        process.kill(-registry!.processGroupId!, "SIGKILL");
+      } catch {
+        // Expected manual cleanup for the deliberately quarantined process.
+      }
+      await removeLocalServiceRegistryRecord(registry!.serviceKey).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("serializes adapter-managed runtime persistence before generic agent termination", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Adapter lifecycle", issuePrefix: `M${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Adapter owner", role: "engineer", status: "idle", adapterType: "openclaw_gateway", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "manual", status: "succeeded", startedAt: new Date(), finishedAt: new Date(), updatedAt: new Date() });
+    let markNormalized!: () => void;
+    let releasePersist!: () => void;
+    const normalized = new Promise<void>((resolve) => { markNormalized = resolve; });
+    const persistGate = new Promise<void>((resolve) => { releasePersist = resolve; });
+    const persistence = persistAdapterManagedRuntimeServices({
+      db,
+      adapterType: "openclaw_gateway",
+      runId,
+      agent: { id: agentId, name: "Adapter owner", companyId },
+      issue: null,
+      workspace: { ...buildWorkspace(os.tmpdir()), projectId: null, workspaceId: null },
+      reports: [{ serviceName: "preview", providerRef: `sandbox-${randomUUID()}` }],
+      dependencies: {
+        afterReportsNormalizedBeforePersist: async () => {
+          markNormalized();
+          await persistGate;
+        },
+      },
+    });
+    await normalized;
+    const termination = agentService(db).terminate(agentId);
+    let statusWhilePersistenceOwnsFence = "idle";
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      statusWhilePersistenceOwnsFence = await db.select({ status: agents.status }).from(agents)
+        .where(eq(agents.id, agentId)).then((rows) => rows[0]!.status);
+      if (statusWhilePersistenceOwnsFence === "terminated") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    releasePersist();
+    const [persistenceResult, terminationResult] = await Promise.allSettled([persistence, termination]);
+    expect(statusWhilePersistenceOwnsFence).toBe("idle");
+    if (persistenceResult.status === "rejected") throw persistenceResult.reason;
+    expect(persistenceResult).toMatchObject({ status: "fulfilled" });
+    expect(terminationResult).toMatchObject({
+      status: "rejected",
+      reason: { status: 409, details: { code: "agent_active_dependencies" } },
+    });
+    await expect(db.select().from(workspaceRuntimeServices)).resolves.toContainEqual(
+      expect.objectContaining({ ownerAgentId: agentId, status: "running", provider: "adapter_managed" }),
+    );
+  });
+
+  it("fails closed for active live-owner rows without a verified process registry", async () => {
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Active orphan company",
+      issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Active orphan owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const rows = [
+      { id: randomUUID(), serviceName: "active-live-pid", providerRef: String(child.pid), status: "running" },
+      { id: randomUUID(), serviceName: "active-null-pid", providerRef: null, status: "starting" },
+      { id: randomUUID(), serviceName: "active-invalid-pid", providerRef: "not-a-pid", status: "running" },
+    ];
+    await db.insert(workspaceRuntimeServices).values(rows.map((row) => ({
+      ...row,
+      companyId,
+      scopeType: "agent",
+      scopeId: ownerAgentId,
+      lifecycle: "shared",
+      provider: "local_process",
+      ownerAgentId,
+      healthStatus: "healthy",
+    })));
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/process absence is unproven/);
+      expect(isPidAlive(child.pid!)).toBe(true);
+      const persisted = await db.select().from(workspaceRuntimeServices);
+      for (const row of rows) {
+        expect(persisted.find((candidate) => candidate.id === row.id)).toMatchObject({
+          status: row.status,
+          healthStatus: "healthy",
+        });
+      }
+    } finally {
+      await new Promise<void>((resolve) => {
+        child.once("exit", () => resolve());
+        child.kill("SIGKILL");
+      });
+    }
+  });
+
+  it("fails closed without signaling when a persisted row owner no longer matches its claim and registry", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-tombstone-reconcile-"));
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-tombstone-home-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `runtime-tombstone-reconcile-${randomUUID()}`;
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const tombstoneId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "Temporary valid owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: tombstoneId,
+        companyId,
+        name: "Historical runtime owner",
+        role: "engineer",
+        status: "terminated",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    leasedRunIds.add(runId);
+    const runtimeConfig = {
+      workspaceRuntime: {
+        services: [{
+          name: "web",
+          command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+          port: { type: "auto" },
+          readiness: {
+            type: "http",
+            urlTemplate: "http://127.0.0.1:{{port}}",
+            timeoutSec: 10,
+            intervalMs: 100,
+          },
+          lifecycle: "shared",
+          reuseScope: "agent",
+          stopPolicy: { type: "manual" },
+        }],
+      },
+    };
+    const [service] = await ensureRuntimeServicesForRun({
+      db,
+      runId,
+      agent: { id: agentId, name: "Temporary valid owner", companyId },
+      issue: null,
+      workspace,
+      config: runtimeConfig,
+      adapterEnv: {},
+    });
+    expect(service?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    const originalRegistry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(originalRegistry).not.toBeNull();
+    await db.update(workspaceRuntimeServices)
+      .set({ ownerAgentId: tombstoneId })
+      .where(eq(workspaceRuntimeServices.id, service!.id));
+    await resetRuntimeServicesForTests();
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/exact runtime row and running start claim|exact.*binding|no verifiable local process registry record/i);
+      const persisted = await db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id))
+        .then((rows) => rows[0] ?? null);
+      expect(persisted).toMatchObject({ status: "running", healthStatus: "healthy" });
+      expect(persisted?.stoppedAt).toBeNull();
+      await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
+      await expect(findLocalServiceRegistryRecordByRuntimeServiceId({
+        runtimeServiceId: service!.id,
+        profileKind: "workspace-runtime",
+      })).resolves.toMatchObject({ serviceKey: originalRegistry!.serviceKey });
+    } finally {
+      const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+        runtimeServiceId: service!.id,
+        profileKind: "workspace-runtime",
+      });
+      if (registry) {
+        await terminateLocalService(registry);
+        await removeLocalServiceRegistryRecord(registry.serviceKey);
+      }
+      await resetRuntimeServicesForTests();
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not terminate a live agent service and fails closed when a stopped tombstone row shares its identity", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-tombstone-key-"));
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-tombstone-key-home-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `runtime-tombstone-key-${randomUUID()}`;
+    const companyId = randomUUID();
+    const liveAgentId = randomUUID();
+    const tombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `K${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      { id: liveAgentId, companyId, name: "Live owner", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      { id: tombstoneId, companyId, name: "Historical owner", role: "engineer", status: "terminated", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+    ]);
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: liveAgentId, invocationSource: "manual", status: "running", startedAt: new Date(), updatedAt: new Date() });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    leasedRunIds.add(runId);
+    const [liveService] = await ensureRuntimeServicesForRun({
+      db,
+      runId,
+      agent: { id: liveAgentId, name: "Live owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+    });
+    const liveRow = await db.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.id, liveService!.id))
+      .then((rows) => rows[0]!);
+    const tombstoneServiceId = randomUUID();
+    await db.insert(workspaceRuntimeServices).values({
+      ...liveRow,
+      id: tombstoneServiceId,
+      ownerAgentId: tombstoneId,
+      startedByRunId: null,
+      status: "stopped",
+      stoppedAt: new Date(),
+    });
+    await resetRuntimeServicesForTests();
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/no verifiable local process registry record/);
+      await expect(fetch(liveService!.url!)).resolves.toMatchObject({ ok: true });
+      const rows = await db.select().from(workspaceRuntimeServices);
+      expect(rows.find((row) => row.id === liveService!.id)?.status).toBe("running");
+      expect(rows.find((row) => row.id === tombstoneServiceId)).toMatchObject({
+        status: "stopped",
+        healthStatus: "healthy",
+      });
+
+      await db.update(workspaceRuntimeServices)
+        .set({ status: "stopped", healthStatus: "unknown", providerRef: null })
+        .where(eq(workspaceRuntimeServices.id, tombstoneServiceId));
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .resolves.toMatchObject({ reconciled: 2, adopted: 1, stopped: 0 });
+      await expect(fetch(liveService!.url!)).resolves.toMatchObject({ ok: true });
+
+      await resetRuntimeServicesForTests();
+      const liveRegistry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+        runtimeServiceId: liveService!.id,
+        profileKind: "workspace-runtime",
+      });
+      expect(liveRegistry).not.toBeNull();
+      await writeLocalServiceRegistryRecord({ ...liveRegistry!, runtimeServiceId: null });
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/unbound local process without exact PID identity|exact runtime row and running start claim/);
+      await expect(fetch(liveService!.url!)).resolves.toMatchObject({ ok: true });
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({ db, executionWorkspaceId: randomUUID(), workspaceCwd: workspace.cwd });
+      await resetRuntimeServicesForTests();
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when an active tombstone service has no verifiable process record", async () => {
+    const companyId = randomUUID();
+    const tombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    const runtimeServiceId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix: `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+    await db.insert(agents).values({ id: tombstoneId, companyId, name: "Historical owner", role: "engineer", status: "terminated", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(workspaceRuntimeServices).values({
+      id: runtimeServiceId,
+      companyId,
+      scopeType: "agent",
+      scopeId: tombstoneId,
+      serviceName: "missing",
+      status: "running",
+      lifecycle: "shared",
+      reuseKey: `missing-${randomUUID()}`,
+      command: "node missing-service.js",
+      cwd: os.tmpdir(),
+      provider: "local_process",
+      ownerAgentId: tombstoneId,
+      healthStatus: "healthy",
+    });
+
+    await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+      .rejects.toThrow(/workspace runtime service/i);
+    await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+      .rejects.toThrow(/workspace runtime service/i);
+    const persisted = await db.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.id, runtimeServiceId))
+      .then((rows) => rows[0]);
+    expect(persisted).toMatchObject({ status: "running", healthStatus: "healthy" });
+  });
+
+  it("fails closed for a stopped cross-company owner row while its provider PID is alive", async () => {
+    const runtimeCompanyId = randomUUID();
+    const ownerCompanyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const runtimeServiceId = randomUUID();
+    await db.insert(companies).values([
+      { id: runtimeCompanyId, name: "Runtime company", issuePrefix: `R${runtimeCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false },
+      { id: ownerCompanyId, name: "Owner company", issuePrefix: `O${ownerCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false },
+    ]);
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId: ownerCompanyId,
+      name: "Cross-company runtime owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    await db.insert(workspaceRuntimeServices).values({
+      id: runtimeServiceId,
+      companyId: runtimeCompanyId,
+      scopeType: "agent",
+      scopeId: ownerAgentId,
+      serviceName: "unsafe-stopped",
+      status: "stopped",
+      lifecycle: "shared",
+      provider: "local_process",
+      providerRef: String(child.pid),
+      ownerAgentId,
+      stoppedAt: new Date(),
+      healthStatus: "unknown",
+    });
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/no verifiable local process registry record/);
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/no verifiable local process registry record/);
+      expect(isPidAlive(child.pid!)).toBe(true);
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    }
+
+    await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+      .resolves.toMatchObject({ reconciled: 1, adopted: 0, stopped: 0 });
+  });
+
+  it("requires both persisted PID and its process group to be absent", async () => {
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const runtimeServiceId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Process group company",
+      issuePrefix: `G${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Terminated process group owner",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const parent = spawn(process.execPath, [
+      "-e",
+      `const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); child.unref();`,
+    ], { detached: true, stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => {
+      parent.once("spawn", resolve);
+      parent.once("error", reject);
+    });
+    const processGroupId = parent.pid!;
+    await new Promise<void>((resolve) => parent.once("exit", () => resolve()));
+    for (let attempt = 0; attempt < 50 && !isProcessGroupAlive(processGroupId); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(isPidAlive(processGroupId)).toBe(false);
+    expect(isProcessGroupAlive(processGroupId)).toBe(true);
+    await db.insert(workspaceRuntimeServices).values({
+      id: runtimeServiceId,
+      companyId,
+      scopeType: "agent",
+      scopeId: ownerAgentId,
+      serviceName: "detached-process-group",
+      status: "failed",
+      lifecycle: "shared",
+      provider: "local_process",
+      providerRef: String(processGroupId),
+      ownerAgentId,
+      healthStatus: "unhealthy",
+    });
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/no verifiable local process registry record/);
+      const persisted = await db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, runtimeServiceId))
+        .then((rows) => rows[0]);
+      expect(persisted).toMatchObject({ status: "failed", healthStatus: "unhealthy" });
+    } finally {
+      try {
+        process.kill(-processGroupId, "SIGKILL");
+      } catch {
+        // The process group may already have exited.
+      }
+      for (let attempt = 0; attempt < 50 && isProcessGroupAlive(processGroupId); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+
+    await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+      .resolves.toMatchObject({ reconciled: 1, adopted: 0, stopped: 1 });
+  });
+
+  it("terminalizes an unsafe row with an unknown status when process absence is proven", async () => {
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const runtimeServiceId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Unknown status company",
+      issuePrefix: `N${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Unknown status terminated owner",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(workspaceRuntimeServices).values({
+      id: runtimeServiceId,
+      companyId,
+      scopeType: "agent",
+      scopeId: ownerAgentId,
+      serviceName: "unknown-status-service",
+      status: "stopped",
+      lifecycle: "shared",
+      provider: "local_process",
+      providerRef: null,
+      ownerAgentId,
+      healthStatus: "unknown",
+    });
+    await db.update(workspaceRuntimeServices)
+      .set({ status: "unknown_runtime_state" })
+      .where(eq(workspaceRuntimeServices.id, runtimeServiceId));
+
+    await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+      .resolves.toMatchObject({ reconciled: 1, adopted: 0, stopped: 1 });
+    await expect(db.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.id, runtimeServiceId))
+      .then((rows) => rows[0])).resolves.toMatchObject({
+      status: "stopped",
+      healthStatus: "unknown",
+    });
+  });
+
+  it("fails closed for stopped or failed live-owner rows while their unbound PIDs are alive", async () => {
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Terminal zombie company",
+      issuePrefix: `Z${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Live terminal zombie owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const children = ["stopped", "failed"].map(() =>
+      spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }));
+    await Promise.all(children.map((child) => new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    })));
+    const runtimeServiceIds = [randomUUID(), randomUUID()];
+    await db.insert(workspaceRuntimeServices).values(children.map((child, index) => ({
+      id: runtimeServiceIds[index],
+      companyId,
+      scopeType: "agent",
+      scopeId: ownerAgentId,
+      serviceName: `terminal-zombie-${index}`,
+      status: index === 0 ? "stopped" : "failed",
+      lifecycle: "shared",
+      provider: "local_process",
+      providerRef: String(child.pid),
+      ownerAgentId,
+      healthStatus: index === 0 ? "unknown" : "unhealthy",
+    })));
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+        .rejects.toThrow(/no verifiable local process registry record/);
+      expect(children.every((child) => isPidAlive(child.pid!))).toBe(true);
+    } finally {
+      await Promise.all(children.map((child) => new Promise<void>((resolve) => {
+        child.once("exit", () => resolve());
+        child.kill("SIGKILL");
+      })));
+    }
+
+    await expect(reconcilePersistedRuntimeServicesOnStartup(db))
+      .resolves.toMatchObject({ reconciled: 2, adopted: 0, stopped: 1 });
+  });
+
+  it("fails closed without invoking termination for a mismatched tombstone binding", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-tombstone-failure-"));
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-tombstone-failure-home-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = `runtime-tombstone-failure-${randomUUID()}`;
+    const companyId = randomUUID();
+    const liveAgentId = randomUUID();
+    const tombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    const runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix: `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+    await db.insert(agents).values([
+      { id: liveAgentId, companyId, name: "Live owner", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      { id: tombstoneId, companyId, name: "Historical owner", role: "engineer", status: "terminated", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+    ]);
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: liveAgentId, invocationSource: "manual", status: "running", startedAt: new Date(), updatedAt: new Date() });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    leasedRunIds.add(runId);
+    const [service] = await ensureRuntimeServicesForRun({
+      db,
+      runId,
+      agent: { id: liveAgentId, name: "Live owner", companyId },
+      issue: null,
+      workspace,
+      config: { workspaceRuntime: { services: [{ name: "web", command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"", port: { type: "auto" }, readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 }, lifecycle: "shared", reuseScope: "agent", stopPolicy: { type: "manual" } }] } },
+      adapterEnv: {},
+    });
+    await db.update(workspaceRuntimeServices).set({ ownerAgentId: tombstoneId }).where(eq(workspaceRuntimeServices.id, service!.id));
+    await resetRuntimeServicesForTests();
+    let terminationCalls = 0;
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+        terminateLocalService: async () => { terminationCalls += 1; },
+      })).rejects.toThrow(/no verifiable local process registry record/);
+      await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
+      const failedTermination = {
+        terminateLocalService: async () => {
+          terminationCalls += 1;
+          throw new Error("synthetic termination failure");
+        },
+      };
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, failedTermination))
+        .rejects.toThrow(/no verifiable local process registry record/);
+      expect(terminationCalls).toBe(0);
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, failedTermination))
+        .rejects.toThrow(/no verifiable local process registry record/);
+      await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
+      const persisted = await db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id))
+        .then((rows) => rows[0]);
+      expect(persisted).toMatchObject({ status: "running", healthStatus: "healthy" });
+      const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({ runtimeServiceId: service!.id, profileKind: "workspace-runtime" });
+      expect(registry).not.toBeNull();
+    } finally {
+      const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({ runtimeServiceId: service!.id, profileKind: "workspace-runtime" });
+      if (registry) {
+        await terminateLocalService(registry);
+        await removeLocalServiceRegistryRecord(registry.serviceKey);
+      }
+      await resetRuntimeServicesForTests();
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
   });
 
   it("does not reuse a stopped auto-port service port while another process owns it", async () => {
@@ -4268,6 +5789,647 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
           }
         }
       }
+    }
+  }, 20_000);
+
+  it("fails closed without changing a claimed runtime when a dead v2 registry copies its id but has no valid claim metadata", async () => {
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const runtimeServiceId = randomUUID();
+    const claimId = randomUUID();
+    const serviceKey = `workspace-runtime-dead-v2-${randomUUID()}`;
+    const startedAt = new Date("2026-07-14T08:00:00.000Z");
+    const updatedAt = new Date("2026-07-14T08:05:00.000Z");
+    const claimUpdatedAt = new Date("2026-07-14T08:06:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Dead v2 copied runtime company",
+      issuePrefix: `V${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Dead v2 copied runtime owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(workspaceRuntimeServices).values({
+      id: runtimeServiceId,
+      companyId,
+      scopeType: "agent",
+      scopeId: ownerAgentId,
+      serviceName: "claimed-runtime-victim",
+      status: "running",
+      lifecycle: "shared",
+      reuseKey: `agent:${ownerAgentId}:claimed-runtime-victim`,
+      command: "node claimed-runtime-victim.js",
+      cwd: os.tmpdir(),
+      port: 49_196,
+      url: "http://127.0.0.1:49196",
+      provider: "local_process",
+      providerRef: "999996",
+      ownerAgentId,
+      healthStatus: "healthy",
+      startedAt,
+      lastUsedAt: updatedAt,
+      createdAt: startedAt,
+      updatedAt,
+    });
+    await db.insert(workspaceRuntimeStartClaims).values({
+      companyId,
+      serviceKey,
+      claimId,
+      status: "running",
+      runtimeServiceId,
+      ownerAgentId,
+      claimedAt: startedAt,
+      expiresAt: new Date("2026-07-14T08:30:00.000Z"),
+      finalizedAt: claimUpdatedAt,
+      updatedAt: claimUpdatedAt,
+    });
+    await writeLocalServiceRegistryRecord({
+      version: 2,
+      serviceKey,
+      profileKind: "workspace-runtime",
+      serviceName: "copied-id-attacker",
+      command: "node copied-id-attacker.js",
+      cwd: os.tmpdir(),
+      envFingerprint: "copied-id-attacker",
+      port: 49_197,
+      url: "http://127.0.0.1:49197",
+      pid: 999_996,
+      processGroupId: 999_996,
+      processStartedAt: startedAt.toISOString(),
+      processExecutable: process.execPath,
+      processCommandSha256: `v1:sha256:${"0".repeat(64)}`,
+      provider: "local_process",
+      runtimeServiceId,
+      reuseKey: "copied-id-attacker",
+      startedAt: startedAt.toISOString(),
+      lastSeenAt: updatedAt.toISOString(),
+      metadata: {
+        companyId,
+        ownerAgentId,
+        startClaimId: false,
+      },
+    });
+    let terminationCalls = 0;
+
+    await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+      terminateLocalService: async () => {
+        terminationCalls += 1;
+      },
+    })).rejects.toThrow(/dead.*registry|exact.*claim|v2/i);
+
+    expect(terminationCalls).toBe(0);
+    await expect(db.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.id, runtimeServiceId))
+      .then((rows) => rows[0])).resolves.toMatchObject({
+      status: "running",
+      healthStatus: "healthy",
+      ownerAgentId,
+      updatedAt,
+    });
+    await expect(db.select().from(workspaceRuntimeStartClaims)
+      .where(eq(workspaceRuntimeStartClaims.claimId, claimId))
+      .then((rows) => rows[0])).resolves.toMatchObject({
+      status: "running",
+      runtimeServiceId,
+      ownerAgentId,
+      failureCode: null,
+      updatedAt: claimUpdatedAt,
+    });
+    await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+      .resolves.toContainEqual(expect.objectContaining({ serviceKey, runtimeServiceId, version: 2 }));
+  });
+
+  it("normal child stop revalidates runtime, claim, registry, and OS identity after classification", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-normal-stop-fence-"));
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const driftOwnerAgentId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Normal stop fence company",
+      issuePrefix: `N${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: ownerAgentId,
+        companyId,
+        name: "Normal stop owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: driftOwnerAgentId,
+        companyId,
+        name: "Normal stop drift owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Normal stop fence project",
+      status: "active",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Normal stop fence execution workspace",
+      status: "active",
+      cwd: workspaceRoot,
+      providerType: "local_fs",
+      providerRef: workspaceRoot,
+    });
+    const [service] = await startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: ownerAgentId, name: "Normal stop owner", companyId },
+      issue: null,
+      workspace: { ...buildWorkspace(workspaceRoot), projectId, workspaceId: null },
+      executionWorkspaceId,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "normal-stop-web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: {
+              type: "http",
+              urlTemplate: "http://127.0.0.1:{{port}}",
+              timeoutSec: 10,
+              intervalMs: 100,
+            },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+    });
+    const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(registry).not.toBeNull();
+    const originalRuntime = await db.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]!);
+    const originalClaim = await db.select().from(workspaceRuntimeStartClaims)
+      .where(eq(workspaceRuntimeStartClaims.runtimeServiceId, service!.id)).then((rows) => rows[0]!);
+    let signalCount = 0;
+    let classificationHookCalls = 0;
+
+    try {
+      const stopInput = {
+        db,
+        executionWorkspaceId,
+        runtimeServiceId: service!.id,
+        dependencies: {
+          afterStopClassifiedBeforeSignal: async () => {
+            classificationHookCalls += 1;
+            await db.update(workspaceRuntimeServices).set({
+              ownerAgentId: driftOwnerAgentId,
+              updatedAt: new Date(),
+            }).where(eq(workspaceRuntimeServices.id, service!.id));
+          },
+          terminateLocalService: async (_record: unknown, options: {
+            signalWithinFence?: (signal: NodeJS.Signals, sendSignal: () => void) => Promise<void>;
+          } | undefined) => {
+            await options?.signalWithinFence?.("SIGTERM", () => {
+              signalCount += 1;
+            });
+          },
+        },
+      } as Parameters<typeof stopRuntimeServicesForExecutionWorkspace>[0] & {
+        dependencies: {
+          afterStopClassifiedBeforeSignal: () => Promise<void>;
+          terminateLocalService: typeof terminateLocalService;
+        };
+      };
+      await expect(stopRuntimeServicesForExecutionWorkspace(stopInput))
+        .rejects.toThrow(/changed|binding|fence|quarantined/i);
+
+      expect(classificationHookCalls).toBe(1);
+      expect(signalCount).toBe(0);
+      await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          status: originalRuntime.status,
+          healthStatus: originalRuntime.healthStatus,
+          ownerAgentId: driftOwnerAgentId,
+        });
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.id, originalClaim.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          status: originalClaim.status,
+          claimId: originalClaim.claimId,
+          runtimeServiceId: originalClaim.runtimeServiceId,
+          ownerAgentId: originalClaim.ownerAgentId,
+        });
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({
+          serviceKey: registry!.serviceKey,
+          runtimeServiceId: service!.id,
+        }));
+    } finally {
+      try {
+        process.kill(-registry!.processGroupId!, "SIGKILL");
+      } catch {
+        // The vulnerable implementation may already have killed the group.
+      }
+      await removeLocalServiceRegistryRecord(registry!.serviceKey).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("does not delete a fresh registry published after the old runtime terminalizes", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-registry-remove-race-"));
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Registry removal race runtime",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Registry removal race owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    const [service] = await startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: agentId, name: "Registry removal race owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "registry-remove-web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT),'127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+    });
+    const oldRegistry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(oldRegistry).not.toBeNull();
+    const freshClaimId = randomUUID();
+    const freshRuntimeServiceId = randomUUID();
+
+    try {
+      await expect(stopRuntimeServicesForExecutionWorkspace({
+        db,
+        executionWorkspaceId: randomUUID(),
+        runtimeServiceId: service!.id,
+        dependencies: {
+          afterStopTerminalizedBeforeRegistryRemove: async () => {
+            await db.update(workspaceRuntimeStartClaims).set({
+              claimId: freshClaimId,
+              status: "starting",
+              runtimeServiceId: null,
+              failureCode: null,
+              finalizedAt: null,
+              updatedAt: new Date(),
+            }).where(eq(workspaceRuntimeStartClaims.serviceKey, oldRegistry!.serviceKey));
+            await writeLocalServiceRegistryRecord({
+              ...oldRegistry!,
+              runtimeServiceId: freshRuntimeServiceId,
+              lastSeenAt: new Date().toISOString(),
+              metadata: {
+                ...oldRegistry!.metadata,
+                startClaimId: freshClaimId,
+              },
+            });
+          },
+        },
+      })).rejects.toThrow(/claim changed|exact removal|registry/i);
+      expect(isProcessGroupAlive(oldRegistry!.processGroupId)).toBe(false);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({ status: "stopped", healthStatus: "unknown" });
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.serviceKey, oldRegistry!.serviceKey)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          claimId: freshClaimId,
+          status: "starting",
+          runtimeServiceId: null,
+        });
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({
+          serviceKey: oldRegistry!.serviceKey,
+          runtimeServiceId: freshRuntimeServiceId,
+          metadata: expect.objectContaining({ startClaimId: freshClaimId }),
+        }));
+    } finally {
+      try {
+        process.kill(-oldRegistry!.processGroupId!, "SIGKILL");
+      } catch {
+        // The old fenced stop should already have removed its process group.
+      }
+      await removeLocalServiceRegistryRecord(oldRegistry!.serviceKey).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("rechecks an unsafe owner status before startup reconciliation sends a signal", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-reconcile-owner-drift-"));
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Reconcile owner status runtime",
+      issuePrefix: `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Reconcile owner status owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const workspace = { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null };
+    const [service] = await startRuntimeServicesForWorkspaceControl({
+      db,
+      actor: { id: agentId, name: "Reconcile owner status owner", companyId },
+      issue: null,
+      workspace,
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "reconcile-owner-web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT),'127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: { type: "http", urlTemplate: "http://127.0.0.1:{{port}}", timeoutSec: 10, intervalMs: 100 },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+    });
+    const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(registry).not.toBeNull();
+    const runtimeBefore = await db.select().from(workspaceRuntimeServices)
+      .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]!);
+    const claimBefore = await db.select().from(workspaceRuntimeStartClaims)
+      .where(eq(workspaceRuntimeStartClaims.runtimeServiceId, service!.id)).then((rows) => rows[0]!);
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+    let classificationHookCalls = 0;
+    let signalCount = 0;
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+        afterPersistedClassifiedBeforeSignal: async () => {
+          classificationHookCalls += 1;
+          await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
+        },
+        terminateLocalService: async (_record, options) => {
+          await options?.signalWithinFence?.("SIGTERM", () => { signalCount += 1; });
+        },
+      })).rejects.toThrow(/owner.*changed|lifecycle|reconciliation failed/i);
+      expect(classificationHookCalls).toBe(1);
+      expect(signalCount).toBe(0);
+      expect(isPidAlive(registry!.pid)).toBe(true);
+      expect(isProcessGroupAlive(registry!.processGroupId)).toBe(true);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          status: runtimeBefore.status,
+          healthStatus: runtimeBefore.healthStatus,
+          updatedAt: runtimeBefore.updatedAt,
+        });
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.id, claimBefore.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          claimId: claimBefore.claimId,
+          status: claimBefore.status,
+          runtimeServiceId: claimBefore.runtimeServiceId,
+          updatedAt: claimBefore.updatedAt,
+        });
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({
+          serviceKey: registry!.serviceKey,
+          runtimeServiceId: service!.id,
+        }));
+
+      // A rejected fence must not pre-latch the live in-memory record as
+      // terminalizing. Prove that its original exit listener can still
+      // terminalize the exact durable binding after the process later exits.
+      process.kill(-registry!.processGroupId!, "SIGTERM");
+      let runtimeAfterExit = runtimeBefore;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        runtimeAfterExit = await db.select().from(workspaceRuntimeServices)
+          .where(eq(workspaceRuntimeServices.id, service!.id)).then((rows) => rows[0]!);
+        if (runtimeAfterExit.status === "stopped") break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(runtimeAfterExit).toMatchObject({ status: "stopped", healthStatus: "unknown" });
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.id, claimBefore.id)).then((rows) => rows[0]))
+        .resolves.toMatchObject({
+          claimId: claimBefore.claimId,
+          status: "stopped",
+          runtimeServiceId: service!.id,
+        });
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.not.toContainEqual(expect.objectContaining({
+          serviceKey: registry!.serviceKey,
+          runtimeServiceId: service!.id,
+        }));
+    } finally {
+      try {
+        process.kill(-registry!.processGroupId!, "SIGKILL");
+      } catch {
+        // Expected manual cleanup for the deliberately quarantined process.
+      }
+      await removeLocalServiceRegistryRecord(registry!.serviceKey).catch(() => undefined);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("revalidates the locked runtime, claim, and strict registry after classification before sending a signal", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-signal-fence-"));
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const driftOwnerAgentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Runtime signal fence company",
+      issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: ownerAgentId,
+        companyId,
+        name: "Runtime signal fence owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: driftOwnerAgentId,
+        companyId,
+        name: "Runtime signal drift owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: ownerAgentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    leasedRunIds.add(runId);
+    const [service] = await ensureRuntimeServicesForRun({
+      db,
+      runId,
+      agent: { id: ownerAgentId, name: "Runtime signal fence owner", companyId },
+      issue: null,
+      workspace: { ...buildWorkspace(workspaceRoot), projectId: null, workspaceId: null },
+      config: {
+        workspaceRuntime: {
+          services: [{
+            name: "signal-fence-web",
+            command: "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"",
+            port: { type: "auto" },
+            readiness: {
+              type: "http",
+              urlTemplate: "http://127.0.0.1:{{port}}",
+              timeoutSec: 10,
+              intervalMs: 100,
+            },
+            lifecycle: "shared",
+            reuseScope: "agent",
+            stopPolicy: { type: "manual" },
+          }],
+        },
+      },
+      adapterEnv: {},
+    });
+    const registry = await findLocalServiceRegistryRecordByRuntimeServiceId({
+      runtimeServiceId: service!.id,
+      profileKind: "workspace-runtime",
+    });
+    expect(registry).not.toBeNull();
+    await db.update(workspaceRuntimeServices).set({
+      status: "failed",
+      healthStatus: "unhealthy",
+      updatedAt: new Date(),
+    }).where(eq(workspaceRuntimeServices.id, service!.id));
+    await resetRuntimeServicesForTests();
+    let signalCount = 0;
+
+    try {
+      await expect(reconcilePersistedRuntimeServicesOnStartup(db, {
+        terminateLocalService: async (_record, options) => {
+          await db.update(workspaceRuntimeServices)
+            .set({ ownerAgentId: driftOwnerAgentId, updatedAt: new Date() })
+            .where(eq(workspaceRuntimeServices.id, service!.id));
+          const signalWithinFence = (options as typeof options & {
+            signalWithinFence?: (
+              signal: NodeJS.Signals,
+              sendSignal: () => void,
+            ) => Promise<void>;
+          } | undefined)?.signalWithinFence;
+          if (signalWithinFence) {
+            await signalWithinFence("SIGTERM", () => {
+              signalCount += 1;
+            });
+            return;
+          }
+          await options?.verifyBeforeSignal?.();
+          signalCount += 1;
+        },
+      })).rejects.toThrow(/changed|binding|reconciliation failed/i);
+
+      expect(signalCount).toBe(0);
+      await expect(db.select().from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, service!.id))
+        .then((rows) => rows[0])).resolves.toMatchObject({
+        status: "failed",
+        healthStatus: "unhealthy",
+        ownerAgentId: driftOwnerAgentId,
+      });
+      await expect(db.select().from(workspaceRuntimeStartClaims)
+        .where(eq(workspaceRuntimeStartClaims.runtimeServiceId, service!.id))
+        .then((rows) => rows[0])).resolves.toMatchObject({
+        status: "running",
+        runtimeServiceId: service!.id,
+        ownerAgentId,
+      });
+      await expect(listLocalServiceRegistryRecordsStrict({ profileKind: "workspace-runtime" }))
+        .resolves.toContainEqual(expect.objectContaining({ serviceKey: registry!.serviceKey }));
+    } finally {
+      await terminateLocalService(registry!, { forceAfterMs: 0 }).catch(() => undefined);
+      await removeLocalServiceRegistryRecord(registry!.serviceKey);
+      leasedRunIds.delete(runId);
+      await resetRuntimeServicesForTests();
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
     }
   }, 20_000);
 
@@ -4676,6 +6838,28 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
       startedByRunId: "run-1",
     });
     expect(first[0]?.id).toBe(second[0]?.id);
+  });
+
+  it("does not let adapter reports forge the runtime service owner", () => {
+    const refs = normalizeAdapterManagedRuntimeServices({
+      adapterType: "openclaw_gateway",
+      runId: "run-1",
+      agent: {
+        id: "agent-1",
+        name: "Gateway Agent",
+        companyId: "company-1",
+      },
+      issue: null,
+      workspace: buildWorkspace("/tmp/project"),
+      reports: [
+        {
+          serviceName: "preview",
+          ownerAgentId: "forged-agent",
+        },
+      ],
+    });
+
+    expect(refs[0]?.ownerAgentId).toBe("agent-1");
   });
 
   it("prefers execution workspace ids over cwd for execution-scoped adapter services", () => {

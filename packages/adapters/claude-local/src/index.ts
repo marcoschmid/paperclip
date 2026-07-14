@@ -43,9 +43,10 @@ Core fields:
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
 - maxTurnsPerRun (number, optional): max turns for one run
-- dangerouslySkipPermissions (boolean, optional, default true): allow non-interactive Claude runs to proceed without approval prompts. Local targets receive --dangerously-skip-permissions; remote targets receive a curated --allowedTools list so they do not inherit local bypass permissions.
+- dangerouslySkipPermissions (boolean, optional, default false): legacy global bypass input. Paperclip rejects true and rejects the equivalent flag in extraArgs/args because its declared scope cannot be enforced.
+- allowedTools (string[], legacy): free-form tool scopes are rejected. A future tool allowance must come from a Board-managed manifest with matching approval and canary evidence.
 - command (string, optional): defaults to "claude"
-- extraArgs (string[], optional): additional CLI args
+- extraArgs (string[], optional): fail-closed allowlist; only --no-session-persistence is accepted
 - env (object, optional): KEY=VALUE environment variables
 - workspaceStrategy (object, optional): execution workspace strategy; currently supports { type: "git_worktree", baseRef?, branchTemplate?, worktreeParentDir? }
 - workspaceRuntime (object, optional): reserved for workspace runtime metadata; workspace runtime services are manually controlled from the workspace UI and are not auto-started by heartbeats

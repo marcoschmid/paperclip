@@ -1,9 +1,22 @@
 import { EventEmitter } from "node:events";
+import { createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { agentApiKeys, agents, companies, createDb } from "@paperclipai/db";
+import {
+  authorizeLiveEventsUpgrade,
+  setupLiveEventsWebSocketServer,
+} from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 vi.mock("../middleware/logger.js", () => ({
   logger: {
@@ -119,5 +132,68 @@ describe("setupLiveEventsWebSocketServer", () => {
     expect(socket.listenerCount("error")).toBe(0);
     expect(socket.listenerCount("close")).toBe(0);
     expect(socket.listenerCount("finish")).toBe(0);
+  });
+});
+
+describeEmbeddedPostgres("live events websocket agent-key authorization", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-live-events-ws-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(agentApiKeys);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("rejects historical tombstone keys before touching lastUsedAt", async () => {
+    const companyId = randomUUID();
+    const token = `pcp_${"a".repeat(48)}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const [key] = await db.insert(agentApiKeys).values({
+      agentId: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "Historical key",
+      keyHash: createHash("sha256").update(token).digest("hex"),
+    }).returning();
+    const req = createUpgradeRequest({
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    await expect(authorizeLiveEventsUpgrade(
+      db,
+      req,
+      companyId,
+      new URL(`http://localhost/api/companies/${companyId}/events/ws`),
+      { deploymentMode: "authenticated" },
+    )).resolves.toBeNull();
+
+    const persisted = await db.select().from(agentApiKeys);
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]).toMatchObject({ id: key!.id, lastUsedAt: null });
   });
 });

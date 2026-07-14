@@ -51,29 +51,67 @@ function registerRoutineServiceMock() {
               if (!issueId) return null;
 
               const issue = await db
-                .select({ companyId: issues.companyId })
+                .select({
+                  companyId: issues.companyId,
+                  assigneeAgentId: issues.assigneeAgentId,
+                  originRunId: issues.originRunId,
+                })
                 .from(issues)
                 .where(eq(issues.id, issueId))
-                .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
-              if (!issue) return null;
+                .then((rows: Array<{
+                  companyId: string;
+                  assigneeAgentId: string | null;
+                  originRunId: string | null;
+                }>) => rows[0] ?? null);
+              if (
+                !issue?.originRunId
+                || issue.assigneeAgentId !== agentId
+                || wakeupOpts?.idempotencyKey !== `routine-delivery:${issue.originRunId}`
+              ) return null;
 
               const queuedRunId = randomUUID();
-              await db.insert(heartbeatRuns).values({
-                id: queuedRunId,
-                companyId: issue.companyId,
-                agentId,
-                invocationSource: wakeupOpts?.source ?? "assignment",
-                triggerDetail: wakeupOpts?.triggerDetail ?? null,
-                status: "queued",
-                contextSnapshot: { ...(wakeupOpts?.contextSnapshot ?? {}), issueId },
+              const wakeupRequestId = randomUUID();
+              await db.transaction(async (tx: any) => {
+                await tx.insert(agentWakeupRequests).values({
+                  id: wakeupRequestId,
+                  companyId: issue.companyId,
+                  agentId,
+                  source: wakeupOpts?.source ?? "assignment",
+                  triggerDetail: wakeupOpts?.triggerDetail ?? null,
+                  reason: wakeupOpts?.reason ?? null,
+                  payload: {
+                    ...(wakeupOpts?.payload ?? {}),
+                    issueId,
+                    originRunId: issue.originRunId,
+                  },
+                  status: "queued",
+                  requestedByActorType: wakeupOpts?.requestedByActorType ?? null,
+                  requestedByActorId: wakeupOpts?.requestedByActorId ?? null,
+                  idempotencyKey: wakeupOpts.idempotencyKey,
+                  runId: queuedRunId,
+                });
+                await tx.insert(heartbeatRuns).values({
+                  id: queuedRunId,
+                  companyId: issue.companyId,
+                  agentId,
+                  invocationSource: wakeupOpts?.source ?? "assignment",
+                  triggerDetail: wakeupOpts?.triggerDetail ?? null,
+                  status: "queued",
+                  wakeupRequestId,
+                  contextSnapshot: {
+                    ...(wakeupOpts?.contextSnapshot ?? {}),
+                    issueId,
+                    originRunId: issue.originRunId,
+                  },
+                });
+                await tx
+                  .update(issues)
+                  .set({
+                    executionRunId: queuedRunId,
+                    executionLockedAt: new Date(),
+                  })
+                  .where(eq(issues.id, issueId));
               });
-              await db
-                .update(issues)
-                .set({
-                  executionRunId: queuedRunId,
-                  executionLockedAt: new Date(),
-                })
-                .where(eq(issues.id, issueId));
               return { id: queuedRunId };
             },
           },

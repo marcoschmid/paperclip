@@ -2,6 +2,7 @@ import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, costEvents, financeEvents, goals, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
+import { assertHistoricalAgentTombstoneMutable } from "./agent-retirement-historical-tombstones.js";
 
 export interface FinanceDateRange {
   from?: Date;
@@ -41,6 +42,7 @@ export function financeService(db: Db) {
 
   return {
     createEvent: async (companyId: string, data: Omit<typeof financeEvents.$inferInsert, "companyId">) => {
+      assertHistoricalAgentTombstoneMutable(data.agentId);
       if (data.agentId) await assertBelongsToCompany(db, agents, data.agentId, companyId, "Agent");
       if (data.issueId) await assertBelongsToCompany(db, issues, data.issueId, companyId, "Issue");
       if (data.projectId) await assertBelongsToCompany(db, projects, data.projectId, companyId, "Project");

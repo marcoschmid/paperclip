@@ -49,7 +49,16 @@ import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  assertHistoricalAgentTombstoneActiveReference,
+  isHistoricalAgentTombstoneId,
+} from "./agent-retirement-historical-tombstones.js";
 import { authorizationService } from "./authorization.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+  lockAgentLifecycleReferences,
+} from "./agent-lifecycle-fence.js";
 import {
   formatPipelineCaseOutputContextMarkdown,
   pipelineCaseOutputsService,
@@ -616,8 +625,43 @@ function terminalKindForStage(kind: string) {
   return isTerminalKind(kind) ? kind : null;
 }
 
-function hasValidLease(row: typeof pipelineCases.$inferSelect, now = nowDate()) {
-  return Boolean(row.leaseToken && row.leaseExpiresAt && row.leaseExpiresAt.getTime() > now.getTime());
+type PipelineCaseLeaseState = Pick<
+  typeof pipelineCases.$inferSelect,
+  "leaseOwnerType" | "leaseAgentId" | "leaseUserId" | "leaseToken" | "leaseExpiresAt"
+>;
+
+function hasAnyLeaseState(row: PipelineCaseLeaseState) {
+  return Boolean(
+    row.leaseOwnerType || row.leaseAgentId || row.leaseUserId || row.leaseToken || row.leaseExpiresAt,
+  );
+}
+
+function invalidLeaseReason(row: PipelineCaseLeaseState, now = nowDate()) {
+  if (!hasAnyLeaseState(row)) return null;
+  if (row.leaseOwnerType === "agent" && isHistoricalAgentTombstoneId(row.leaseAgentId)) {
+    return "historical_agent_tombstone" as const;
+  }
+  const completeAgentLease = row.leaseOwnerType === "agent" &&
+    Boolean(row.leaseAgentId) &&
+    !row.leaseUserId &&
+    Boolean(row.leaseToken) &&
+    Boolean(row.leaseExpiresAt);
+  const completeUserLease = row.leaseOwnerType === "user" &&
+    Boolean(row.leaseUserId) &&
+    !row.leaseAgentId &&
+    Boolean(row.leaseToken) &&
+    Boolean(row.leaseExpiresAt);
+  if (!completeAgentLease && !completeUserLease) return "incomplete_lease" as const;
+  if (row.leaseExpiresAt!.getTime() <= now.getTime()) return "expired" as const;
+  return null;
+}
+
+export function isPipelineCaseLeaseUsable(row: PipelineCaseLeaseState, now = nowDate()) {
+  return hasAnyLeaseState(row) && invalidLeaseReason(row, now) === null;
+}
+
+function hasValidLease(row: PipelineCaseLeaseState, now = nowDate()) {
+  return isPipelineCaseLeaseUsable(row, now);
 }
 
 function leaseOwner(row: typeof pipelineCases.$inferSelect) {
@@ -634,7 +678,10 @@ function actorOwnsLease(row: typeof pipelineCases.$inferSelect, actor: PipelineA
   if (!row.leaseToken) return true;
   if (leaseToken && leaseToken === row.leaseToken) return true;
   if (actor.type === "system") return true;
-  if (actor.type === "agent") return row.leaseOwnerType === "agent" && row.leaseAgentId === actor.agentId;
+  if (actor.type === "agent") {
+    return row.leaseOwnerType === "agent"
+      && row.leaseAgentId === canonicalizeAgentReferenceId(actor.agentId);
+  }
   if (actor.type === "user") return row.leaseOwnerType === "user" && row.leaseUserId === actor.userId;
   return false;
 }
@@ -1040,10 +1087,13 @@ function normalizeStageApprover(
   if (kind === "any_human") {
     return { kind };
   }
+  const canonicalId = kind === "agent"
+    ? canonicalizeAgentReferenceId(id as string)
+    : id as string;
   if (!requireApproval) {
-    return { kind, id: id as string };
+    return { kind, id: canonicalId };
   }
-  return { kind, id: id as string };
+  return { kind, id: canonicalId };
 }
 
 function assertStageEnabled(stage: typeof pipelineStages.$inferSelect, action: string) {
@@ -1556,9 +1606,19 @@ async function getCaseWithStageForUpdateOrThrow(db: PipelineDb, companyId: strin
 
 async function expireLeaseIfNeeded(db: PipelineDb, row: typeof pipelineCases.$inferSelect, actor: PipelineActor) {
   const now = nowDate();
-  if (!row.leaseToken || !row.leaseExpiresAt || row.leaseExpiresAt.getTime() > now.getTime()) {
-    return row;
-  }
+  const reason = invalidLeaseReason(row, now);
+  if (!reason) return row;
+
+  const leaseIdentityPredicates = [eq(pipelineCases.id, row.id)];
+  leaseIdentityPredicates.push(row.leaseToken
+    ? eq(pipelineCases.leaseToken, row.leaseToken)
+    : isNull(pipelineCases.leaseToken));
+  leaseIdentityPredicates.push(row.leaseExpiresAt
+    ? eq(pipelineCases.leaseExpiresAt, row.leaseExpiresAt)
+    : isNull(pipelineCases.leaseExpiresAt));
+  leaseIdentityPredicates.push(row.leaseOwnerType
+    ? eq(pipelineCases.leaseOwnerType, row.leaseOwnerType)
+    : isNull(pipelineCases.leaseOwnerType));
 
   const [updated] = await db
     .update(pipelineCases)
@@ -1570,7 +1630,7 @@ async function expireLeaseIfNeeded(db: PipelineDb, row: typeof pipelineCases.$in
       leaseExpiresAt: null,
       updatedAt: now,
     })
-    .where(and(eq(pipelineCases.id, row.id), eq(pipelineCases.leaseToken, row.leaseToken)))
+    .where(and(...leaseIdentityPredicates))
     .returning();
   if (!updated) return row;
 
@@ -1579,7 +1639,7 @@ async function expireLeaseIfNeeded(db: PipelineDb, row: typeof pipelineCases.$in
     caseId: row.id,
     type: "lease_expired",
     actor,
-    payload: { previousOwner: leaseOwner(row), expiredAt: now.toISOString() },
+    payload: { previousOwner: leaseOwner(row), expiredAt: now.toISOString(), reason },
   });
   return updated;
 }
@@ -2227,8 +2287,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
   const authorization = authorizationService(db);
   const secretsSvc = secretService(db);
 
-  async function assertRoutineInCompany(companyId: string, routineId: string) {
-    const routine = await db
+  async function assertRoutineInCompany(
+    companyId: string,
+    routineId: string,
+    dbOrTx: PipelineDb = db,
+  ) {
+    const routine = await dbOrTx
       .select({ id: routines.id, companyId: routines.companyId, assigneeAgentId: routines.assigneeAgentId })
       .from(routines)
       .where(eq(routines.id, routineId))
@@ -2241,10 +2305,153 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     return routine;
   }
 
-  async function validateStageAutomationConfig(companyId: string, config?: PipelineStageConfig | null) {
+  async function prelockStageAutomationReferences(
+    companyId: string,
+    configs: readonly (PipelineStageConfig | null | undefined)[],
+    dbOrTx: PipelineDb,
+  ) {
+    const routineIds = [...new Set(configs.flatMap((config) => {
+      const onEnter = config?.onEnter;
+      return onEnter?.type === "run_routine" && onEnter.routineId ? [onEnter.routineId] : [];
+    }))].sort();
+    const routineSnapshots = routineIds.length === 0
+      ? []
+      : await dbOrTx
+        .select({ id: routines.id, companyId: routines.companyId, assigneeAgentId: routines.assigneeAgentId })
+        .from(routines)
+        .where(inArray(routines.id, routineIds))
+        .orderBy(asc(routines.id));
+    const snapshotById = new Map(routineSnapshots.map((routine) => [routine.id, routine]));
+    for (const routineId of routineIds) {
+      const routine = snapshotById.get(routineId);
+      if (!routine) throw notFound("Routine not found");
+      if (routine.companyId !== companyId) {
+        throw unprocessable("Pipeline automation routine must belong to the same company", { code: "validation" });
+      }
+    }
+    const agentIds = configs.flatMap((config) => {
+      const approverId = config?.approver?.kind === "agent" && config.approver.id
+        ? canonicalizeAgentReferenceId(config.approver.id)
+        : null;
+      const onEnter = config?.onEnter;
+      const routine = onEnter?.type === "run_routine" && onEnter.routineId
+        ? snapshotById.get(onEnter.routineId)
+        : null;
+      const assigneeId = routine?.assigneeAgentId
+        ? canonicalizeAgentReferenceId(routine.assigneeAgentId)
+        : null;
+      return [approverId, assigneeId].filter((id): id is string => Boolean(id));
+    });
+    await lockAgentLifecycleReferences(dbOrTx as Db, {
+      companyId,
+      agentIds,
+      mode: "active",
+    });
+    if (routineIds.length === 0) return;
+    const lockedRoutines = await dbOrTx
+      .select({ id: routines.id, companyId: routines.companyId, assigneeAgentId: routines.assigneeAgentId })
+      .from(routines)
+      .where(inArray(routines.id, routineIds))
+      .orderBy(asc(routines.id))
+      .for("update");
+    const lockedById = new Map(lockedRoutines.map((routine) => [routine.id, routine]));
+    for (const routineId of routineIds) {
+      const snapshot = snapshotById.get(routineId)!;
+      const locked = lockedById.get(routineId);
+      if (!locked) throw notFound("Routine not found");
+      if (locked.companyId !== companyId) {
+        throw unprocessable("Pipeline automation routine must belong to the same company", { code: "validation" });
+      }
+      if (locked.assigneeAgentId !== snapshot.assigneeAgentId) {
+        throw conflict("Pipeline automation routine assignee changed during validation", {
+          code: "pipeline_automation_reference_drift",
+          routineId,
+          expectedAssigneeAgentId: snapshot.assigneeAgentId,
+          currentAssigneeAgentId: locked.assigneeAgentId,
+        });
+      }
+    }
+  }
+
+  async function validateStageAutomationConfig(
+    companyId: string,
+    config?: PipelineStageConfig | null,
+    dbOrTx: PipelineDb = db,
+  ) {
+    const approverAgentId = config?.approver?.kind === "agent" && config.approver.id
+      ? canonicalizeAgentReferenceId(config.approver.id)
+      : null;
     const onEnter = config?.onEnter;
-    if (!onEnter || onEnter.type !== "run_routine" || !onEnter.routineId) return;
-    await assertRoutineInCompany(companyId, onEnter.routineId);
+    const routineSnapshot = onEnter?.type === "run_routine" && onEnter.routineId
+      ? await assertRoutineInCompany(companyId, onEnter.routineId, dbOrTx)
+      : null;
+    const routineAssigneeId = routineSnapshot?.assigneeAgentId
+      ? canonicalizeAgentReferenceId(routineSnapshot.assigneeAgentId)
+      : null;
+    await lockAgentLifecycleReferences(dbOrTx as Db, {
+      companyId,
+      agentIds: [approverAgentId, routineAssigneeId].filter((id): id is string => Boolean(id)),
+      mode: "active",
+    });
+    const routine = routineSnapshot
+      ? await dbOrTx
+        .select({ id: routines.id, companyId: routines.companyId, assigneeAgentId: routines.assigneeAgentId })
+        .from(routines)
+        .where(eq(routines.id, routineSnapshot.id))
+        .limit(1)
+        .for("update")
+        .then((rows) => rows[0] ?? null)
+      : null;
+    if (routineSnapshot && !routine) throw notFound("Routine not found");
+    if (routine && routine.companyId !== companyId) {
+      throw unprocessable("Pipeline automation routine must belong to the same company", { code: "validation" });
+    }
+    if (routine && routine.assigneeAgentId !== routineSnapshot?.assigneeAgentId) {
+      throw conflict("Pipeline automation routine assignee changed during validation", {
+        code: "pipeline_automation_reference_drift",
+        routineId: routine.id,
+        expectedAssigneeAgentId: routineSnapshot?.assigneeAgentId ?? null,
+        currentAssigneeAgentId: routine.assigneeAgentId,
+      });
+    }
+    if (approverAgentId) {
+      await assertAssignableAgent(dbOrTx as Db, companyId, approverAgentId, { kind: "work" });
+    }
+    if (routine) {
+      await assertAssignableAgent(dbOrTx as Db, companyId, routineAssigneeId, { kind: "routine" });
+    }
+  }
+
+  async function validatePipelineActivation(
+    companyId: string,
+    pipelineId: string,
+    dbOrTx: PipelineDb = db,
+  ) {
+    await getPipelineOrThrow(dbOrTx, companyId, pipelineId);
+    const stages = await dbOrTx
+      .select()
+      .from(pipelineStages)
+      .where(eq(pipelineStages.pipelineId, pipelineId));
+    const configs = stages.map((stage) => normalizeStageConfig(stage.kind, stageConfig(stage)));
+    await prelockStageAutomationReferences(companyId, configs, dbOrTx);
+    for (const config of configs) {
+      await validateStageAutomationConfig(companyId, config, dbOrTx);
+    }
+  }
+
+  async function validateStageApprover(
+    companyId: string,
+    config?: PipelineStageConfig | null,
+    dbOrTx: PipelineDb = db,
+  ) {
+    if (config?.approver?.kind !== "agent" || !config.approver.id) return;
+    const agentId = canonicalizeAgentReferenceId(config.approver.id);
+    await lockAgentLifecycleReference(dbOrTx as Db, {
+      companyId,
+      agentId,
+      mode: "active",
+    });
+    await assertAssignableAgent(dbOrTx as Db, companyId, agentId, { kind: "work" });
   }
 
   async function loadBreakdownTarget(
@@ -2732,7 +2939,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       return rest as PipelineStageConfig;
     }
 
-    await assertAssignableAgent(dbOrTx as Db, input.companyId, input.assigneeAgentId, { kind: "routine" });
+    const assigneeAgentId = canonicalizeAgentReferenceId(input.assigneeAgentId);
+    await lockAgentLifecycleReference(dbOrTx as Db, {
+      companyId: input.companyId,
+      agentId: assigneeAgentId,
+      mode: "active",
+    });
+    await assertAssignableAgent(dbOrTx as Db, input.companyId, assigneeAgentId, { kind: "routine" });
     const actorPatch = routineActorPatch(input.actor);
     const previousRoutine = input.previousRoutineId
       ? await dbOrTx
@@ -2761,7 +2974,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         .set({
           title,
           description,
-          assigneeAgentId: input.assigneeAgentId,
+          assigneeAgentId,
           status: "active",
           originKind: "pipeline_automation",
           originId: input.pipelineId,
@@ -2795,7 +3008,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         companyId: input.companyId,
         title,
         description,
-        assigneeAgentId: input.assigneeAgentId,
+        assigneeAgentId,
         status: "active",
         priority: "medium",
         concurrencyPolicy: "coalesce_if_active",
@@ -2831,6 +3044,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     dbOrTx: PipelineDb,
     input: { companyId: string; pipelineId: string; routineId: string; actor: PipelineActor },
   ) {
+    const routine = await assertRoutineInCompany(input.companyId, input.routineId, dbOrTx);
+    await assertAssignableAgent(dbOrTx as Db, input.companyId, routine.assigneeAgentId, { kind: "routine" });
     const updated = await dbOrTx
       .update(routines)
       .set({ originKind: "pipeline_automation", originId: input.pipelineId, updatedAt: nowDate() })
@@ -2879,6 +3094,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
   ) {
     const stillReferenced = await routineStillReferencedByAnyPipeline(dbOrTx, input);
     if (stillReferenced) return;
+    const routine = await dbOrTx
+      .select({ assigneeAgentId: routines.assigneeAgentId, originKind: routines.originKind })
+      .from(routines)
+      .where(and(eq(routines.id, input.routineId), eq(routines.companyId, input.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (routine?.originKind === "pipeline_automation") {
+      await assertAssignableAgent(dbOrTx as Db, input.companyId, routine.assigneeAgentId, { kind: "routine" });
+    }
     const updated = await dbOrTx
       .update(routines)
       .set({ originKind: "manual", originId: null, updatedAt: nowDate() })
@@ -3234,6 +3457,11 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       : await getStageByKeyOrThrow(tx, current.pipelineId, input.toStageKey ?? "");
     assertStageEnabled(toStage, "transition");
     if (fromStage.id !== toStage.id) {
+      await validateStageApprover(
+        input.companyId,
+        normalizeStageConfig(fromStage.kind, stageConfig(fromStage)),
+        tx,
+      );
       assertActorCanApproveStageExit(fromStage, input.actor);
       await assertStageTransitionGates(tx, current, fromStage, { skipChildrenTerminalGate: input.skipChildrenTerminalGate });
       await assertLatestReviewApprovalStillCurrent(tx, current, fromStage, toStage, {
@@ -3461,6 +3689,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
 
   const service = {
     resolveBreakdownTarget,
+    validatePipelineActivation,
 
     async createPipeline(input: {
       companyId: string;
@@ -3488,9 +3717,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           config: normalizeStageConfig(stage.kind, "config" in stage ? stage.config : {}),
         }));
         const stageKeys = new Set(stageInputs.map((stage) => stage.key));
+        await prelockStageAutomationReferences(
+          input.companyId,
+          stageInputs.map((stage) => stage.config),
+          tx,
+        );
         for (const stage of stageInputs) {
           assertReviewTargetsInSet(stage.kind, stage.config, stageKeys);
-          await validateStageAutomationConfig(input.companyId, stage.config);
+          await validateStageAutomationConfig(input.companyId, stage.config, tx);
         }
         const [pipeline] = await tx
           .insert(pipelines)
@@ -3575,6 +3809,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       await validateStageTargets(input.companyId, input.pipelineId, input.kind, config);
       await validateStageAutomationConfig(input.companyId, config);
       return db.transaction(async (tx) => {
+        await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
         const [nextStage] = await tx
           .select({ key: pipelineStages.key })
           .from(pipelineStages)
@@ -3584,6 +3819,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         const nextConfig = input.kind === "open"
           ? config
           : withDefaultWorkingChildrenGateConfig({ kind, config }, nextStage?.key ?? null);
+        await validateStageAutomationConfig(input.companyId, nextConfig, tx);
         await tx
           .update(pipelineStages)
           .set({
@@ -3649,6 +3885,20 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       await validateStageTargets(input.companyId, input.pipelineId, kind, config);
       await validateStageAutomationConfig(input.companyId, config);
       return db.transaction(async (tx) => {
+        if (automationRequest) {
+          const approverAgentId = config.approver?.kind === "agent" && config.approver.id
+            ? canonicalizeAgentReferenceId(config.approver.id)
+            : null;
+          const automationAssigneeAgentId = automationRequest.assigneeAgentId
+            ? canonicalizeAgentReferenceId(automationRequest.assigneeAgentId)
+            : null;
+          await lockAgentLifecycleReferences(tx as unknown as Db, {
+            companyId: input.companyId,
+            agentIds: [approverAgentId, automationAssigneeAgentId]
+              .filter((agentId): agentId is string => Boolean(agentId)),
+            mode: "active",
+          });
+        }
         const nextConfig = automationRequest
           ? await syncPipelineStageAutomation(tx, {
               companyId: input.companyId,
@@ -3664,6 +3914,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
               actor: input.actor ?? { type: "system" },
             })
           : config;
+        await validateStageAutomationConfig(input.companyId, nextConfig, tx);
         const nextRoutineId = stageAutomationRoutineIdFromConfig(nextConfig);
         const [updated] = await tx
           .update(pipelineStages)
@@ -3714,6 +3965,15 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         });
       }
 
+      const routine = await assertRoutineInCompany(input.companyId, routineId);
+      if (!routine.assigneeAgentId) {
+        throw unprocessable("Pipeline stage automation must have an assignee before env can be saved", {
+          code: "stage_automation_assignee_required",
+          routineId,
+        });
+      }
+      await assertAssignableAgent(db, input.companyId, routine.assigneeAgentId, { kind: "routine" });
+
       const normalizedEnv = input.env === null
         ? null
         : await secretsSvc.normalizeEnvBindingsForPersistence(input.companyId, input.env, {
@@ -3736,6 +3996,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             routineId,
           });
         }
+        await assertAssignableAgent(txDb, input.companyId, locked.assigneeAgentId, { kind: "routine" });
         if (input.baseRoutineRevisionId && input.baseRoutineRevisionId !== locked.latestRevisionId) {
           throw conflict("Stage automation routine was updated by someone else", {
             currentRoutineRevisionId: locked.latestRevisionId,
@@ -4364,7 +4625,21 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       actor: Extract<PipelineActor, { type: "user" | "agent" }>;
       leaseMs?: number;
     }) {
+      const leaseAgentId = input.actor.type === "agent"
+        ? canonicalizeAgentReferenceId(input.actor.agentId)
+        : null;
+      if (input.actor.type === "agent") {
+        assertHistoricalAgentTombstoneActiveReference(input.actor.agentId);
+      }
       return db.transaction(async (tx) => {
+        if (leaseAgentId) {
+          await lockAgentLifecycleReference(tx as unknown as Db, {
+            companyId: input.companyId,
+            agentId: leaseAgentId,
+            mode: "active",
+          });
+          await assertAssignableAgent(tx as unknown as Db, input.companyId, leaseAgentId, { kind: "work" });
+        }
         const { case: existing } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
         const current = await expireLeaseIfNeeded(tx, existing, { type: "system" });
         if (hasValidLease(current) && !actorOwnsLease(current, input.actor, null)) {
@@ -4377,7 +4652,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           .update(pipelineCases)
           .set({
             leaseOwnerType: input.actor.type,
-            leaseAgentId: input.actor.type === "agent" ? input.actor.agentId : null,
+            leaseAgentId,
             leaseUserId: input.actor.type === "user" ? input.actor.userId : null,
             leaseToken: token,
             leaseExpiresAt: expiresAt,
@@ -4892,6 +5167,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           throw unprocessable("Pipeline case is not in a review stage", { code: "validation" });
         }
         const config = reviewConfigForStage(detail.stage);
+        await validateStageApprover(input.companyId, config, tx);
         assertActorCanApproveStageExit(detail.stage, input.actor);
         const reasonRequired =
           (input.decision === "request_changes" && config.requireRequestChangesReason !== false) ||

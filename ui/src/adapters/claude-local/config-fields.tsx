@@ -94,24 +94,18 @@ export function ClaudeLocalAdvancedFields({
             : mark("adapterConfig", "chrome", v)
         }
       />
-      <ToggleField
-        label="Skip permissions"
-        hint={help.dangerouslySkipPermissions}
-        checked={
-          isCreate
-            ? values!.dangerouslySkipPermissions
-            : eff(
-                "adapterConfig",
-                "dangerouslySkipPermissions",
-                config.dangerouslySkipPermissions !== false,
-              )
-        }
-        onChange={(v) =>
-          isCreate
-            ? set!({ dangerouslySkipPermissions: v })
-            : mark("adapterConfig", "dangerouslySkipPermissions", v)
-        }
-      />
+      {!isCreate && config.dangerouslySkipPermissions === true && (
+        <ToggleField
+          label="Legacy global permission bypass (blocked)"
+          hint="Paperclip no longer executes Claude with the global bypass. Turn this legacy value off; free-form allowedTools is also blocked pending a Board-managed manifest."
+          checked={eff(
+            "adapterConfig",
+            "dangerouslySkipPermissions",
+            true,
+          )}
+          onChange={(v) => mark("adapterConfig", "dangerouslySkipPermissions", v)}
+        />
+      )}
       <Field label="Max turns per run" hint={help.maxTurnsPerRun}>
         {isCreate ? (
           <input

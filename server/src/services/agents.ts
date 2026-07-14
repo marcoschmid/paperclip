@@ -1,35 +1,71 @@
-import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { and, desc, eq, gte, inArray, isNull, lt, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  agentPortfolioMaintenanceGates,
+  activityLog,
   agentConfigRevisions,
   agentApiKeys,
-  agentRuntimeState,
-  agentTaskSessions,
-  agentWakeupRequests,
-  activityLog,
+  agentMemberships,
+  companyMemberships,
+  companySecretBindings,
+  companySkillStars,
   costEvents,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueExecutionDecisions,
-  issues,
-  issueComments,
+  principalPermissionGrants,
+  userSecretDeclarations,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  agentLifecycleGateSchema,
+  agentLifecycleSchema,
   getAgentWorkEligibility,
   isUuidLike,
   normalizeAgentApiKeyScope,
   normalizeAgentUrlKey,
+  isAgentRetirementSource,
+  normalizeAgentRetirementId,
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
+  type AgentLifecycleGate,
+  type AgentLifecycleTransition,
+  type AgentPauseReason,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import { secretService } from "./secrets.js";
+import {
+  SERVER_MANAGED_AGENT_LIFECYCLE_GATE_KEYS,
+  stripServerManagedAgentLifecycleGates,
+  validateAgentLifecyclePatchTransition,
+} from "./agent-lifecycle.js";
+import {
+  assertHistoricalAgentTombstoneAccessMutable,
+  assertHistoricalAgentTombstoneActiveReference,
+  assertHistoricalAgentTombstoneMutable,
+} from "./agent-retirement-historical-tombstones.js";
+import {
+  hasAgentOperationalDependencies,
+  nonzeroAgentOperationalDependencyCounts,
+  scanAgentDeletionHistoryReferences,
+  scanAgentOperationalDependencies,
+} from "./agent-operational-dependencies.js";
+import { withAgentStartLock } from "./agent-start-lock.js";
+
+function withAgentMutationLocks<T>(ids: Array<string | null | undefined>, fn: () => Promise<T>) {
+  const orderedIds = [...new Set(ids
+    .filter((id): id is string => typeof id === "string" && id.length > 0)
+    .map((id) => normalizeAgentRetirementId(id) ?? id))]
+    .sort((left, right) => left.localeCompare(right));
+  const acquire = (index: number): Promise<T> => {
+    const agentId = orderedIds[index];
+    return agentId ? withAgentStartLock(agentId, () => acquire(index + 1)) : fn();
+  };
+  return acquire(0);
+}
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -65,6 +101,25 @@ interface RevisionMetadata {
 
 interface UpdateAgentOptions {
   recordRevision?: RevisionMetadata;
+  lifecycleTransition?: AgentLifecycleTransition;
+}
+
+interface UpdateLifecycleGateOptions extends UpdateAgentOptions {
+  lifecycleGate: AgentLifecycleGate | null;
+  expectedAgentUpdatedAt: string;
+}
+
+interface InternalUpdateAgentOptions extends UpdateAgentOptions {
+  trustedLifecycleGateWrite?: {
+    lifecycleGate: AgentLifecycleGate | null;
+    expectedAgentUpdatedAt: string;
+  };
+}
+
+type AgentServicePauseReason = Exclude<AgentPauseReason, "company_archived">;
+
+interface AgentPauseOptions {
+  maintenanceOperationId?: string;
 }
 
 interface AgentShortnameRow {
@@ -79,6 +134,42 @@ interface AgentShortnameCollisionOptions {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(record: object, key: PropertyKey) {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function hasServerManagedLifecycleGate(metadata: unknown) {
+  return isPlainRecord(metadata)
+    && SERVER_MANAGED_AGENT_LIFECYCLE_GATE_KEYS.some((key) => hasOwn(metadata, key));
+}
+
+function normalizeAgentMetadataPatch(input: {
+  existingMetadata: unknown;
+  requestedMetadata: unknown;
+  trustedLifecycleGate?: AgentLifecycleGate | null;
+  clearServerManagedLifecycleGates?: boolean;
+}): Record<string, unknown> | null {
+  const existing = isPlainRecord(input.existingMetadata) ? input.existingMetadata : {};
+  const requestedRecord = isPlainRecord(input.requestedMetadata) ? input.requestedMetadata : {};
+  const sanitized = stripServerManagedAgentLifecycleGates(requestedRecord);
+  const next = isPlainRecord(sanitized) ? sanitized : {};
+
+  if (!hasOwn(next, "lifecycle") && hasOwn(existing, "lifecycle")) {
+    next.lifecycle = existing.lifecycle;
+  }
+  for (const key of SERVER_MANAGED_AGENT_LIFECYCLE_GATE_KEYS) {
+    if (input.clearServerManagedLifecycleGates) continue;
+    if (key === "lifecycleGate" && input.trustedLifecycleGate !== undefined) {
+      if (input.trustedLifecycleGate !== null) next.lifecycleGate = input.trustedLifecycleGate;
+      continue;
+    }
+    if (hasOwn(existing, key)) next[key] = existing[key];
+  }
+
+  if (input.requestedMetadata === null && Object.keys(next).length === 0) return null;
+  return next;
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {
@@ -96,10 +187,12 @@ function buildConfigSnapshot(
     typeof row.runtimeConfig === "object" && row.runtimeConfig !== null && !Array.isArray(row.runtimeConfig)
       ? sanitizeRecord(row.runtimeConfig as Record<string, unknown>)
       : {};
-  const metadata =
+  const rawMetadata =
     typeof row.metadata === "object" && row.metadata !== null && !Array.isArray(row.metadata)
       ? sanitizeRecord(row.metadata as Record<string, unknown>)
       : row.metadata ?? null;
+  const strippedMetadata = stripServerManagedAgentLifecycleGates(rawMetadata);
+  const metadata = isPlainRecord(strippedMetadata) ? strippedMetadata : null;
   return {
     name: row.name,
     role: row.role,
@@ -124,6 +217,19 @@ function containsRedactedMarker(value: unknown): boolean {
 
 function hasConfigPatchFields(data: Partial<typeof agents.$inferInsert>) {
   return CONFIG_REVISION_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(data, field));
+}
+
+function assertValidLifecycleMetadata(metadata: unknown) {
+  if (!isPlainRecord(metadata)) return;
+  if (Object.prototype.hasOwnProperty.call(metadata, "lifecycle")) {
+    const lifecycle = agentLifecycleSchema.safeParse(metadata.lifecycle);
+    if (!lifecycle.success) {
+      throw unprocessable("Invalid agent lifecycle metadata", {
+        code: "invalid_agent_lifecycle",
+        issues: lifecycle.error.issues,
+      });
+    }
+  }
 }
 
 function parseFiniteNumberLike(value: unknown): number | null {
@@ -219,6 +325,113 @@ export function deduplicateAgentName(
     }
   }
   return `${candidateName} ${Date.now()}`;
+}
+
+async function cleanupAgentAccessRows(
+  targetDb: Db,
+  agent: Pick<typeof agents.$inferSelect, "id">,
+  mode: "terminate" | "remove",
+) {
+  const now = new Date();
+  if (mode === "terminate") {
+    await targetDb
+      .update(agentApiKeys)
+      .set({ revokedAt: now })
+      .where(and(eq(agentApiKeys.agentId, agent.id), isNull(agentApiKeys.revokedAt)));
+  } else {
+    await targetDb.delete(agentApiKeys).where(eq(agentApiKeys.agentId, agent.id));
+  }
+  await targetDb.delete(principalPermissionGrants).where(and(
+    eq(principalPermissionGrants.principalType, "agent"),
+    sql`lower(${principalPermissionGrants.principalId}) = ${agent.id}`,
+  ));
+  await targetDb.delete(companyMemberships).where(and(
+    eq(companyMemberships.principalType, "agent"),
+    sql`lower(${companyMemberships.principalId}) = ${agent.id}`,
+  ));
+  await targetDb.delete(agentMemberships).where(eq(agentMemberships.agentId, agent.id));
+  await targetDb.delete(companySecretBindings).where(and(
+    eq(companySecretBindings.targetType, "agent"),
+    sql`lower(${companySecretBindings.targetId}) = ${agent.id}`,
+  ));
+  await targetDb.delete(userSecretDeclarations).where(and(
+    eq(userSecretDeclarations.targetType, "agent"),
+    sql`lower(${userSecretDeclarations.targetId}) = ${agent.id}`,
+  ));
+  await targetDb.delete(companySkillStars).where(eq(companySkillStars.agentId, agent.id));
+}
+
+export type AgentTerminationActorContext = {
+  actorType?: "user" | "agent" | "system";
+  actorId?: string;
+  source?: string;
+  details?: Record<string, unknown>;
+};
+
+export async function terminateAgentInTransaction(
+  targetDb: Db,
+  id: string,
+  actor: AgentTerminationActorContext = {},
+) {
+  assertHistoricalAgentTombstoneMutable(id);
+  if (isAgentRetirementSource(id)) {
+    throw conflict("This agent requires the gated retirement workflow", {
+      code: "retirement_gated_termination_required",
+      sourceAgentId: id,
+    });
+  }
+  const agentId = normalizeAgentRetirementId(id) ?? id;
+  const existing = await targetDb
+    .select()
+    .from(agents)
+    .where(eq(agents.id, agentId))
+    .for("update")
+    .then((rows) => rows[0] ?? null);
+  if (!existing) return null;
+
+  const dependencies = await scanAgentOperationalDependencies(targetDb, agentId);
+  if (hasAgentOperationalDependencies(dependencies.counts)) {
+    throw conflict("Agent still has active operational dependencies", {
+      code: "agent_active_dependencies",
+      dependencyCounts: nonzeroAgentOperationalDependencyCounts(dependencies.counts),
+    });
+  }
+
+  await cleanupAgentAccessRows(targetDb, existing, "terminate");
+  if (existing.status === "terminated") return existing;
+  const result = await targetDb
+    .update(agents)
+    .set({
+      status: "terminated",
+      pauseReason: null,
+      pausedAt: null,
+      errorReason: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(agents.id, agentId), eq(agents.status, existing.status)))
+    .returning()
+    .then((rows) => rows[0] ?? null);
+  if (!result) {
+    throw conflict("Agent status changed while termination was prepared", {
+      code: "agent_lifecycle_concurrent_update",
+    });
+  }
+  await targetDb.insert(activityLog).values({
+    companyId: existing.companyId,
+    actorType: actor.actorType ?? "system",
+    actorId: actor.actorId ?? "agent-service",
+    action: "agent.terminated",
+    entityType: "agent",
+    entityId: existing.id,
+    agentId: existing.id,
+    details: {
+      source: actor.source ?? "agent_service",
+      previousStatus: existing.status,
+      lifecycleEvidence: "atomic_serializable",
+      ...(actor.details ?? {}),
+    },
+  });
+  return result;
 }
 
 export function agentService(db: Db) {
@@ -332,10 +545,17 @@ export function agentService(db: Db) {
   }
 
   async function ensureManager(companyId: string, managerId: string) {
+    assertHistoricalAgentTombstoneActiveReference(managerId);
     const manager = await getById(managerId);
     if (!manager) throw notFound("Manager not found");
     if (manager.companyId !== companyId) {
       throw unprocessable("Manager must belong to same company");
+    }
+    if (manager.status === "terminated") {
+      throw conflict("Terminated agents cannot manage active reportees", {
+        code: "agent_manager_terminated",
+        managerId,
+      });
     }
     return manager;
   }
@@ -345,10 +565,35 @@ export function agentService(db: Db) {
     if (reportsTo === agentId) throw unprocessable("Agent cannot report to itself");
 
     let cursor: string | null = reportsTo;
+    const visited = new Set<string>();
     while (cursor) {
       if (cursor === agentId) throw unprocessable("Reporting relationship would create cycle");
+      if (visited.has(cursor)) {
+        throw unprocessable("Reporting relationship contains an existing cycle");
+      }
+      visited.add(cursor);
       const next = await getById(cursor);
       cursor = next?.reportsTo ?? null;
+    }
+  }
+
+  function assertNoCycleInLockedCompanyRows(
+    agentId: string,
+    reportsTo: string | null,
+    companyRows: Array<{ id: string; reportsTo: string | null }>,
+  ) {
+    if (!reportsTo) return;
+    if (reportsTo === agentId) throw unprocessable("Agent cannot report to itself");
+    const reportsToByAgent = new Map(companyRows.map((row) => [row.id, row.reportsTo]));
+    const visited = new Set<string>();
+    let cursor: string | null = reportsTo;
+    while (cursor) {
+      if (cursor === agentId) throw unprocessable("Reporting relationship would create cycle");
+      if (visited.has(cursor)) {
+        throw unprocessable("Reporting relationship contains an existing cycle");
+      }
+      visited.add(cursor);
+      cursor = reportsToByAgent.get(cursor) ?? null;
     }
   }
 
@@ -378,7 +623,7 @@ export function agentService(db: Db) {
   }
 
   async function syncAgentSecretBindings(
-    agent: { id: string; companyId: string; adapterConfig: unknown },
+    agent: { id: string; companyId: string; adapterConfig: unknown; status: string },
     dbClient: Db = db,
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
@@ -387,20 +632,112 @@ export function agentService(db: Db) {
       companyId: agent.companyId,
       agentId: agent.id,
       adapterConfig: agent.adapterConfig,
+      allowPendingApproval: agent.status === "pending_approval",
     });
   }
 
   async function updateAgent(
     id: string,
     data: Partial<typeof agents.$inferInsert>,
-    options?: UpdateAgentOptions,
+    options?: InternalUpdateAgentOptions,
   ) {
+    const agentId = normalizeAgentRetirementId(id) ?? id;
+    return withAgentMutationLocks(
+      [agentId, typeof data.reportsTo === "string" ? data.reportsTo : null],
+      () => updateAgentLocked(agentId, data, options),
+    );
+  }
+
+  async function updateAgentLocked(
+    id: string,
+    data: Partial<typeof agents.$inferInsert>,
+    options?: InternalUpdateAgentOptions,
+  ) {
+    assertHistoricalAgentTombstoneMutable(id);
     const existing = await getById(id);
     if (!existing) return null;
-
-    if (existing.status === "terminated" && data.status && data.status !== "terminated") {
-      throw conflict("Terminated agents cannot be resumed");
+    if (data.status === "terminated") {
+      if (isAgentRetirementSource(id)) {
+        throw conflict("This agent requires the gated retirement workflow", {
+          code: "retirement_gated_termination_required",
+          sourceAgentId: id,
+        });
+      }
+      throw conflict("Agents must use the atomic termination workflow", {
+        code: "agent_direct_termination_forbidden",
+      });
     }
+    if (existing.status === "terminated") {
+      throw conflict("Terminated agents are immutable", { code: "agent_terminated_immutable" });
+    }
+
+    const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
+    const hasMetadataPatch = hasOwn(data, "metadata");
+    const reviewedPassedRevalidation = options?.lifecycleTransition?.mode === "reviewed_passed_revalidation";
+    if (reviewedPassedRevalidation && options?.trustedLifecycleGateWrite) {
+      throw conflict("Passed-canary revalidation cannot install a replacement lifecycle gate", {
+        code: "agent_lifecycle_transition_forbidden",
+        reason: "revalidation_state_invalid",
+      });
+    }
+    if (options?.trustedLifecycleGateWrite?.lifecycleGate) {
+      const parsedGate = agentLifecycleGateSchema.safeParse(options.trustedLifecycleGateWrite.lifecycleGate);
+      if (!parsedGate.success) {
+        throw unprocessable("Invalid server-managed agent lifecycle gate", {
+          code: "invalid_agent_lifecycle_gate",
+          issues: parsedGate.error.issues,
+        });
+      }
+    }
+    if (hasMetadataPatch) {
+      normalizedPatch.metadata = normalizeAgentMetadataPatch({
+        existingMetadata: existing.metadata,
+        requestedMetadata: data.metadata,
+        ...(options?.trustedLifecycleGateWrite
+          ? { trustedLifecycleGate: options.trustedLifecycleGateWrite.lifecycleGate }
+          : {}),
+        clearServerManagedLifecycleGates: reviewedPassedRevalidation,
+      });
+      assertValidLifecycleMetadata(normalizedPatch.metadata);
+      const nextMetadata = isPlainRecord(normalizedPatch.metadata) ? normalizedPatch.metadata : null;
+      if (nextMetadata && Object.prototype.hasOwnProperty.call(nextMetadata, "lifecycle")) {
+        const transitionResult = validateAgentLifecyclePatchTransition({
+          previousLifecycle: isPlainRecord(existing.metadata) ? existing.metadata.lifecycle : undefined,
+          nextLifecycle: nextMetadata.lifecycle,
+          transition: options?.lifecycleTransition,
+          currentAgentUpdatedAt: existing.updatedAt,
+          nextAgentStatus: typeof normalizedPatch.status === "string"
+            ? normalizedPatch.status
+            : existing.status,
+          fingerprintRelevantChange: ["adapterType", "adapterConfig", "runtimeConfig", "permissions"]
+            .some((key) => hasOwn(data, key)),
+        });
+        if (!transitionResult.ok) {
+          throw conflict("Agent lifecycle transition is not allowed through agentService.update", {
+            code: "agent_lifecycle_transition_forbidden",
+            reason: transitionResult.reason,
+          });
+        }
+      } else if (options?.lifecycleTransition) {
+        throw conflict("Reviewed lifecycle repair requires a lifecycle metadata patch", {
+          code: "agent_lifecycle_transition_forbidden",
+          reason: "next_lifecycle_invalid",
+        });
+      }
+    } else if (options?.lifecycleTransition || options?.trustedLifecycleGateWrite) {
+      throw conflict("Lifecycle mutation requires an explicit metadata patch", {
+        code: "agent_lifecycle_transition_forbidden",
+        reason: "next_lifecycle_invalid",
+      });
+    }
+
+    if (reviewedPassedRevalidation) {
+      normalizedPatch.status = "paused";
+      normalizedPatch.pauseReason = "system";
+      normalizedPatch.pausedAt = new Date();
+      normalizedPatch.errorReason = null;
+    }
+
     if (
       existing.status === "pending_approval" &&
       data.status &&
@@ -412,6 +749,7 @@ export function agentService(db: Db) {
 
     if (data.reportsTo !== undefined) {
       if (data.reportsTo) {
+        normalizedPatch.reportsTo = normalizeAgentRetirementId(data.reportsTo) ?? data.reportsTo;
         await ensureManager(existing.companyId, data.reportsTo);
       }
       await assertNoCycle(id, data.reportsTo);
@@ -425,7 +763,6 @@ export function agentService(db: Db) {
       }
     }
 
-    const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
     if (data.permissions !== undefined) {
       const role = (data.role ?? existing.role) as string;
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions, role);
@@ -443,16 +780,123 @@ export function agentService(db: Db) {
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
     const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
+    const existingMetadata = isPlainRecord(existing.metadata) ? existing.metadata : null;
+    const nextMetadata = isPlainRecord(normalizedPatch.metadata) ? normalizedPatch.metadata : null;
+    const lifecycleStatePresent = Boolean(
+      existingMetadata && (hasOwn(existingMetadata, "lifecycle") || hasServerManagedLifecycleGate(existingMetadata)),
+    ) || Boolean(
+      nextMetadata && (hasOwn(nextMetadata, "lifecycle") || hasServerManagedLifecycleGate(nextMetadata)),
+    ) || hasServerManagedLifecycleGate(data.metadata);
+    const touchesLifecycleRelevantState = [
+      "metadata",
+      "adapterType",
+      "adapterConfig",
+      "runtimeConfig",
+      "permissions",
+    ].some((key) => hasOwn(normalizedPatch, key));
+    const lifecycleCasRequired = Boolean(
+      options?.lifecycleTransition
+      || options?.trustedLifecycleGateWrite
+      || (lifecycleStatePresent && touchesLifecycleRelevantState),
+    );
+    const expectedUpdatedAtValue = options?.trustedLifecycleGateWrite?.expectedAgentUpdatedAt
+      ?? options?.lifecycleTransition?.expectedAgentUpdatedAt
+      ?? (lifecycleCasRequired ? existing.updatedAt.toISOString() : null);
+    const expectedUpdatedAt = expectedUpdatedAtValue ? new Date(expectedUpdatedAtValue) : null;
+    if (expectedUpdatedAt && Number.isNaN(expectedUpdatedAt.getTime())) {
+      throw unprocessable("Lifecycle CAS requires a valid expectedAgentUpdatedAt", {
+        code: "invalid_agent_lifecycle_cas",
+      });
+    }
 
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      const reportingRelationshipPatch = data.reportsTo !== undefined;
+      const requestedManagerId = typeof normalizedPatch.reportsTo === "string"
+        ? normalizedPatch.reportsTo
+        : null;
+      const lockIds = [...new Set([id, requestedManagerId].filter((value): value is string => Boolean(value)))]
+        .sort((left, right) => left.localeCompare(right));
+      const lockedRows = reportingRelationshipPatch
+        ? await txDb
+          .select()
+          .from(agents)
+          .where(eq(agents.companyId, existing.companyId))
+          .orderBy(agents.id)
+          .for("update")
+        : await txDb
+          .select()
+          .from(agents)
+          .where(inArray(agents.id, lockIds))
+          .orderBy(agents.id)
+          .for("update");
+      const locked = lockedRows.find((row) => row.id === id) ?? null;
+      if (!locked) return null;
+      if (locked.status === "terminated") {
+        throw conflict("Terminated agents are immutable", { code: "agent_terminated_immutable" });
+      }
+      if (locked.status !== existing.status) {
+        throw conflict("Agent lifecycle state changed while the config patch was prepared", {
+          code: "agent_lifecycle_concurrent_update",
+          reason: "status_cas_mismatch",
+        });
+      }
+      if (requestedManagerId) {
+        assertHistoricalAgentTombstoneActiveReference(requestedManagerId);
+        const manager = lockedRows.find((row) => row.id === requestedManagerId) ?? null;
+        if (!manager) throw notFound("Manager not found");
+        if (manager.companyId !== locked.companyId) {
+          throw unprocessable("Manager must belong to same company");
+        }
+        if (manager.status === "terminated") {
+          throw conflict("Terminated agents cannot manage active reportees", {
+            code: "agent_manager_terminated",
+            managerId: requestedManagerId,
+          });
+        }
+      }
+      if (reportingRelationshipPatch) {
+        assertNoCycleInLockedCompanyRows(id, requestedManagerId, lockedRows);
+      }
+      const metadataEvidencePredicate = existing.metadata === null
+        ? isNull(agents.metadata)
+        : eq(agents.metadata, existing.metadata);
       const updated = await tx
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
-        .where(eq(agents.id, id))
+        .where(expectedUpdatedAt
+          ? and(
+              eq(agents.id, id),
+              eq(agents.status, locked.status),
+              sql`date_trunc('milliseconds', ${agents.updatedAt}) = ${expectedUpdatedAt.toISOString()}::timestamptz`,
+              ...(lifecycleCasRequired ? [metadataEvidencePredicate] : []),
+            )
+          : and(eq(agents.id, id), eq(agents.status, locked.status)))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (!updated) return null;
+      if (!updated && expectedUpdatedAt) {
+        if (options?.lifecycleTransition) {
+          const reason = options.lifecycleTransition.mode === "reviewed_passed_revalidation"
+            ? "revalidation_cas_mismatch"
+            : "repair_cas_mismatch";
+          throw conflict("Agent changed after the reviewed lifecycle transition was prepared", {
+            code: "agent_lifecycle_transition_forbidden",
+            reason,
+            currentAgentUpdatedAt: existing.updatedAt.toISOString(),
+          });
+        }
+        throw conflict("Agent lifecycle state changed while the config patch was prepared", {
+          code: "agent_lifecycle_concurrent_update",
+          reason: "lifecycle_cas_mismatch",
+          expectedAgentUpdatedAt: expectedUpdatedAt.toISOString(),
+        });
+      }
+      if (!updated) {
+        throw conflict("Agent lifecycle state changed while the config patch was prepared", {
+          code: "agent_lifecycle_concurrent_update",
+          reason: "status_cas_mismatch",
+        });
+      }
 
       if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
         await syncAgentSecretBindings(updated, txDb);
@@ -502,220 +946,351 @@ export function agentService(db: Db) {
     getById,
 
     create: async (companyId: string, data: Omit<typeof agents.$inferInsert, "companyId">) => {
-      if (data.reportsTo) {
-        await ensureManager(companyId, data.reportsTo);
+      const agentId = data.id ?? randomUUID();
+      assertHistoricalAgentTombstoneMutable(agentId);
+      if (data.status === "terminated") {
+        throw conflict("Agents must use the atomic termination workflow", {
+          code: isAgentRetirementSource(agentId)
+            ? "retirement_gated_termination_required"
+            : "agent_direct_termination_forbidden",
+          ...(isAgentRetirementSource(agentId) ? { sourceAgentId: agentId } : {}),
+        });
       }
-
-      const existingAgents = await db
-        .select({ id: agents.id, name: agents.name, status: agents.status })
-        .from(agents)
-        .where(eq(agents.companyId, companyId));
-      const uniqueName = deduplicateAgentName(data.name, existingAgents);
-
-      const role = data.role ?? "general";
-      const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
-      const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
-      const adapterType = data.adapterType ?? "process";
-      const adapterConfig = isPlainRecord(data.adapterConfig)
-        ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
-        : {};
-      return db.transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
-        const created = await tx
-          .insert(agents)
-          .values({
-            ...data,
-            name: uniqueName,
-            companyId,
-            role,
-            adapterType,
-            adapterConfig,
-            permissions: normalizedPermissions,
-            runtimeConfig,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-        await syncAgentSecretBindings(created, txDb);
-        const normalizedCreated = await agentService(txDb).getById(created.id);
-        if (!normalizedCreated) {
-          throw notFound("Agent not found");
+      const managerId = typeof data.reportsTo === "string"
+        ? normalizeAgentRetirementId(data.reportsTo) ?? data.reportsTo
+        : null;
+      return withAgentMutationLocks([agentId, managerId], async () => {
+        if (data.reportsTo) {
+          await ensureManager(companyId, data.reportsTo);
         }
-        return normalizedCreated;
+
+        const existingAgents = await db
+          .select({ id: agents.id, name: agents.name, status: agents.status })
+          .from(agents)
+          .where(eq(agents.companyId, companyId));
+        const uniqueName = deduplicateAgentName(data.name, existingAgents);
+
+        const role = data.role ?? "general";
+        const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
+        const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
+        const adapterType = data.adapterType ?? "process";
+        const adapterConfig = isPlainRecord(data.adapterConfig)
+          ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
+          : {};
+        const strippedMetadata = stripServerManagedAgentLifecycleGates(data.metadata);
+        const metadata = isPlainRecord(strippedMetadata) ? strippedMetadata : null;
+        assertValidLifecycleMetadata(metadata);
+        return db.transaction(async (tx) => {
+          const txDb = tx as unknown as Db;
+          if (managerId) {
+            assertHistoricalAgentTombstoneActiveReference(managerId);
+            const manager = await txDb.select().from(agents).where(eq(agents.id, managerId))
+              .for("update").then((rows) => rows[0] ?? null);
+            if (!manager) throw notFound("Manager not found");
+            if (manager.companyId !== companyId) {
+              throw unprocessable("Manager must belong to same company");
+            }
+            if (manager.status === "terminated") {
+              throw conflict("Terminated agents cannot manage active reportees", {
+                code: "agent_manager_terminated",
+                managerId,
+              });
+            }
+          }
+          const created = await tx
+            .insert(agents)
+            .values({
+              ...data,
+              id: agentId,
+              reportsTo: managerId,
+              name: uniqueName,
+              companyId,
+              role,
+              adapterType,
+              adapterConfig,
+              permissions: normalizedPermissions,
+              runtimeConfig,
+              metadata,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+          await syncAgentSecretBindings(created, txDb);
+          const normalizedCreated = await agentService(txDb).getById(created.id);
+          if (!normalizedCreated) {
+            throw notFound("Agent not found");
+          }
+          return normalizedCreated;
+        });
       });
     },
 
-    update: updateAgent,
+    update: (
+      id: string,
+      data: Partial<typeof agents.$inferInsert>,
+      options?: UpdateAgentOptions,
+    ) => updateAgent(id, data, options),
 
-    pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
-      const existing = await getById(id);
-      if (!existing) return null;
-      if (existing.status === "terminated") throw conflict("Cannot pause terminated agent");
+    updateLifecycleGate: (
+      id: string,
+      data: Partial<typeof agents.$inferInsert>,
+      options: UpdateLifecycleGateOptions,
+    ) => updateAgent(id, data, {
+      recordRevision: options.recordRevision,
+      lifecycleTransition: options.lifecycleTransition,
+      trustedLifecycleGateWrite: {
+        lifecycleGate: options.lifecycleGate,
+        expectedAgentUpdatedAt: options.expectedAgentUpdatedAt,
+      },
+    }),
 
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "paused",
-          pauseReason: reason,
-          pausedAt: new Date(),
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+    pause: async (
+      id: string,
+      reason: AgentServicePauseReason = "manual",
+      options: AgentPauseOptions = {},
+    ) => {
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      assertHistoricalAgentTombstoneMutable(agentId);
+      if (isAgentRetirementSource(agentId)) {
+        throw conflict("This agent requires the gated retirement workflow", {
+          code: "retirement_gated_termination_required",
+          sourceAgentId: agentId,
+        });
+      }
+      return withAgentStartLock(agentId, () => db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await txDb.select().from(agents).where(eq(agents.id, agentId))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        if (existing.status === "terminated") {
+          throw conflict("Terminated agents are immutable", { code: "agent_terminated_immutable" });
+        }
+        if (reason === "maintenance") {
+          const maintenanceOperationId = options.maintenanceOperationId;
+          if (!maintenanceOperationId || !isUuidLike(maintenanceOperationId)) {
+            throw conflict("Maintenance pause requires an exact quiesced operation gate", {
+              code: "agent_maintenance_pause_gate_invalid",
+            });
+          }
+          const gate = await txDb
+            .select({ id: agentPortfolioMaintenanceGates.id })
+            .from(agentPortfolioMaintenanceGates)
+            .where(and(
+              eq(agentPortfolioMaintenanceGates.agentId, agentId),
+              eq(agentPortfolioMaintenanceGates.companyId, existing.companyId),
+              eq(agentPortfolioMaintenanceGates.operationId, maintenanceOperationId),
+              eq(agentPortfolioMaintenanceGates.stage, "quiesced"),
+            ))
+            .for("share")
+            .then((rows) => rows[0] ?? null);
+          if (!gate) {
+            throw conflict("Maintenance pause requires an exact quiesced operation gate", {
+              code: "agent_maintenance_pause_gate_invalid",
+            });
+          }
+        }
+        const updated = await txDb
+          .update(agents)
+          .set({
+            status: "paused",
+            pauseReason: reason,
+            pausedAt: new Date(),
+            errorReason: null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(agents.id, agentId), eq(agents.status, existing.status)))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("Agent lifecycle changed concurrently", { code: "agent_lifecycle_concurrent_update" });
+        return agentService(txDb).getById(updated.id);
+      }, { isolationLevel: "serializable" }));
     },
 
     resume: async (id: string) => {
-      const existing = await getById(id);
-      if (!existing) return null;
-      if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
-      if (existing.status === "pending_approval") {
-        throw conflict("Pending approval agents cannot be resumed");
-      }
-
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      assertHistoricalAgentTombstoneMutable(agentId);
+      return withAgentStartLock(agentId, () => db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await txDb.select().from(agents).where(eq(agents.id, agentId))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        if (existing.status === "terminated") {
+          throw conflict("Terminated agents are immutable", { code: "agent_terminated_immutable" });
+        }
+        if (existing.status === "pending_approval") {
+          throw conflict("Pending approval agents cannot be resumed");
+        }
+        const updated = await txDb
+          .update(agents)
+          .set({
+            status: "idle",
+            pauseReason: null,
+            pausedAt: null,
+            errorReason: null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(agents.id, agentId), eq(agents.status, existing.status)))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("Agent lifecycle changed concurrently", { code: "agent_lifecycle_concurrent_update" });
+        return agentService(txDb).getById(updated.id);
+      }, { isolationLevel: "serializable" }));
     },
 
     clearError: async (id: string) => {
-      const existing = await getById(id);
-      if (!existing) return null;
-      if (existing.status === "terminated") throw conflict("Cannot clear error on terminated agent");
-      if (existing.status === "pending_approval") {
-        throw conflict("Pending approval agents cannot have errors cleared");
-      }
-      if (existing.status !== "error") {
-        throw conflict("Only agents in error status can have their error cleared");
-      }
-
-      const updated = await db
-        .update(agents)
-        .set({
-          status: "idle",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(agents.id, id), eq(agents.status, "error")))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      if (!updated) {
-        throw conflict("Only agents in error status can have their error cleared");
-      }
-      return getById(updated.id);
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      assertHistoricalAgentTombstoneMutable(agentId);
+      return withAgentStartLock(agentId, () => db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await txDb.select().from(agents).where(eq(agents.id, agentId))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        if (existing.status === "terminated") {
+          throw conflict("Terminated agents are immutable", { code: "agent_terminated_immutable" });
+        }
+        if (existing.status === "pending_approval") {
+          throw conflict("Pending approval agents cannot have errors cleared");
+        }
+        if (existing.status !== "error") {
+          throw conflict("Only agents in error status can have their error cleared");
+        }
+        const updated = await txDb
+          .update(agents)
+          .set({
+            status: "idle",
+            pauseReason: null,
+            pausedAt: null,
+            errorReason: null,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(agents.id, agentId), eq(agents.status, existing.status)))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("Agent lifecycle changed concurrently", { code: "agent_lifecycle_concurrent_update" });
+        return agentService(txDb).getById(updated.id);
+      }, { isolationLevel: "serializable" }));
     },
 
-    terminate: async (id: string) => {
-      const existing = await getById(id);
-      if (!existing) return null;
-
-      await db
-        .update(agents)
-        .set({
-          status: "terminated",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id));
-
-      await db
-        .update(agentApiKeys)
-        .set({ revokedAt: new Date() })
-        .where(eq(agentApiKeys.agentId, id));
-
-      return getById(id);
+    terminate: async (id: string, actor?: AgentTerminationActorContext) => {
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      return withAgentStartLock(agentId, async () => {
+        const updated = await db.transaction(
+          (tx) => terminateAgentInTransaction(tx as unknown as Db, agentId, actor),
+          { isolationLevel: "serializable" },
+        );
+        return updated ? getById(updated.id) : null;
+      });
     },
 
     remove: async (id: string) => {
-      const existing = await getById(id);
-      if (!existing) return null;
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      assertHistoricalAgentTombstoneMutable(agentId);
+      if (isAgentRetirementSource(agentId)) {
+        throw conflict("Protected retirement sources cannot be physically deleted", {
+          code: "retirement_physical_delete_forbidden",
+          sourceAgentId: agentId,
+        });
+      }
+      return withAgentStartLock(agentId, () => db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await txDb
+          .select()
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        if (existing.status !== "pending_approval" && existing.status !== "terminated") {
+          throw conflict("Agent must be terminated before physical deletion", {
+            code: "agent_delete_history_preserved",
+            reason: "termination_required",
+          });
+        }
 
-      return db.transaction(async (tx) => {
-        await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
-        await tx
-          .update(issues)
-          .set({ assigneeAgentId: null, createdByAgentId: null })
-          .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
-        await tx.delete(activityLog).where(
-          or(
-            eq(activityLog.agentId, id),
-            sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
-          ),
-        );
-        await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
-        await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
-        const deleted = await tx
+        const dependencies = await scanAgentOperationalDependencies(txDb, agentId);
+        if (hasAgentOperationalDependencies(dependencies.counts)) {
+          throw conflict("Agent still has active operational dependencies", {
+            code: "agent_active_dependencies",
+            dependencyCounts: nonzeroAgentOperationalDependencyCounts(dependencies.counts),
+          });
+        }
+        await cleanupAgentAccessRows(txDb, existing, "remove");
+        const history = await scanAgentDeletionHistoryReferences(txDb, agentId);
+        if (history.total > 0) {
+          throw conflict("Agent history and provenance must be preserved", {
+            code: "agent_delete_history_preserved",
+            referenceCounts: history.referenceCounts,
+          });
+        }
+
+        const deleted = await txDb
           .delete(agents)
-          .where(eq(agents.id, id))
+          .where(and(eq(agents.id, agentId), eq(agents.status, existing.status)))
           .returning()
           .then((rows) => rows[0] ?? null);
+        if (!deleted) {
+          throw conflict("Agent status changed while deletion was prepared", {
+            code: "agent_lifecycle_concurrent_update",
+          });
+        }
         return deleted ? normalizeAgentRow(deleted) : null;
-      });
+      }, { isolationLevel: "serializable" }));
     },
 
     activatePendingApproval: async (id: string) => {
-      const activatedAgent = await db.transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
-        const updated = await tx
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      assertHistoricalAgentTombstoneMutable(agentId);
+      return withAgentStartLock(agentId, async () => {
+        const activatedAgent = await db.transaction(async (tx) => {
+          const txDb = tx as unknown as Db;
+          const existing = await txDb.select().from(agents).where(eq(agents.id, agentId))
+            .for("update").then((rows) => rows[0] ?? null);
+          if (!existing) return null;
+          if (existing.status === "terminated") {
+            return { agent: normalizeAgentRow(existing), activated: false };
+          }
+          if (existing.status !== "pending_approval") {
+            const agent = await agentService(txDb).getById(existing.id);
+            return agent ? { agent, activated: false } : null;
+          }
+          const updated = await txDb
           .update(agents)
           .set({ status: "idle", updatedAt: new Date() })
-          .where(and(eq(agents.id, id), eq(agents.status, "pending_approval")))
+          .where(and(eq(agents.id, agentId), eq(agents.status, existing.status)))
           .returning()
           .then((rows) => rows[0] ?? null);
-        if (!updated) return null;
-        await syncAgentSecretBindings(updated, txDb);
-        const agent = await agentService(txDb).getById(updated.id);
-        if (!agent) {
-          throw notFound("Agent not found");
-        }
-        return agent;
+          if (!updated) throw conflict("Agent lifecycle changed concurrently", { code: "agent_lifecycle_concurrent_update" });
+          await syncAgentSecretBindings(updated, txDb);
+          const agent = await agentService(txDb).getById(updated.id);
+          if (!agent) throw notFound("Agent not found");
+          return { agent, activated: true };
+        }, { isolationLevel: "serializable" });
+        return activatedAgent;
       });
-
-      if (activatedAgent) {
-        return { agent: activatedAgent, activated: true };
-      }
-
-      const existing = await getById(id);
-      return existing ? { agent: existing, activated: false } : null;
     },
 
     updatePermissions: async (id: string, permissions: Record<string, unknown> & { canCreateAgents: boolean }) => {
-      const existing = await getById(id);
-      if (!existing) return null;
-
-      const updated = await db
-        .update(agents)
-        .set({
-          permissions: normalizeAgentPermissions({ ...existing.permissions, ...permissions }, existing.role),
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      return updated ? getById(updated.id) : null;
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      assertHistoricalAgentTombstoneAccessMutable(agentId);
+      return withAgentStartLock(agentId, () => db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await txDb.select().from(agents).where(eq(agents.id, agentId))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        if (existing.status === "terminated") {
+          throw conflict("Terminated agents are immutable", { code: "agent_terminated_immutable" });
+        }
+        const updated = await txDb
+          .update(agents)
+          .set({
+            permissions: normalizeAgentPermissions({ ...existing.permissions, ...permissions }, existing.role),
+            updatedAt: new Date(),
+          })
+          .where(and(eq(agents.id, agentId), eq(agents.status, existing.status)))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("Agent lifecycle changed concurrently", { code: "agent_lifecycle_concurrent_update" });
+        return agentService(txDb).getById(updated.id);
+      }, { isolationLevel: "serializable" }));
     },
 
     listConfigRevisions: async (id: string) =>
@@ -737,6 +1312,7 @@ export function agentService(db: Db) {
       revisionId: string,
       actor: { agentId?: string | null; userId?: string | null },
     ) => {
+      assertHistoricalAgentTombstoneMutable(id);
       const revision = await db
         .select()
         .from(agentConfigRevisions)
@@ -764,38 +1340,44 @@ export function agentService(db: Db) {
       scope: AgentApiKeyScope = { kind: "standard" },
       options?: { responsibleUserId?: string | null },
     ) => {
-      const existing = await getById(id);
-      if (!existing) throw notFound("Agent not found");
-      if (existing.status === "pending_approval") {
-        throw conflict("Cannot create keys for pending approval agents");
-      }
-      if (existing.status === "terminated") {
-        throw conflict("Cannot create keys for terminated agents");
-      }
+      const agentId = normalizeAgentRetirementId(id) ?? id;
+      assertHistoricalAgentTombstoneAccessMutable(agentId);
+      return withAgentStartLock(agentId, () => db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await txDb.select().from(agents).where(eq(agents.id, agentId))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!existing) throw notFound("Agent not found");
+        if (existing.status === "pending_approval") {
+          throw conflict("Cannot create keys for pending approval agents");
+        }
+        if (existing.status === "terminated") {
+          throw conflict("Cannot create keys for terminated agents", { code: "agent_terminated_immutable" });
+        }
 
-      const token = createToken();
-      const keyHash = hashToken(token);
-      const created = await db
-        .insert(agentApiKeys)
-        .values({
-          agentId: id,
-          companyId: existing.companyId,
-          name,
-          keyHash,
-          responsibleUserId: options?.responsibleUserId?.trim() || null,
-          scopeConfig: scope.kind === "standard" ? null : scope,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+        const token = createToken();
+        const keyHash = hashToken(token);
+        const created = await txDb
+          .insert(agentApiKeys)
+          .values({
+            agentId,
+            companyId: existing.companyId,
+            name,
+            keyHash,
+            responsibleUserId: options?.responsibleUserId?.trim() || null,
+            scopeConfig: scope.kind === "standard" ? null : scope,
+          })
+          .returning()
+          .then((rows) => rows[0]);
 
-      return {
-        id: created.id,
-        name: created.name,
-        scope: normalizeAgentApiKeyScope(created.scopeConfig),
-        responsibleUserId: created.responsibleUserId,
-        token,
-        createdAt: created.createdAt,
-      };
+        return {
+          id: created.id,
+          name: created.name,
+          scope: normalizeAgentApiKeyScope(created.scopeConfig),
+          responsibleUserId: created.responsibleUserId,
+          token,
+          createdAt: created.createdAt,
+        };
+      }, { isolationLevel: "serializable" }));
     },
 
     listKeys: (id: string) =>
@@ -844,6 +1426,7 @@ export function agentService(db: Db) {
         }),
 
     revokeKey: async (agentId: string, keyId: string) => {
+      assertHistoricalAgentTombstoneAccessMutable(agentId);
       const rows = await db
         .update(agentApiKeys)
         .set({ revokedAt: new Date() })

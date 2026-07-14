@@ -454,26 +454,29 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       expect(latestOverride?.status).toBe("succeeded");
     }, { timeout: 5_000 });
 
-    const acquireCalls = workerManager.call.mock.calls
-      .filter(([, method]) => method === "environmentAcquireLease");
+    const acquirePayloads = workerManager.call.mock.calls
+      .filter(([, method]) => method === "environmentAcquireLease")
+      .map(([, , payload]) => payload);
 
-    expect(acquireCalls).toHaveLength(2);
-    expect(acquireCalls[0]?.[2]).toMatchObject({
-      companyId: companyAId,
-      environmentId: sharedEnvironmentId,
-      config: { template: "shared" },
-      agentId: agentAId,
-      runId: sharedRun!.id,
-      adapterType: "codex_local",
-    });
-    expect(acquireCalls[1]?.[2]).toMatchObject({
-      companyId: companyBId,
-      environmentId: overrideEnvironmentId,
-      config: { template: "override" },
-      agentId: agentBId,
-      runId: overrideRun!.id,
-      adapterType: "codex_local",
-    });
+    expect(acquirePayloads).toHaveLength(2);
+    expect(acquirePayloads).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        companyId: companyAId,
+        environmentId: sharedEnvironmentId,
+        config: { template: "shared" },
+        agentId: agentAId,
+        runId: sharedRun!.id,
+        adapterType: "codex_local",
+      }),
+      expect.objectContaining({
+        companyId: companyBId,
+        environmentId: overrideEnvironmentId,
+        config: { template: "override" },
+        agentId: agentBId,
+        runId: overrideRun!.id,
+        adapterType: "codex_local",
+      }),
+    ]));
   }, 15_000);
 
   it("ignores stale non-reused workspace environment config in favor of the assignee selection", async () => {

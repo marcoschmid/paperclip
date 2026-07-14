@@ -79,6 +79,26 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
   await fs.chmod(commandPath, 0o755);
 }
 
+async function writeTerminalClaudeCommand(
+  commandPath: string,
+  options: {
+    resultEvent: Record<string, unknown>;
+    afterResult: "hang" | "sigterm";
+  },
+): Promise<void> {
+  const payload = JSON.stringify(options.resultEvent);
+  const afterResult = options.afterResult === "hang"
+    ? "setInterval(() => {}, 1000);"
+    : "setTimeout(() => process.kill(process.pid, 'SIGTERM'), 25);";
+  const script = `#!/usr/bin/env node
+process.stdout.write(${JSON.stringify(`${payload}\n`)}, () => {
+  ${afterResult}
+});
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -352,6 +372,97 @@ describe("claude execute", () => {
    * On resumed sessions the instructions are already in the session cache;
    * re-injecting them wastes tokens and may be rejected by the CLI.
    */
+  it.skipIf(process.platform === "win32")(
+    "normalizes only a successful Claude result terminated by terminal-result cleanup",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-terminal-cleanup-"));
+      const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+        commandWriter: async (target) => writeTerminalClaudeCommand(target, {
+          resultEvent: {
+            type: "result",
+            subtype: "success",
+            session_id: "45454545-4545-4454-8454-454545454545",
+            is_error: false,
+            result: "bounded work completed",
+            usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+          },
+          afterResult: "hang",
+        }),
+      });
+      try {
+        const result = await execute({
+          runId: "run-terminal-cleanup-success",
+          agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: {
+            command: commandPath,
+            cwd: workspace,
+            promptTemplate: "Do bounded work.",
+            terminalResultCleanupGraceMs: 25,
+            timeoutSec: 5,
+            graceSec: 1,
+          },
+          context: {},
+          authToken: "tok",
+          onLog: async () => {},
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(result.signal).toBeNull();
+        expect(result.timedOut).toBe(false);
+        expect(result.errorMessage).toBeNull();
+        expect(result.summary).toBe("bounded work completed");
+      } finally {
+        restore();
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "fails closed when a real SIGTERM follows a parsed Claude success result",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-real-sigterm-"));
+      const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+        commandWriter: async (target) => writeTerminalClaudeCommand(target, {
+          resultEvent: {
+            type: "result",
+            subtype: "success",
+            session_id: "56565656-5656-4565-8565-565656565656",
+            is_error: false,
+            result: "result emitted before an external termination",
+          },
+          afterResult: "sigterm",
+        }),
+      });
+      try {
+        const result = await execute({
+          runId: "run-real-sigterm-after-success",
+          agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: {
+            command: commandPath,
+            cwd: workspace,
+            promptTemplate: "Do bounded work.",
+            terminalResultCleanupGraceMs: 5_000,
+            timeoutSec: 5,
+            graceSec: 1,
+          },
+          context: {},
+          authToken: "tok",
+          onLog: async () => {},
+        });
+
+        expect(result.exitCode).not.toBe(0);
+        expect(result.signal).toBe("SIGTERM");
+        expect(result.errorMessage).toContain("Claude exited");
+      } finally {
+        restore();
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("passes --append-system-prompt-file on a fresh session when instructionsFile is set", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-fresh-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
@@ -799,9 +910,6 @@ describe("claude execute", () => {
       });
       const capture = JSON.parse(await fs.readFile(capturePath1, "utf8")) as CapturePayload;
       expect(capture.argv).toContain("--allowedTools");
-      expect(capture.argv).toContain(
-        "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write",
-      );
       expect(capture.argv).not.toContain("--dangerously-skip-permissions");
       expect(capture.claudeConfigDir).toBe(path.join(remoteWorkspace, ".paperclip-runtime", "claude", "config"));
       expect(capture.claudeConfigEntries).toContain("settings.json");

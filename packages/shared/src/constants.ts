@@ -573,6 +573,12 @@ export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 export const PAUSE_REASONS = ["manual", "budget", "system", "company_archived"] as const;
 export type PauseReason = (typeof PAUSE_REASONS)[number];
 
+// Maintenance is an agent-only lifecycle state. Keep the generic pause
+// contract unchanged so projects, companies, and budget summaries cannot
+// accidentally acquire agent portfolio-maintenance semantics.
+export const AGENT_PAUSE_REASONS = [...PAUSE_REASONS, "maintenance"] as const;
+export type AgentPauseReason = (typeof AGENT_PAUSE_REASONS)[number];
+
 export const PROJECT_COLORS = [
   "#6366f1", // indigo
   "#8b5cf6", // violet
@@ -760,6 +766,7 @@ export const WAKEUP_REQUEST_STATUSES = [
   "completed",
   "failed",
   "cancelled",
+  "timed_out",
 ] as const;
 export type WakeupRequestStatus = (typeof WAKEUP_REQUEST_STATUSES)[number];
 

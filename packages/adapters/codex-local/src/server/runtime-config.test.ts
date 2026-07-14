@@ -1,12 +1,13 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     [...cleanupPaths].map(async (filepath) => {
       await fs.rm(filepath, { recursive: true, force: true });
@@ -41,6 +42,84 @@ const BIFROST_PROVIDERS = {
 };
 
 describe("prepareCodexRuntimeConfig", () => {
+  it("creates managed runtime config, backup, and directories with private modes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-runtime-private-"));
+    cleanupPaths.add(root);
+    const home = path.join(root, "managed", "codex-home");
+    await fs.mkdir(home, { recursive: true, mode: 0o755 });
+    await fs.chmod(home, 0o755);
+    await fs.writeFile(path.join(home, "config.toml"), 'model = "legacy"\n', { mode: 0o644 });
+    await fs.chmod(path.join(home, "config.toml"), 0o644);
+
+    const prepared = await prepareCodexRuntimeConfig({
+      env: { PAPERCLIP_CODEX_PROVIDERS: JSON.stringify(BIFROST_PROVIDERS) },
+      codexHome: home,
+    });
+
+    expect((await fs.stat(home)).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(path.join(home, "config.toml"))).mode & 0o777).toBe(0o600);
+    expect(
+      (await fs.stat(path.join(home, "config.toml.paperclip-backup"))).mode & 0o777,
+    ).toBe(0o600);
+
+    await prepared.cleanup();
+    expect(await readConfigToml(home)).toBe('model = "legacy"\n');
+    expect((await fs.stat(path.join(home, "config.toml"))).mode & 0o777).toBe(0o600);
+    await expect(fs.access(path.join(home, "config.toml.paperclip-backup"))).rejects.toThrow();
+  });
+
+  it.each(["config.toml", "config.toml.paperclip-backup"])(
+    "rejects an existing %s symlink without reading or writing its target",
+    async (targetName) => {
+      const home = await makeCodexHome();
+      const external = path.join(path.dirname(home), `${path.basename(home)}-external`);
+      cleanupPaths.add(external);
+      await fs.writeFile(external, "external-unchanged\n", "utf8");
+      if (targetName !== "config.toml") {
+        await fs.writeFile(path.join(home, "config.toml"), 'model = "safe"\n', "utf8");
+      }
+      await fs.symlink(external, path.join(home, targetName));
+
+      await expect(
+        prepareCodexRuntimeConfig({
+          env: { PAPERCLIP_CODEX_PROVIDERS: JSON.stringify(BIFROST_PROVIDERS) },
+          codexHome: home,
+        }),
+      ).rejects.toThrow(/symbolic link/);
+      await expect(fs.readFile(external, "utf8")).resolves.toBe("external-unchanged\n");
+    },
+  );
+
+  it.each(["config.toml", "config.toml.paperclip-backup"])(
+    "atomically replaces a raced-in %s symlink without touching its target",
+    async (targetName) => {
+      const home = await makeCodexHome('model = "safe"\n');
+      const external = path.join(path.dirname(home), `${path.basename(home)}-swap-target`);
+      cleanupPaths.add(external);
+      await fs.writeFile(external, "external-unchanged\n", "utf8");
+      const originalRename = fs.rename.bind(fs);
+      let swapped = false;
+      vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+        if (!swapped && path.resolve(String(target)) === path.join(home, targetName)) {
+          await fs.rm(String(target), { force: true });
+          await fs.symlink(external, String(target));
+          swapped = true;
+        }
+        await originalRename(source, target);
+      });
+
+      const prepared = await prepareCodexRuntimeConfig({
+        env: { PAPERCLIP_CODEX_PROVIDERS: JSON.stringify(BIFROST_PROVIDERS) },
+        codexHome: home,
+      });
+
+      expect(swapped).toBe(true);
+      expect((await fs.lstat(path.join(home, targetName))).isSymbolicLink()).toBe(false);
+      await expect(fs.readFile(external, "utf8")).resolves.toBe("external-unchanged\n");
+      await prepared.cleanup();
+    },
+  );
+
   it("is a no-op when PAPERCLIP_CODEX_PROVIDERS is unset", async () => {
     const home = await makeCodexHome("model = \"gpt-5.1-codex\"\n");
     const prepared = await prepareCodexRuntimeConfig({ env: { FOO: "bar" }, codexHome: home });

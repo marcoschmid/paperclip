@@ -56,6 +56,11 @@ export type {
   WorkTimelineSpan,
 } from "./work-timeline.js";
 export { approvalService } from "./approvals.js";
+export {
+  approvalExecutionClaimService,
+  type ApprovalExecutionClaimInput,
+  type ApprovalExecutionClaimServiceOptions,
+} from "./approval-execution-claims.js";
 export { budgetService } from "./budgets.js";
 export { secretService } from "./secrets.js";
 export { routineService } from "./routines.js";
@@ -95,6 +100,11 @@ export {
 export { bootstrapExecutionPolicyFromEnv } from "./execution-policy-bootstrap.js";
 export { cloudUpstreamService, reconcileCloudUpstreamRunsOnStartup } from "./cloud-upstreams.js";
 export { companyPortabilityService } from "./company-portability.js";
+export {
+  portfolioMaintenanceService,
+  type PortfolioMaintenanceAgentCandidate,
+} from "./portfolio-maintenance.js";
+export { agentRetirementService } from "./agent-retirement.js";
 export { teamsCatalogService } from "./teams-catalog.js";
 export { environmentService } from "./environments.js";
 export {
@@ -127,4 +137,5 @@ export {
   type CodexAuthReconciliationSummary,
 } from "./codex-auth-reconciliation.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
+export { environmentRuntimeService } from "./environment-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";

@@ -3,6 +3,7 @@ import {
   routineRevisionSnapshotV1Schema,
   routineVariableSchema,
   updateRoutineSchema,
+  updateRoutineTriggerSchema,
 } from "./routine.js";
 
 const routineId = "11111111-1111-4111-8111-111111111111";
@@ -83,6 +84,18 @@ describe("routine validators", () => {
       title: "Daily triage",
       baseRevisionId,
     }).baseRevisionId).toBe(baseRevisionId);
+  });
+
+  it("accepts optional trigger revision CAS while preserving legacy trigger patches", () => {
+    expect(updateRoutineTriggerSchema.parse({ enabled: false })).toEqual({ enabled: false });
+    expect(updateRoutineTriggerSchema.parse({
+      enabled: false,
+      baseRevisionId,
+    })).toEqual({ enabled: false, baseRevisionId });
+    expect(updateRoutineTriggerSchema.safeParse({
+      enabled: false,
+      baseRevisionId: "not-a-uuid",
+    }).success).toBe(false);
   });
 
   it("accepts date variables with valid YYYY-MM-DD defaults", () => {

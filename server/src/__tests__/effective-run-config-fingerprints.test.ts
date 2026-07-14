@@ -1,11 +1,36 @@
 import { describe, expect, it } from "vitest";
 import {
   canonicalizeEffectiveRunConfigCategory,
+  createAgentConfigurationFingerprint,
   createEffectiveRunConfigFingerprints,
   diffEffectiveRunConfigFingerprints,
 } from "../services/effective-run-config-fingerprints.ts";
 
 describe("effective run config fingerprints", () => {
+  it("binds the complete runtime model-profile configuration into the agent fingerprint", () => {
+    const base = createAgentConfigurationFingerprint({
+      adapterType: "claude_local",
+      adapterConfig: { model: "primary" },
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: { adapterConfig: { model: "canary-model", effort: "low" } },
+        },
+      },
+    });
+    const changed = createAgentConfigurationFingerprint({
+      adapterType: "claude_local",
+      adapterConfig: { model: "primary" },
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: { adapterConfig: { model: "changed-model", effort: "low" } },
+        },
+      },
+    });
+
+    expect(base).toMatch(/^v1:sha256:[a-f0-9]{64}$/);
+    expect(changed).not.toBe(base);
+  });
+
   it("emits versioned deterministic fingerprints with stable object ordering", () => {
     const first = createEffectiveRunConfigFingerprints({
       session: {

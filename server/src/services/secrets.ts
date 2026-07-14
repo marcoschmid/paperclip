@@ -60,6 +60,10 @@ import type {
 import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationDeniedDetails, authorizationService } from "./authorization.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SENSITIVE_ENV_KEY_RE =
@@ -71,6 +75,7 @@ const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
 ]);
 const FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS: Readonly<Record<string, readonly string[]>> = {
   hermes_gateway: ["apiKey"],
+  openclaw_gateway: ["authToken", "password", "devicePrivateKeyPem", "token", "deviceToken"],
 };
 const USER_SECRET_DEFINITION_KEY_UNIQUE_CONSTRAINT = "user_secret_definitions_company_key_uq";
 const USER_SECRET_VALUE_UNIQUE_CONSTRAINT = "company_secrets_user_definition_owner_uq";
@@ -593,6 +598,32 @@ export function secretService(db: Db) {
     adapterType?: string | null;
     actor?: { userId?: string | null; agentId?: string | null };
   };
+  type SecretTargetWriteOptions = {
+    allowPendingApproval?: boolean;
+  };
+
+  function normalizeSecretTarget<T extends { targetType: SecretBindingTargetType; targetId: string }>(
+    target: T,
+  ): T {
+    if (target.targetType !== "agent") return target;
+    return { ...target, targetId: canonicalizeAgentReferenceId(target.targetId) };
+  }
+
+  async function lockSecretTarget(
+    targetDb: SecretBindingDb,
+    companyId: string,
+    target: { targetType: SecretBindingTargetType; targetId: string },
+    activeReference: boolean,
+    options: SecretTargetWriteOptions = {},
+  ) {
+    if (target.targetType !== "agent") return;
+    await lockAgentLifecycleReference(targetDb as unknown as Db, {
+      companyId,
+      agentId: target.targetId,
+      mode: activeReference ? "active" : "cleanup",
+      allowPendingApproval: options.allowPendingApproval,
+    });
+  }
 
   async function getById(id: string, source: Pick<Db | DbTransaction, "select"> = db) {
     return source
@@ -2457,8 +2488,9 @@ export function secretService(db: Db) {
         allowMissingOverride?: boolean;
         label?: string | null;
       }>,
-      options?: { db?: SecretBindingDb; replaceAll?: boolean },
+      options?: { db?: SecretBindingDb; replaceAll?: boolean; allowPendingApproval?: boolean },
     ) => {
+      const normalizedTarget = normalizeSecretTarget(target);
       const targetDb = options?.db ?? db;
       const normalizedRefs: Array<{
         definitionId: string;
@@ -2488,21 +2520,35 @@ export function secretService(db: Db) {
 
       const pathPrefix = target.pathPrefix ?? "env";
       const writeDeclarations = async (executor: SecretBindingDb) => {
+        await lockSecretTarget(
+          executor,
+          companyId,
+          normalizedTarget,
+          normalizedRefs.length > 0,
+          { allowPendingApproval: options?.allowPendingApproval },
+        );
+        for (const ref of normalizedRefs) {
+          await resolveUserSecretDefinition(companyId, { definitionId: ref.definitionId }, executor);
+        }
         if (options?.replaceAll) {
           await executor
             .delete(userSecretDeclarations)
             .where(and(
               eq(userSecretDeclarations.companyId, companyId),
-              eq(userSecretDeclarations.targetType, target.targetType),
-              eq(userSecretDeclarations.targetId, target.targetId),
+              eq(userSecretDeclarations.targetType, normalizedTarget.targetType),
+              normalizedTarget.targetType === "agent"
+                ? sql<boolean>`lower(${userSecretDeclarations.targetId}) = ${normalizedTarget.targetId}`
+                : eq(userSecretDeclarations.targetId, normalizedTarget.targetId),
             ));
         } else {
           await executor
             .delete(userSecretDeclarations)
             .where(and(
               eq(userSecretDeclarations.companyId, companyId),
-              eq(userSecretDeclarations.targetType, target.targetType),
-              eq(userSecretDeclarations.targetId, target.targetId),
+              eq(userSecretDeclarations.targetType, normalizedTarget.targetType),
+              normalizedTarget.targetType === "agent"
+                ? sql<boolean>`lower(${userSecretDeclarations.targetId}) = ${normalizedTarget.targetId}`
+                : eq(userSecretDeclarations.targetId, normalizedTarget.targetId),
               like(userSecretDeclarations.configPath, `${pathPrefix}.%`),
             ));
         }
@@ -2511,8 +2557,8 @@ export function secretService(db: Db) {
           normalizedRefs.map((ref) => ({
             companyId,
             userSecretDefinitionId: ref.definitionId,
-            targetType: target.targetType,
-            targetId: target.targetId,
+            targetType: normalizedTarget.targetType,
+            targetId: normalizedTarget.targetId,
             configPath: ref.configPath,
             envKey: ref.envKey,
             versionSelector: String(ref.versionSelector),
@@ -3397,35 +3443,36 @@ export function secretService(db: Db) {
       versionSelector?: SecretVersionSelector;
       required?: boolean;
       label?: string | null;
-    }) => {
-      await assertSecretInCompany(input.companyId, input.secretId);
-      const existing = await db
-        .select()
-        .from(companySecretBindings)
-        .where(
-          and(
+    }, options: SecretTargetWriteOptions = {}) => {
+      const target = normalizeSecretTarget({ targetType: input.targetType, targetId: input.targetId });
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await lockSecretTarget(txDb, input.companyId, target, true, options);
+        await assertSecretInCompany(input.companyId, input.secretId, txDb);
+        const existing = await txDb
+          .select()
+          .from(companySecretBindings)
+          .where(and(
             eq(companySecretBindings.companyId, input.companyId),
-            eq(companySecretBindings.targetType, input.targetType),
-            eq(companySecretBindings.targetId, input.targetId),
+            eq(companySecretBindings.targetType, target.targetType),
+            target.targetType === "agent"
+              ? sql<boolean>`lower(${companySecretBindings.targetId}) = ${target.targetId}`
+              : eq(companySecretBindings.targetId, target.targetId),
             eq(companySecretBindings.configPath, input.configPath),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (existing) throw conflict(`Secret binding already exists at ${input.configPath}`);
-      return db
-        .insert(companySecretBindings)
-        .values({
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (existing) throw conflict(`Secret binding already exists at ${input.configPath}`);
+        return txDb.insert(companySecretBindings).values({
           companyId: input.companyId,
           secretId: input.secretId,
-          targetType: input.targetType,
-          targetId: input.targetId,
+          targetType: target.targetType,
+          targetId: target.targetId,
           configPath: input.configPath,
           versionSelector: String(input.versionSelector ?? "latest"),
           required: input.required ?? true,
           label: input.label ?? null,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+        }).returning().then((rows) => rows[0]);
+      });
     },
 
     syncSecretRefsForTarget: async (
@@ -3438,8 +3485,9 @@ export function secretService(db: Db) {
         required?: boolean;
         label?: string | null;
       }>,
-      options?: { replaceAll?: boolean },
+      options?: { replaceAll?: boolean; allowPendingApproval?: boolean },
     ) => {
+      const normalizedTarget = normalizeSecretTarget(target);
       const normalizedRefs: Array<{
         secretId: string;
         configPath: string;
@@ -3461,14 +3509,27 @@ export function secretService(db: Db) {
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
 
       await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        await lockSecretTarget(
+          txDb,
+          companyId,
+          normalizedTarget,
+          normalizedRefs.length > 0,
+          { allowPendingApproval: options?.allowPendingApproval },
+        );
+        for (const ref of normalizedRefs) {
+          await assertSecretInCompany(companyId, ref.secretId, txDb);
+        }
         if (options?.replaceAll) {
           await tx
             .delete(companySecretBindings)
             .where(
               and(
                 eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
+                eq(companySecretBindings.targetType, normalizedTarget.targetType),
+                normalizedTarget.targetType === "agent"
+                  ? sql<boolean>`lower(${companySecretBindings.targetId}) = ${normalizedTarget.targetId}`
+                  : eq(companySecretBindings.targetId, normalizedTarget.targetId),
               ),
             );
         } else if (pathPrefixes.length > 0) {
@@ -3478,8 +3539,10 @@ export function secretService(db: Db) {
               .where(
                 and(
                   eq(companySecretBindings.companyId, companyId),
-                  eq(companySecretBindings.targetType, target.targetType),
-                  eq(companySecretBindings.targetId, target.targetId),
+                  eq(companySecretBindings.targetType, normalizedTarget.targetType),
+                  normalizedTarget.targetType === "agent"
+                    ? sql<boolean>`lower(${companySecretBindings.targetId}) = ${normalizedTarget.targetId}`
+                    : eq(companySecretBindings.targetId, normalizedTarget.targetId),
                   or(
                     eq(companySecretBindings.configPath, pathPrefix),
                     like(companySecretBindings.configPath, `${pathPrefix}.%`),
@@ -3493,8 +3556,10 @@ export function secretService(db: Db) {
             .where(
               and(
                 eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
+                eq(companySecretBindings.targetType, normalizedTarget.targetType),
+                normalizedTarget.targetType === "agent"
+                  ? sql<boolean>`lower(${companySecretBindings.targetId}) = ${normalizedTarget.targetId}`
+                  : eq(companySecretBindings.targetId, normalizedTarget.targetId),
               ),
             );
         }
@@ -3503,8 +3568,8 @@ export function secretService(db: Db) {
           normalizedRefs.map((ref) => ({
             companyId,
             secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
+            targetType: normalizedTarget.targetType,
+            targetId: normalizedTarget.targetId,
             configPath: ref.configPath,
             versionSelector: String(ref.versionSelector),
             required: ref.required,
@@ -3517,24 +3582,29 @@ export function secretService(db: Db) {
 
     listBindingCompanyIdsForTarget: async (
       target: { targetType: SecretBindingTargetType; targetId: string },
-    ): Promise<string[]> =>
-      db
+    ): Promise<string[]> => {
+      const normalizedTarget = normalizeSecretTarget(target);
+      return db
         .select({ companyId: companySecretBindings.companyId })
         .from(companySecretBindings)
         .where(
           and(
-            eq(companySecretBindings.targetType, target.targetType),
-            eq(companySecretBindings.targetId, target.targetId),
+            eq(companySecretBindings.targetType, normalizedTarget.targetType),
+            normalizedTarget.targetType === "agent"
+              ? sql<boolean>`lower(${companySecretBindings.targetId}) = ${normalizedTarget.targetId}`
+              : eq(companySecretBindings.targetId, normalizedTarget.targetId),
           ),
         )
-        .then((rows) => [...new Set(rows.map((row) => row.companyId))]),
+        .then((rows) => [...new Set(rows.map((row) => row.companyId))]);
+    },
 
     syncEnvBindingsForTarget: async (
       companyId: string,
       target: { targetType: SecretBindingTargetType; targetId: string; pathPrefix?: string },
       envValue: unknown,
-      options?: { db?: SecretBindingDb },
+      options?: { db?: SecretBindingDb; allowPendingApproval?: boolean },
     ) => {
+      const normalizedTarget = normalizeSecretTarget(target);
       const record = asRecord(envValue) ?? {};
       const refs: Array<{
         secretId: string;
@@ -3549,7 +3619,7 @@ export function secretService(db: Db) {
         required: boolean;
         allowMissingOverride: boolean;
       }> = [];
-      const pathPrefix = target.pathPrefix ?? "env";
+      const pathPrefix = normalizedTarget.pathPrefix ?? "env";
       const bindingDb = options?.db ?? db;
       for (const [key, rawBinding] of Object.entries(record)) {
         const parsed = envBindingSchema.safeParse(rawBinding);
@@ -3576,54 +3646,72 @@ export function secretService(db: Db) {
         });
       }
 
-      const writeBindings = async (targetDb: SecretBindingDb) => {
+      const writeAll = async (targetDb: SecretBindingDb) => {
+        await lockSecretTarget(
+          targetDb,
+          companyId,
+          normalizedTarget,
+          refs.length > 0 || userRefs.length > 0,
+          { allowPendingApproval: options?.allowPendingApproval },
+        );
+        for (const ref of refs) {
+          await assertSecretInCompany(companyId, ref.secretId, targetDb);
+        }
+        const definitions = new Map<string, string>();
+        for (const ref of userRefs) {
+          const definition = await resolveUserSecretDefinition(
+            companyId,
+            { definitionKey: ref.definitionKey },
+            targetDb,
+          );
+          definitions.set(ref.definitionKey, definition.id);
+        }
+
         await targetDb
           .delete(companySecretBindings)
           .where(
             and(
               eq(companySecretBindings.companyId, companyId),
-              eq(companySecretBindings.targetType, target.targetType),
-              eq(companySecretBindings.targetId, target.targetId),
+              eq(companySecretBindings.targetType, normalizedTarget.targetType),
+              normalizedTarget.targetType === "agent"
+                ? sql<boolean>`lower(${companySecretBindings.targetId}) = ${normalizedTarget.targetId}`
+                : eq(companySecretBindings.targetId, normalizedTarget.targetId),
               like(companySecretBindings.configPath, `${pathPrefix}.%`),
             ),
           );
-        if (refs.length === 0) return;
-        await targetDb.insert(companySecretBindings).values(
-          refs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: true,
-          })),
+        if (refs.length > 0) {
+          await targetDb.insert(companySecretBindings).values(
+            refs.map((ref) => ({
+              companyId,
+              secretId: ref.secretId,
+              targetType: normalizedTarget.targetType,
+              targetId: normalizedTarget.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: true,
+            })),
           );
-      };
+        }
 
-      const writeUserDeclarations = async (targetDb: SecretBindingDb) => {
         await targetDb
           .delete(userSecretDeclarations)
           .where(
             and(
               eq(userSecretDeclarations.companyId, companyId),
-              eq(userSecretDeclarations.targetType, target.targetType),
-              eq(userSecretDeclarations.targetId, target.targetId),
+              eq(userSecretDeclarations.targetType, normalizedTarget.targetType),
+              normalizedTarget.targetType === "agent"
+                ? sql<boolean>`lower(${userSecretDeclarations.targetId}) = ${normalizedTarget.targetId}`
+                : eq(userSecretDeclarations.targetId, normalizedTarget.targetId),
               like(userSecretDeclarations.configPath, `${pathPrefix}.%`),
             ),
           );
         if (userRefs.length === 0) return;
-        const definitions = new Map<string, string>();
-        for (const ref of userRefs) {
-          const definition = await resolveUserSecretDefinition(companyId, { definitionKey: ref.definitionKey }, targetDb);
-          definitions.set(ref.definitionKey, definition.id);
-        }
         await targetDb.insert(userSecretDeclarations).values(
           userRefs.map((ref) => ({
             companyId,
             userSecretDefinitionId: definitions.get(ref.definitionKey)!,
-            targetType: target.targetType,
-            targetId: target.targetId,
+            targetType: normalizedTarget.targetType,
+            targetId: normalizedTarget.targetId,
             configPath: ref.configPath,
             envKey: ref.envKey,
             versionSelector: String(ref.versionSelector),
@@ -3634,13 +3722,9 @@ export function secretService(db: Db) {
       };
 
       if (options?.db) {
-        await writeBindings(options.db);
-        await writeUserDeclarations(options.db);
+        await writeAll(options.db);
       } else {
-        await db.transaction(async (tx) => {
-          await writeBindings(tx);
-          await writeUserDeclarations(tx);
-        });
+        await db.transaction(async (tx) => writeAll(tx));
       }
       return refs;
     },

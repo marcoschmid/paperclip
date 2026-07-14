@@ -69,8 +69,34 @@ describe("decisionRoutes", () => {
 
     expect(res.status).toBe(201);
     expect(res.body.id).toBe("d1");
-    expect(m.upsert).toHaveBeenCalledWith(CID, { projectId: PID, ...base });
+    expect(m.upsert).toHaveBeenCalledWith(CID, {
+      projectId: PID,
+      ...base,
+      createdByAgentId: null,
+      createdByUserId: "tester",
+    });
     expect(m.logActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST derives authorship from the authenticated actor instead of request provenance", async () => {
+    m.upsert.mockResolvedValue({
+      created: true,
+      decision: { id: "d1", sourceKey: "adr-0001", projectId: PID, status: "accepted" },
+    });
+
+    const res = await request(await createApp()).post(path).send({
+      ...base,
+      createdByAgentId: "8d403783-c4e2-4746-adad-7689cd95ae33",
+      createdByUserId: "forged-user",
+    });
+
+    expect(res.status).toBe(201);
+    expect(m.upsert).toHaveBeenCalledWith(CID, {
+      projectId: PID,
+      ...base,
+      createdByAgentId: null,
+      createdByUserId: "tester",
+    });
   });
 
   it("POST returns 200 when the decision already existed (updated in place)", async () => {

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,12 +6,16 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   agents,
+  agentConfigRevisions,
+  activityLog,
   companies,
   companySecretBindings,
   companySecretProviderConfigs,
   companySecretVersions,
   companySecrets,
   createDb,
+  heartbeatRunEvents,
+  secretAccessEvents,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -44,6 +48,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
@@ -71,6 +76,15 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       requireBoardApprovalForNewAgents: false,
     });
     return companyId;
+  }
+
+  function digest(value: string): string {
+    return createHash("sha256").update(value).digest("hex");
+  }
+
+  function containsPlaintext(value: unknown, plaintexts: string[]): boolean {
+    const serialized = JSON.stringify(value);
+    return plaintexts.some((plaintext) => serialized.includes(plaintext));
   }
 
   it("creates agent secret bindings when a new agent persists secret_ref env", async () => {
@@ -113,6 +127,200 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
       versionSelector: "latest",
       required: true,
     });
+  });
+
+  it("binds and resolves a company-scoped Stitch secret and follows latest rotations without rewriting agent config", async () => {
+    const companyId = await seedCompany();
+    const secrets = secretService(db);
+    const firstValue = `FAKE_STITCH_TEST_VALUE_DO_NOT_USE_${randomUUID()}`;
+    const rotatedValue = `FAKE_STITCH_ROTATED_TEST_VALUE_DO_NOT_USE_${randomUUID()}`;
+    const secret = await secrets.create(companyId, {
+      name: `stitch-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: firstValue,
+    });
+
+    const service = agentService(db);
+    const created = await service.create(companyId, {
+      name: "Stitch Codex",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {
+        env: {
+          STITCH_API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
+        },
+      },
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+
+    const persistedBeforeRotation = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, created.id))
+      .then((rows) => rows[0]);
+    const persistedConfigBeforeRotation = persistedBeforeRotation?.adapterConfig as Record<string, unknown>;
+    expect(containsPlaintext(persistedBeforeRotation, [firstValue, rotatedValue])).toBe(false);
+    const persistedBindingBeforeRotation = (
+      persistedConfigBeforeRotation.env as Record<string, unknown>
+    ).STITCH_API_KEY;
+    expect(persistedBindingBeforeRotation).toEqual({
+      type: "secret_ref",
+      secretId: secret.id,
+      version: "latest",
+    });
+
+    const bindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, created.id),
+      ));
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({
+      secretId: secret.id,
+      configPath: "env.STITCH_API_KEY",
+      versionSelector: "latest",
+      required: true,
+    });
+
+    const firstResolution = await secrets.resolveAdapterConfigForRuntime(
+      companyId,
+      persistedConfigBeforeRotation,
+      { consumerType: "agent", consumerId: created.id },
+      { adapterType: "codex_local" },
+    );
+    const firstResolvedEnv = firstResolution.config.env as Record<string, string>;
+    expect(digest(firstResolvedEnv.STITCH_API_KEY ?? "")).toBe(digest(firstValue));
+
+    await service.update(
+      created.id,
+      { title: "Stitch-enabled Codex" },
+      { recordRevision: { source: "patch" } },
+    );
+    await secrets.rotate(secret.id, { value: rotatedValue });
+
+    const persistedAfterRotation = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, created.id))
+      .then((rows) => rows[0]);
+    expect(containsPlaintext(persistedAfterRotation, [firstValue, rotatedValue])).toBe(false);
+    expect(digest(JSON.stringify(persistedAfterRotation?.adapterConfig)))
+      .toBe(digest(JSON.stringify(persistedConfigBeforeRotation)));
+
+    const rotatedResolution = await secrets.resolveAdapterConfigForRuntime(
+      companyId,
+      persistedAfterRotation?.adapterConfig as Record<string, unknown>,
+      { consumerType: "agent", consumerId: created.id },
+      { adapterType: "codex_local" },
+    );
+    const rotatedResolvedEnv = rotatedResolution.config.env as Record<string, string>;
+    expect(digest(rotatedResolvedEnv.STITCH_API_KEY ?? "")).toBe(digest(rotatedValue));
+    expect(digest(rotatedResolvedEnv.STITCH_API_KEY ?? "")).not.toBe(digest(firstValue));
+
+    const [revisions, secretRows, versionRows, accessEvents, activityRows, heartbeatEvents] = await Promise.all([
+      db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, created.id)),
+      db.select().from(companySecrets).where(eq(companySecrets.id, secret.id)),
+      db.select().from(companySecretVersions).where(eq(companySecretVersions.secretId, secret.id)),
+      db
+        .select()
+        .from(secretAccessEvents)
+        .where(eq(secretAccessEvents.secretId, secret.id))
+        .orderBy(secretAccessEvents.version),
+      db.select().from(activityLog).where(eq(activityLog.companyId, companyId)),
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId)),
+    ]);
+    expect(containsPlaintext(
+      {
+        persistedAfterRotation,
+        revisions,
+        secretRows,
+        versionRows,
+        bindings,
+        accessEvents,
+        activityRows,
+        heartbeatEvents,
+      },
+      [firstValue, rotatedValue],
+    )).toBe(false);
+    expect(revisions).toHaveLength(1);
+    expect(versionRows).toHaveLength(2);
+    expect(accessEvents).toHaveLength(2);
+    expect(accessEvents.map((event) => ({
+      version: event.version,
+      consumerType: event.consumerType,
+      consumerId: event.consumerId,
+      configPath: event.configPath,
+      outcome: event.outcome,
+    }))).toEqual([
+      {
+        version: 1,
+        consumerType: "agent",
+        consumerId: created.id,
+        configPath: "env.STITCH_API_KEY",
+        outcome: "success",
+      },
+      {
+        version: 2,
+        consumerType: "agent",
+        consumerId: created.id,
+        configPath: "env.STITCH_API_KEY",
+        outcome: "success",
+      },
+    ]);
+    expect(activityRows).toHaveLength(0);
+    expect(heartbeatEvents).toHaveLength(0);
+  });
+
+  it("rejects a Stitch secret reference owned by another company", async () => {
+    const owningCompanyId = await seedCompany();
+    const consumingCompanyId = await seedCompany();
+    const crossCompanyValue = `FAKE_CROSS_COMPANY_STITCH_VALUE_DO_NOT_USE_${randomUUID()}`;
+    const secret = await secretService(db).create(owningCompanyId, {
+      name: `stitch-cross-company-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: crossCompanyValue,
+    });
+
+    let rejectionStatus: number | null = null;
+    let rejectionMessage = "";
+    try {
+      await agentService(db).create(consumingCompanyId, {
+        name: "Cross-company Stitch Codex",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: {
+          env: {
+            STITCH_API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
+          },
+        },
+        runtimeConfig: {},
+        spentMonthlyCents: 0,
+        lastHeartbeatAt: null,
+      });
+    } catch (error) {
+      const rejection = error as { status?: unknown; message?: unknown };
+      rejectionStatus = typeof rejection.status === "number" ? rejection.status : null;
+      rejectionMessage = typeof rejection.message === "string" ? rejection.message : "";
+    }
+    expect(rejectionMessage.includes(crossCompanyValue)).toBe(false);
+    expect(rejectionStatus === 422).toBe(true);
+    expect(rejectionMessage === "Secret must belong to same company").toBe(true);
+
+    const consumingCompanyAgents = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.companyId, consumingCompanyId));
+    const consumingCompanyBindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.companyId, consumingCompanyId));
+    expect(consumingCompanyAgents).toHaveLength(0);
+    expect(consumingCompanyBindings).toHaveLength(0);
   });
 
   it("converts Hermes gateway apiKey strings into persisted secret refs", async () => {

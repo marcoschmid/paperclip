@@ -74,6 +74,8 @@ export interface HeartbeatRun {
   processPid: number | null;
   processGroupId?: number | null;
   processStartedAt: Date | null;
+  processExecutable?: string | null;
+  processCommandSha256?: string | null;
   lastOutputAt: Date | null;
   lastOutputSeq: number;
   lastOutputStream: "stdout" | "stderr" | null;

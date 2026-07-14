@@ -20,7 +20,7 @@ The following intentions are explicitly preserved in this spec:
 1. Paperclip is adapter-agnostic. The key is a protocol, not a specific runtime.
 2. We still need default built-ins to make the system useful immediately.
 3. First two built-ins are `claude-local` and `codex-local`.
-4. Those adapters run local CLIs directly on the host machine, unsandboxed.
+4. Those adapters run CLIs in the selected execution target. Permission, approval, and sandbox policy is runtime-owned; agent configuration cannot disable it with global bypass flags.
 5. Agent config includes working directory and initial/default prompt.
 6. Heartbeats run the configured adapter process, Paperclip manages lifecycle, and on exit Paperclip parses JSON output and updates state.
 7. Session IDs and token usage must be persisted so later heartbeats can resume.
@@ -250,7 +250,7 @@ Runs local `claude` CLI directly.
   "promptTemplate": "You are agent {{agent.id}} ...",
   "model": "optional-model-id",
   "maxTurnsPerRun": 1000,
-  "dangerouslySkipPermissions": true,
+  "dangerouslySkipPermissions": false,
   "env": {"KEY": "VALUE"},
   "extraArgs": [],
   "timeoutSec": 1800,
@@ -262,7 +262,9 @@ Runs local `claude` CLI directly.
 
 - Base command: `claude --print <prompt> --output-format json`
 - Resume: add `--resume <sessionId>` when runtime state has session ID
-- Unsandboxed mode: add `--dangerously-skip-permissions` when enabled
+- Global bypass mode is unavailable: `dangerouslySkipPermissions: true`, `--dangerously-skip-permissions`, permission-mode bypasses, and free-form `allowedTools` are rejected.
+- `extraArgs`/legacy `args` are fail-closed; only `--no-session-persistence` is accepted from agent configuration.
+- `targetIsRemote` comes only from Paperclip's trusted execution target. For that remote sandbox context, Paperclip injects one immutable runtime-owned tool list; agent-managed adapter config cannot replace or extend it. Local targets receive no implicit tool allowance.
 
 ### Output parsing
 
@@ -287,7 +289,7 @@ Runs local `codex` CLI directly.
   "promptTemplate": "You are agent {{agent.id}} ...",
   "model": "optional-model-id",
   "search": false,
-  "dangerouslyBypassApprovalsAndSandbox": true,
+  "dangerouslyBypassApprovalsAndSandbox": false,
   "env": {"KEY": "VALUE"},
   "extraArgs": [],
   "timeoutSec": 1800,
@@ -299,7 +301,8 @@ Runs local `codex` CLI directly.
 
 - Base command: `codex exec --json <prompt>`
 - Resume form: `codex exec --json resume <sessionId> <prompt>`
-- Unsandboxed mode: add `--dangerously-bypass-approvals-and-sandbox` when enabled
+- Global bypass mode is unavailable: `dangerouslyBypassApprovalsAndSandbox: true`, its legacy alias, and `--dangerously-bypass-approvals-and-sandbox` are rejected.
+- `extraArgs`/legacy `args` are fail-closed; only `--skip-git-repo-check` is accepted. Sandbox, approval, config, profile, and full-auto overrides are rejected.
 - Optional search mode: add `--search`
 
 ### Output parsing

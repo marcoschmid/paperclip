@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
+import { assertHistoricalAgentTombstoneMutable } from "./agent-retirement-historical-tombstones.js";
 
 export interface CostDateRange {
   from?: Date;
@@ -52,6 +53,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
   const budgets = budgetService(db, budgetHooks);
   return {
     createEvent: async (companyId: string, data: Omit<typeof costEvents.$inferInsert, "companyId">) => {
+      assertHistoricalAgentTombstoneMutable(data.agentId);
       const agent = await db
         .select()
         .from(agents)

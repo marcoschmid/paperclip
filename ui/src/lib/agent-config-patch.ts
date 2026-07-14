@@ -53,6 +53,14 @@ export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay)
             ...overlay.adapterConfig,
           };
 
+    const effectiveAdapterType = overlay.adapterType ?? agent.adapterType;
+    if (
+      effectiveAdapterType === "codex_local"
+      && nextAdapterConfig.dangerouslyBypassApprovalsAndSandbox === false
+    ) {
+      nextAdapterConfig.dangerouslyBypassSandbox = false;
+    }
+
     patch.adapterConfig = omitUndefinedEntries(nextAdapterConfig);
     patch.replaceAdapterConfig = true;
   }

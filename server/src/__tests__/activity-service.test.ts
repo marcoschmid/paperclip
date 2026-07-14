@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -21,6 +22,7 @@ import { activityService } from "../services/activity.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 type ActivityService = ReturnType<typeof activityService>;
 type IssueRun = Awaited<ReturnType<ActivityService["runsForIssue"]>>[number];
 
@@ -304,6 +306,100 @@ describeEmbeddedPostgres("activity service", () => {
       continuationAttempt: 0,
       lastUsefulActionAt: completedAt,
     });
+  });
+
+  it("does not mutate historical tombstone runs during read-triggered liveness backfill", async () => {
+    const companyId = randomUUID();
+    const liveAgentId = randomUUID();
+    const issueId = randomUUID();
+    const historicalRunId = randomUUID();
+    const liveRunId = randomUUID();
+    const completedAt = new Date("2026-07-14T01:30:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: HISTORICAL_TOMBSTONE_ID,
+        companyId,
+        name: "HistoricalTombstone",
+        role: "engineer",
+        status: "terminated",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: liveAgentId,
+        companyId,
+        name: "LiveAgent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Read-only historical ledger",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: liveAgentId,
+      completedAt,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: historicalRunId,
+        companyId,
+        agentId: HISTORICAL_TOMBSTONE_ID,
+        invocationSource: "assignment",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        finishedAt: completedAt,
+        livenessState: null,
+        livenessReason: null,
+        updatedAt: new Date("2026-07-14T01:29:00.000Z"),
+      },
+      {
+        id: liveRunId,
+        companyId,
+        agentId: liveAgentId,
+        invocationSource: "assignment",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        finishedAt: completedAt,
+        livenessState: null,
+        livenessReason: null,
+      },
+    ]);
+    const before = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, historicalRunId))
+      .then((rows) => rows[0]);
+
+    const service = activityService(db);
+    await waitForIssueRun(
+      service,
+      companyId,
+      issueId,
+      (entry) => entry.runId === liveRunId && entry.livenessState === "completed",
+    );
+    const after = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, historicalRunId))
+      .then((rows) => rows[0]);
+
+    expect(after).toEqual(before);
   });
 
   it("does not backfill document evidence from a different run", async () => {

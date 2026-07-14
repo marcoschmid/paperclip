@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { modelProfiles, models } from "./index.js";
+import { agentConfigurationDoc, modelProfiles, models } from "./index.js";
 
 describe("claude local adapter metadata", () => {
   it("advertises Sonnet 5 while keeping specialist frontier models available", () => {
@@ -20,5 +20,12 @@ describe("claude local adapter metadata", () => {
         },
       }),
     );
+  });
+
+  it("documents skip-permissions as fail-closed by default", () => {
+    expect(agentConfigurationDoc).toContain("dangerouslySkipPermissions (boolean, optional, default false)");
+    expect(agentConfigurationDoc).toContain("Paperclip rejects true");
+    expect(agentConfigurationDoc).toContain("allowedTools (string[], legacy)");
+    expect(agentConfigurationDoc).toContain("Board-managed manifest");
   });
 });

@@ -31,6 +31,7 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
+const mockAssertAssignableAgent = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -40,6 +41,9 @@ function registerModuleMocks() {
     issueApprovalService: () => mockIssueApprovalService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
+  }));
+  vi.doMock("../services/agent-assignability.js", () => ({
+    assertAssignableAgent: mockAssertAssignableAgent,
   }));
 }
 
@@ -133,6 +137,8 @@ describe("approval routes idempotent retries", () => {
     mockSecretService.normalizeHireApprovalPayloadForPersistence.mockReset();
     mockLogActivity.mockReset();
     mockAccessService.decide.mockReset();
+    mockAssertAssignableAgent.mockReset();
+    mockAssertAssignableAgent.mockResolvedValue(undefined);
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       action: "company_scope:read",
@@ -367,6 +373,91 @@ describe("approval routes idempotent retries", () => {
         action: "approval.created",
       }),
     );
+  });
+
+  it("rejects an agent attempting to forge another approval requester", async () => {
+    const forgedAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-forged-requester",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: forgedAgentId,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Forged requester" },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        requestedByAgentId: forgedAgentId,
+        payload: { title: "Forged requester" },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("requires an authenticated agent id before an agent actor can create an approval", async () => {
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-missing-agent-id",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      status: "pending",
+      payload: { title: "Missing identity" },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const res = await request(await createApp({
+      type: "agent",
+      source: "agent_key",
+      companyId: "company-1",
+      agentId: undefined,
+    }))
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        payload: { title: "Missing identity" },
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("explicitly validates a board-selected approval requester before create", async () => {
+    const requestedByAgentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    mockApprovalService.create.mockResolvedValue({
+      id: "approval-board-requester",
+      companyId: "company-1",
+      type: "request_board_approval",
+      requestedByAgentId,
+      requestedByUserId: "user-1",
+      status: "pending",
+      payload: {},
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        requestedByAgentId,
+        payload: {},
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockAssertAssignableAgent).toHaveBeenCalledWith(
+      expect.anything(),
+      "company-1",
+      requestedByAgentId,
+      { kind: "work" },
+    );
+    expect(mockApprovalService.create).toHaveBeenCalledTimes(1);
   });
 
   it("blocks status-only recovery runs from creating approvals", async () => {

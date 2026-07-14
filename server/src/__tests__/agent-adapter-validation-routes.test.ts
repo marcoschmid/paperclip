@@ -66,6 +66,7 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
+  agentRetirementService: () => ({}),
   agentInstructionsService: () => mockAgentInstructionsService,
   accessService: () => mockAccessService,
   approvalService: () => mockApprovalService,
@@ -91,6 +92,7 @@ vi.mock("../services/secrets.js", () => ({
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
+    agentRetirementService: () => ({}),
     agentInstructionsService: () => mockAgentInstructionsService,
     accessService: () => mockAccessService,
     approvalService: () => mockApprovalService,
@@ -272,7 +274,7 @@ describe("agent routes adapter validation", () => {
     }));
     await unregisterTestAdapter("external_test");
     await unregisterTestAdapter(missingAdapterType);
-  });
+  }, 30_000);
 
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
@@ -295,7 +297,30 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.adapterType).toBe("external_test");
-  });
+  }, 15_000);
+
+  it("preserves an OpenClaw device private-key secret ref instead of generating a new literal default", async () => {
+    const deviceKeyRef = {
+      type: "secret_ref",
+      secretId: "77777777-7777-4777-8777-777777777777",
+      version: "latest",
+    };
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({
+          name: "OpenClaw Gateway",
+          adapterType: "openclaw_gateway",
+          adapterConfig: { devicePrivateKeyPem: deviceKeyRef },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const createInput = mockAgentService.create.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const adapterConfig = createInput.adapterConfig as Record<string, unknown>;
+    expect(adapterConfig.devicePrivateKeyPem).toEqual(deviceKeyRef);
+  }, 15_000);
 
   it("does not inject CODEX_HOME or OPENAI_API_KEY when creating a keyless codex_local agent", async () => {
     const app = await createApp();

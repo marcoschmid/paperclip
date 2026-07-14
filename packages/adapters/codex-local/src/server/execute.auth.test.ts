@@ -59,6 +59,9 @@ describe("codex managed-home auth fail-fast", () => {
           taskKey: null,
         },
         config: {
+          paperclipRuntimeSurface: {
+            policyVersion: "codex-managed-v2",
+          },
           command: "codex",
           cwd: workspaceDir,
           env: {

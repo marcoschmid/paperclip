@@ -78,6 +78,21 @@ async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
   throw lastError;
 }
 
+async function deleteAgentsAfterHeartbeatCleanupSettles(db: Db) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db);
+    try {
+      await db.delete(agents);
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
 function expectNoCanary(value: unknown, ...markers: string[]) {
   const serialized = JSON.stringify(value);
   for (const marker of markers) expect(serialized).not.toContain(marker);
@@ -523,6 +538,26 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
   }, 20_000);
 
   afterEach(async () => {
+    const agentIds = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .then((rows) => rows.map((row) => row.id));
+    if (agentIds.length > 0) {
+      await heartbeatService(db).cancelInvocationsForAgents(
+        agentIds,
+        "Cancelled by low-trust route test teardown",
+        { suppressDeferredPromotion: true, suppressEvents: true },
+      );
+    }
+    await waitFor(async () => {
+      const activeRuns = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns);
+      return activeRuns.every((run) => !["queued", "running", "scheduled_retry"].includes(run.status));
+    }, 10_000);
+    // A run becomes terminal before its final event and release transaction has
+    // necessarily returned; give that bounded tail a chance to drain.
+    await new Promise((resolve) => setTimeout(resolve, 100));
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -537,11 +572,11 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
-    await db.delete(agents);
+    await deleteAgentsAfterHeartbeatCleanupSettles(db);
     await db.delete(projects);
     await db.delete(companySkills);
     await db.delete(companies);
-  });
+  }, 60_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();

@@ -26,9 +26,15 @@ import {
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
-import { forbidden, notFound } from "../../errors.js";
+import { conflict, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
-import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
+import { isProcessGroupAlive } from "../local-service-supervisor.js";
+import { verifyStoredLocalProcessIdentity } from "../local-process-identity.js";
+import {
+  finalizeHeartbeatRunWithoutSignalWithinFence,
+  terminateHeartbeatRunProcessWithinFence,
+  type HeartbeatRunProcessFenceContext,
+} from "../heartbeat-run-process-fence.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
@@ -1200,71 +1206,186 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function cleanupSourceResolvedRunProcess(input: {
     run: typeof heartbeatRuns.$inferSelect;
     runningAgent: typeof agents.$inferSelect;
+    validateLocked: (context: HeartbeatRunProcessFenceContext) => Promise<void>;
+    terminalize: (
+      context: HeartbeatRunProcessFenceContext & { now: Date },
+      cleanup: Record<string, unknown>,
+    ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
   }) {
+    const validateNoSignalTarget = async (context: HeartbeatRunProcessFenceContext) => {
+      await input.validateLocked(context);
+      const currentRunning = runningProcesses.get(input.run.id);
+      if (
+        currentRunning
+        && (
+          (typeof currentRunning.child.pid === "number" && currentRunning.child.pid > 0)
+          || (typeof currentRunning.processGroupId === "number" && currentRunning.processGroupId > 0)
+        )
+      ) {
+        throw conflict("Heartbeat process target appeared before no-signal recovery fold", {
+          code: "heartbeat_recovery_process_signal_target_drift",
+          runId: input.run.id,
+        });
+      }
+    };
+    const finalizeWithoutSignal = async (cleanup: Record<string, unknown>) => ({
+      cleanup,
+      finalizedRun: await finalizeHeartbeatRunWithoutSignalWithinFence({
+        db,
+        expectedRun: input.run,
+        expectedAgentStatus: input.runningAgent.status,
+        hooks: {
+          validateLocked: validateNoSignalTarget,
+          terminalize: (context) => input.terminalize(context, cleanup),
+        },
+      }),
+    });
+
     if (!SESSIONED_LOCAL_ADAPTERS.has(input.runningAgent.adapterType)) {
-      return {
+      return finalizeWithoutSignal({
         attempted: false,
         outcome: "skipped_non_local_adapter",
         adapterType: input.runningAgent.adapterType,
-      };
+      });
     }
 
     const running = runningProcesses.get(input.run.id);
-    const pid = running?.child.pid ?? input.run.processPid ?? null;
-    const processGroupId = running?.processGroupId ?? input.run.processGroupId ?? null;
+    const pid = input.run.processPid ?? null;
+    const processGroupId = input.run.processGroupId ?? null;
     if (typeof pid !== "number" && typeof processGroupId !== "number") {
-      return {
+      if (running) {
+        return {
+          cleanup: {
+            attempted: false,
+            outcome: "manual_reconcile_required",
+            reason: "in_memory_process_without_persisted_identity",
+            adapterType: input.runningAgent.adapterType,
+            pid: running.child.pid ?? null,
+            processGroupId: running.processGroupId ?? null,
+          },
+          finalizedRun: null,
+        };
+      }
+      return finalizeWithoutSignal({
         attempted: false,
         outcome: "no_process_metadata",
         adapterType: input.runningAgent.adapterType,
+      });
+    }
+
+    const strongIdentityComplete =
+      typeof input.run.processPid === "number"
+      && typeof input.run.processGroupId === "number"
+      && input.run.processStartedAt instanceof Date
+      && typeof input.run.processExecutable === "string"
+      && input.run.processExecutable.length > 0
+      && /^v1:sha256:[a-f0-9]{64}$/.test(input.run.processCommandSha256 ?? "");
+    if (!strongIdentityComplete) {
+      return {
+        cleanup: {
+          attempted: false,
+          outcome: "manual_reconcile_required",
+          reason: "stored_process_identity_incomplete",
+          adapterType: input.runningAgent.adapterType,
+          pid,
+          processGroupId,
+        },
+        finalizedRun: null,
       };
     }
 
-    const wasAlive =
-      (typeof pid === "number" && isPidAlive(pid)) ||
-      (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
-    if (!wasAlive) {
+    const verification = await verifyStoredLocalProcessIdentity(input.run);
+    if (verification.kind === "not_running") {
+      if (processGroupId && isProcessGroupAlive(processGroupId)) {
+        return {
+          cleanup: {
+            attempted: false,
+            outcome: "manual_reconcile_required",
+            reason: "owner_pid_not_running_group_alive",
+            adapterType: input.runningAgent.adapterType,
+            pid,
+            processGroupId,
+          },
+          finalizedRun: null,
+        };
+      }
       runningProcesses.delete(input.run.id);
-      return {
+      return finalizeWithoutSignal({
         attempted: false,
         outcome: "not_running",
         adapterType: input.runningAgent.adapterType,
         pid,
         processGroupId,
+      });
+    }
+    if (verification.kind !== "verified") {
+      return {
+        cleanup: {
+          attempted: false,
+          outcome: "manual_reconcile_required",
+          reason: verification.reason,
+          adapterType: input.runningAgent.adapterType,
+          pid,
+          processGroupId,
+        },
+        finalizedRun: null,
+      };
+    }
+    if (
+      running
+      && (
+        running.child.pid !== verification.identity.pid
+        || running.processGroupId !== verification.identity.processGroupId
+      )
+    ) {
+      return {
+        cleanup: {
+          attempted: false,
+          outcome: "manual_reconcile_required",
+          reason: "in_memory_identity_mismatch",
+          adapterType: input.runningAgent.adapterType,
+          pid,
+          processGroupId,
+        },
+        finalizedRun: null,
       };
     }
 
+    const cleanup = {
+      attempted: true,
+      outcome: "terminated",
+      adapterType: input.runningAgent.adapterType,
+      pid,
+      processGroupId,
+    };
     try {
-      await terminateLocalService(
-        {
-          pid: typeof pid === "number" && Number.isInteger(pid) && pid > 0
-            ? pid
-            : (processGroupId ?? 0),
-          processGroupId: typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
-            ? processGroupId
-            : null,
+      const terminated = await terminateHeartbeatRunProcessWithinFence({
+        db,
+        expectedRun: input.run,
+        expectedAgentStatus: input.runningAgent.status,
+        identity: verification.identity,
+        ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+        hooks: {
+          validateLocked: input.validateLocked,
+          terminalize: (context) => input.terminalize(context, cleanup),
         },
-        running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
-      );
+      });
       runningProcesses.delete(input.run.id);
-      const stillAlive =
-        (typeof pid === "number" && isPidAlive(pid)) ||
-        (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
       return {
-        attempted: true,
-        outcome: stillAlive ? "termination_sent_still_running" : "terminated",
-        adapterType: input.runningAgent.adapterType,
-        pid,
-        processGroupId,
+        cleanup,
+        finalizedRun: terminated.terminalized,
       };
     } catch (error) {
       return {
-        attempted: true,
-        outcome: "failed",
-        adapterType: input.runningAgent.adapterType,
-        pid,
-        processGroupId,
-        error: error instanceof Error ? error.message : String(error),
+        cleanup: {
+          attempted: false,
+          outcome: "manual_reconcile_required",
+          adapterType: input.runningAgent.adapterType,
+          pid,
+          processGroupId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        finalizedRun: null,
       };
     }
   }
@@ -1297,26 +1418,82 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     now: Date;
   }) {
     if (!input.evidence) return { kind: "skipped" as const };
-    const cleanup = await cleanupSourceResolvedRunProcess({ run: input.run, runningAgent: input.runningAgent });
+    const evidence = input.evidence;
     const finalRunStatus = input.sourceIssue.status === "cancelled" ? "cancelled" : "succeeded";
-    const resultJson = {
+    const buildResultJson = (cleanup: Record<string, unknown>) => ({
       ...parseObject(input.run.resultJson),
       sourceResolvedWatchdogFold: {
         sourceIssueId: input.sourceIssue.id,
         sourceIssueIdentifier: input.sourceIssue.identifier,
         sourceIssueStatus: input.sourceIssue.status,
-        sameRunEvidenceKind: input.evidence.kind,
-        sameRunEvidenceId: input.evidence.id,
-        sameRunEvidenceAt: input.evidence.createdAt.toISOString(),
+        sameRunEvidenceKind: evidence.kind,
+        sameRunEvidenceId: evidence.id,
+        sameRunEvidenceAt: evidence.createdAt.toISOString(),
         silenceStartedAt: input.silenceStartedAt?.toISOString() ?? null,
         silenceAgeMs: input.silenceAgeMs,
         evaluationIssueId: input.existingEvaluation?.id ?? null,
         evaluationIssueIdentifier: input.existingEvaluation?.identifier ?? null,
         cleanup,
       },
+    });
+    const validateLocked = async (context: HeartbeatRunProcessFenceContext) => {
+      const lockedSource = await context.db
+        .select()
+        .from(issues)
+        .where(and(
+          eq(issues.id, input.sourceIssue.id),
+          eq(issues.companyId, input.run.companyId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !lockedSource
+        || lockedSource.status !== input.sourceIssue.status
+        || lockedSource.executionRunId !== input.sourceIssue.executionRunId
+        || lockedSource.updatedAt.toISOString() !== input.sourceIssue.updatedAt.toISOString()
+        || !isTerminalIssueStatus(lockedSource.status)
+      ) {
+        throw conflict("Source issue changed before stale-run process signal", {
+          code: "heartbeat_recovery_source_signal_fence_drift",
+          runId: input.run.id,
+          issueId: input.sourceIssue.id,
+        });
+      }
+      const currentEvidence = await context.db
+        .select({
+          id: activityLog.id,
+          companyId: activityLog.companyId,
+          runId: activityLog.runId,
+          action: activityLog.action,
+          entityType: activityLog.entityType,
+          entityId: activityLog.entityId,
+          createdAt: activityLog.createdAt,
+        })
+        .from(activityLog)
+        .where(eq(activityLog.id, evidence.id))
+        .then((rows) => rows[0] ?? null);
+      if (
+        !currentEvidence
+        || currentEvidence.companyId !== input.run.companyId
+        || currentEvidence.runId !== input.run.id
+        || currentEvidence.action !== "issue.updated"
+        || currentEvidence.entityType !== "issue"
+        || currentEvidence.entityId !== input.sourceIssue.id
+        || currentEvidence.createdAt.toISOString() !== evidence.createdAt.toISOString()
+      ) {
+        throw conflict("Source issue evidence changed before stale-run process signal", {
+          code: "heartbeat_recovery_evidence_signal_fence_drift",
+          runId: input.run.id,
+          issueId: input.sourceIssue.id,
+        });
+      }
     };
-    const finalizedRun = await db.transaction(async (tx) => {
-      const [updatedRun] = await tx
+    const terminalize = async (
+      context: HeartbeatRunProcessFenceContext & { now: Date },
+      cleanup: Record<string, unknown>,
+    ) => {
+      const resultJson = buildResultJson(cleanup);
+      const [updatedRun] = await context.db
         .update(heartbeatRuns)
         .set({
           status: finalRunStatus,
@@ -1326,12 +1503,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           resultJson,
           updatedAt: input.now,
         })
-        .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId), eq(heartbeatRuns.status, "running")))
+        .where(and(
+          eq(heartbeatRuns.id, input.run.id),
+          eq(heartbeatRuns.companyId, input.run.companyId),
+          eq(heartbeatRuns.agentId, input.run.agentId),
+          eq(heartbeatRuns.status, input.run.status),
+        ))
         .returning();
-      if (!updatedRun) return null;
+      if (!updatedRun) {
+        throw conflict("Heartbeat run lost its stale-run terminalization CAS", {
+          code: "heartbeat_recovery_terminalization_drift",
+          runId: input.run.id,
+        });
+      }
 
       if (input.run.wakeupRequestId) {
-        await tx
+        await context.db
           .update(agentWakeupRequests)
           .set({
             status: finalRunStatus === "succeeded" ? "completed" : "cancelled",
@@ -1342,7 +1529,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.run.companyId)));
       }
 
-      await tx
+      const sourceExecutionPredicate = input.sourceIssue.executionRunId
+        ? eq(issues.executionRunId, input.sourceIssue.executionRunId)
+        : isNull(issues.executionRunId);
+      const updatedSource = await context.db
         .update(issues)
         .set({
           executionRunId: null,
@@ -1354,13 +1544,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           and(
             eq(issues.id, input.sourceIssue.id),
             eq(issues.companyId, input.run.companyId),
-            eq(issues.executionRunId, input.run.id),
+            eq(issues.status, input.sourceIssue.status),
+            sourceExecutionPredicate,
           ),
-        );
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+      if (!updatedSource) {
+        throw conflict("Source issue lost its stale-run terminalization CAS", {
+          code: "heartbeat_recovery_source_terminalization_drift",
+          runId: input.run.id,
+          issueId: input.sourceIssue.id,
+        });
+      }
 
       return updatedRun;
+    };
+    const cleanupResult = await cleanupSourceResolvedRunProcess({
+      run: input.run,
+      runningAgent: input.runningAgent,
+      validateLocked,
+      terminalize,
     });
+    const cleanup = cleanupResult.cleanup;
+    const finalizedRun = cleanupResult.finalizedRun;
     if (!finalizedRun) return { kind: "skipped" as const };
+    const resultJson = buildResultJson(cleanup);
 
     if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
       await issuesSvc.update(input.existingEvaluation.id, { status: "done" });

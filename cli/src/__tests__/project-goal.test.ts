@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerGoalCommands } from "../commands/client/goal.js";
@@ -6,6 +9,7 @@ import { registerProjectCommands } from "../commands/client/project.js";
 const COMPANY_ID = "22222222-2222-4222-8222-222222222222";
 const PROJECT_ID = "33333333-3333-4333-8333-333333333333";
 const GOAL_ID = "44444444-4444-4444-8444-444444444444";
+const ORIGINAL_PAPERCLIP_CONTEXT = process.env.PAPERCLIP_CONTEXT;
 
 function createProgram(): Command {
   const program = new Command();
@@ -25,10 +29,16 @@ describe("project and goal commands", () => {
     delete process.env.PAPERCLIP_API_KEY;
     delete process.env.PAPERCLIP_API_URL;
     delete process.env.PAPERCLIP_COMPANY_ID;
+    process.env.PAPERCLIP_CONTEXT = path.join(tmpdir(), `paperclip-project-goal-${randomUUID()}.json`);
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    if (ORIGINAL_PAPERCLIP_CONTEXT === undefined) {
+      delete process.env.PAPERCLIP_CONTEXT;
+    } else {
+      process.env.PAPERCLIP_CONTEXT = ORIGINAL_PAPERCLIP_CONTEXT;
+    }
   });
 
   it("creates and updates projects with shared schemas", async () => {

@@ -200,6 +200,7 @@ describe("routine routes", () => {
     mockRoutineService.create.mockResolvedValue(routine);
     mockRoutineService.get.mockResolvedValue(routine);
     mockRoutineService.getTrigger.mockResolvedValue(trigger);
+    mockRoutineService.updateTrigger.mockResolvedValue({ trigger, revision });
     mockRoutineService.update.mockResolvedValue({ ...routine, assigneeAgentId: otherAgentId });
     mockRoutineService.listRevisions.mockResolvedValue([revision]);
     mockRoutineService.restoreRevision.mockResolvedValue({
@@ -575,6 +576,32 @@ describe("routine routes", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("tasks:assign");
     expect(mockRoutineService.updateTrigger).not.toHaveBeenCalled();
+  });
+
+  it("binds trigger updates to the resulting routine revision while accepting revision CAS", async () => {
+    mockAccessService.canUser.mockResolvedValue(true);
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .patch(`/api/routine-triggers/${trigger.id}`)
+      .send({ enabled: true, baseRevisionId: revisionId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockRoutineService.updateTrigger).toHaveBeenCalledWith(
+      trigger.id,
+      { enabled: true, baseRevisionId: revisionId },
+      expect.objectContaining({ userId: "board-user" }),
+    );
+    expect(res.body).toMatchObject({
+      id: trigger.id,
+      routineRevisionId: revisionId,
+    });
   });
 
   it("requires tasks:assign permission to manually run a routine", async () => {

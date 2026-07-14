@@ -3,6 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -22,6 +23,7 @@ import {
   projectWorkspaces,
   projects,
   routineRuns,
+  routineRevisions,
   routines,
 } from "@paperclipai/db";
 import {
@@ -32,13 +34,16 @@ import {
   PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
   pipelineService,
   type PipelineActor,
+  type PipelineStageConfig,
 } from "../services/pipelines.ts";
 import { routineService } from "../services/routines.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.ts";
 import { REDACTED_EVENT_VALUE } from "../redaction.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -52,12 +57,60 @@ describeEmbeddedPostgres("pipelineService", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   const userActor: PipelineActor = { type: "user", userId: "board-user" };
-  const noopHeartbeat = { wakeup: async () => null };
+  const durableHeartbeat: IssueAssignmentWakeupDeps = {
+    wakeup: async (agentId, wakeupOpts) => {
+      const issueId =
+        (typeof wakeupOpts.payload?.issueId === "string" && wakeupOpts.payload.issueId)
+        || (typeof wakeupOpts.contextSnapshot?.issueId === "string" && wakeupOpts.contextSnapshot.issueId)
+        || null;
+      if (!issueId) return null;
+      const issue = await db
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) return null;
+
+      const queuedRunId = randomUUID();
+      const wakeupRequestId = randomUUID();
+      await db.transaction(async (tx) => {
+        await tx.insert(agentWakeupRequests).values({
+          id: wakeupRequestId,
+          companyId: issue.companyId,
+          agentId,
+          source: wakeupOpts.source ?? "assignment",
+          triggerDetail: wakeupOpts.triggerDetail ?? null,
+          reason: wakeupOpts.reason ?? null,
+          payload: wakeupOpts.payload ?? { issueId },
+          status: "queued",
+          requestedByActorType: wakeupOpts.requestedByActorType ?? null,
+          requestedByActorId: wakeupOpts.requestedByActorId ?? null,
+          idempotencyKey: wakeupOpts.idempotencyKey ?? null,
+          runId: queuedRunId,
+        });
+        await tx.insert(heartbeatRuns).values({
+          id: queuedRunId,
+          companyId: issue.companyId,
+          agentId,
+          invocationSource: wakeupOpts.source ?? "assignment",
+          triggerDetail: wakeupOpts.triggerDetail ?? null,
+          status: "queued",
+          wakeupRequestId,
+          contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+        });
+        await tx
+          .update(issues)
+          .set({ executionRunId: queuedRunId, executionLockedAt: new Date() })
+          .where(eq(issues.id, issueId));
+      });
+      return { id: queuedRunId };
+    },
+  };
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pipelines-service-");
     db = createDb(tempDb.connectionString);
-    svc = pipelineService(db, { heartbeat: noopHeartbeat });
+    svc = pipelineService(db, { heartbeat: durableHeartbeat });
   }, 20_000);
 
   afterEach(async () => {
@@ -72,7 +125,9 @@ describeEmbeddedPostgres("pipelineService", () => {
     await db.delete(issueComments);
     await db.delete(activityLog);
     await db.delete(routineRuns);
+    await db.delete(routineRevisions);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(routines);
@@ -119,7 +174,7 @@ describeEmbeddedPostgres("pipelineService", () => {
       runtimeConfig: {},
       permissions: {},
     }).returning();
-    return routineService(db, { heartbeat: noopHeartbeat }).create(companyId, {
+    return routineService(db, { heartbeat: durableHeartbeat }).create(companyId, {
       projectId: null,
       goalId: null,
       parentIssueId: null,
@@ -433,6 +488,158 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(claimed.leaseUserId).toBe("new-owner");
     const events = await svc.listCaseEvents(company.id, created.case.id);
     expect(events.map((event) => event.type)).toEqual(["ingested", "lease_expired", "claimed"]);
+  });
+
+  it("invalidates future legacy tombstone leases so a valid actor can take over or release them", async () => {
+    const { company, pipeline } = await seedPipeline();
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId: company.id,
+      name: "Historical lease owner",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const first = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "legacy-tombstone-lease-claim",
+      title: "Legacy tombstone lease claim",
+      actor: userActor,
+    });
+    await db.update(pipelineCases).set({
+      leaseOwnerType: "agent",
+      leaseAgentId: HISTORICAL_TOMBSTONE_ID,
+      leaseToken: randomUUID(),
+      leaseExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    }).where(eq(pipelineCases.id, first.case.id));
+
+    const claimed = await svc.claimCase({
+      companyId: company.id,
+      caseId: first.case.id,
+      actor: { type: "user", userId: "repair-user" },
+    });
+    expect(claimed).toMatchObject({
+      leaseOwnerType: "user",
+      leaseAgentId: null,
+      leaseUserId: "repair-user",
+    });
+    expect((await svc.listCaseEvents(company.id, first.case.id)).map((event) => event.type))
+      .toEqual(["ingested", "lease_expired", "claimed"]);
+
+    const second = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "legacy-tombstone-lease-release",
+      title: "Legacy tombstone lease release",
+      actor: userActor,
+    });
+    await db.update(pipelineCases).set({
+      leaseOwnerType: "agent",
+      leaseAgentId: HISTORICAL_TOMBSTONE_ID,
+      leaseToken: randomUUID(),
+      leaseExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    }).where(eq(pipelineCases.id, second.case.id));
+    const released = await svc.releaseCase({
+      companyId: company.id,
+      caseId: second.case.id,
+      actor: { type: "user", userId: "repair-user" },
+    });
+    expect(released).toMatchObject({
+      leaseOwnerType: null,
+      leaseAgentId: null,
+      leaseUserId: null,
+      leaseToken: null,
+      leaseExpiresAt: null,
+    });
+  });
+
+  it("clears incomplete future lease shapes before takeover and rejects new tombstone claims atomically", async () => {
+    const { company, pipeline } = await seedPipeline();
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "incomplete-lease",
+      title: "Incomplete lease",
+      actor: userActor,
+    });
+    await db.update(pipelineCases).set({
+      leaseOwnerType: "agent",
+      leaseAgentId: null,
+      leaseUserId: null,
+      leaseToken: randomUUID(),
+      leaseExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    }).where(eq(pipelineCases.id, created.case.id));
+    const claimed = await svc.claimCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      actor: { type: "user", userId: "shape-repair-user" },
+    });
+    expect(claimed).toMatchObject({ leaseOwnerType: "user", leaseUserId: "shape-repair-user" });
+
+    await svc.releaseCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      actor: { type: "user", userId: "shape-repair-user" },
+      leaseToken: claimed.leaseToken,
+    });
+    const beforeCase = (await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id)))[0];
+    const beforeEvents = await db.select().from(pipelineCaseEvents).where(eq(pipelineCaseEvents.caseId, created.case.id));
+    await expect(svc.claimCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      actor: { type: "agent", agentId: HISTORICAL_TOMBSTONE_ID.toUpperCase(), runId: randomUUID() },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID.toUpperCase(),
+      },
+    });
+    expect((await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id)))[0])
+      .toEqual(beforeCase);
+    expect(await db.select().from(pipelineCaseEvents).where(eq(pipelineCaseEvents.caseId, created.case.id)))
+      .toEqual(beforeEvents);
+  });
+
+  it("rejects a terminated agent lease claim without mutating the case or event stream", async () => {
+    const { company, pipeline } = await seedPipeline();
+    const [terminatedAgent] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Terminated lease claimant",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "terminated-agent-lease",
+      title: "Terminated agent lease",
+      actor: userActor,
+    });
+    const beforeCase = (await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id)))[0];
+    const beforeEvents = await db.select().from(pipelineCaseEvents).where(eq(pipelineCaseEvents.caseId, created.case.id));
+
+    await expect(svc.claimCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      actor: { type: "agent", agentId: terminatedAgent!.id, runId: randomUUID() },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "agent_lifecycle_reference_forbidden", reason: "terminated" },
+    });
+
+    expect((await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id)))[0])
+      .toEqual(beforeCase);
+    expect(await db.select().from(pipelineCaseEvents).where(eq(pipelineCaseEvents.caseId, created.case.id)))
+      .toEqual(beforeEvents);
   });
 
   it("enforces transition edges only when enforceTransitions is enabled", async () => {
@@ -1659,6 +1866,558 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(execution!.error).toContain("same company");
     const events = await svc.listCaseEvents(company.id, created.case.id);
     expect(events.filter((event) => event.type === "automation_failed")).toHaveLength(1);
+  });
+
+  it("rejects a historical tombstone routine as an active stage automation reference", async () => {
+    const company = await seedCompany();
+    const historicalTombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    await db.insert(agents).values({
+      id: historicalTombstoneId,
+      companyId: company.id,
+      name: "Historical tombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const [routine] = await db.insert(routines).values({
+      companyId: company.id,
+      title: "Historical automation",
+      assigneeAgentId: historicalTombstoneId,
+      status: "active",
+    }).returning();
+
+    await expect(svc.validateStageAutomationConfig(company.id, {
+      onEnter: { type: "run_routine", routineId: routine!.id },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: historicalTombstoneId,
+      },
+    });
+  });
+
+  it("rejects a historical tombstone as a specific stage approver on create and update", async () => {
+    const company = await seedCompany();
+    const mixedCaseTombstoneId = HISTORICAL_TOMBSTONE_ID.toUpperCase();
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId: company.id,
+      name: "Historical approver",
+      role: "reviewer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await expect(svc.createPipeline({
+      companyId: company.id,
+      key: "forbidden-approver",
+      name: "Forbidden approver",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        {
+          key: "review",
+          name: "Review",
+          kind: "review",
+          config: {
+            approveToStageKey: "done",
+            rejectToStageKey: "cancelled",
+            requireApproval: true,
+            approver: { kind: "agent", id: mixedCaseTombstoneId },
+          },
+        },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+    await expect(db.select().from(pipelines).where(eq(pipelines.companyId, company.id)))
+      .resolves.toHaveLength(0);
+    await expect(db.select().from(pipelineStages)).resolves.toHaveLength(0);
+
+    const seeded = await seedPipeline();
+    const reviewStage = seeded.byKey.get("review")!;
+    const before = (await db.select().from(pipelineStages).where(eq(pipelineStages.id, reviewStage.id)))[0];
+    await db.insert(agents).values({
+      id: "dcd3cadb-8203-4048-be1e-77701a3a43a0",
+      companyId: seeded.company.id,
+      name: "Second historical approver",
+      role: "reviewer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await expect(svc.updateStage({
+      companyId: seeded.company.id,
+      pipelineId: seeded.pipeline.id,
+      stageId: reviewStage.id,
+      patch: {
+        config: {
+          ...(reviewStage.config as Record<string, unknown>),
+          requireApproval: true,
+          approver: { kind: "agent", id: "DCD3CADB-8203-4048-BE1E-77701A3A43A0" },
+        },
+      },
+      actor: userActor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+    expect((await db.select().from(pipelineStages).where(eq(pipelineStages.id, reviewStage.id)))[0])
+      .toEqual(before);
+  });
+
+  it("canonicalizes live stage approvers and fences generic lifecycle races while allowing repair", async () => {
+    const company = await seedCompany();
+    const foreignCompany = await seedCompany();
+    const [liveAgent, pendingAgent, terminatedAgent, foreignAgent] = await db.insert(agents).values([
+      {
+        companyId: company.id,
+        name: "Live stage approver",
+        role: "reviewer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        companyId: company.id,
+        name: "Pending stage approver",
+        role: "reviewer",
+        status: "pending_approval",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        companyId: company.id,
+        name: "Terminated stage approver",
+        role: "reviewer",
+        status: "terminated",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        companyId: foreignCompany.id,
+        name: "Foreign stage approver",
+        role: "reviewer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]).returning();
+
+    const created = await svc.createPipeline({
+      companyId: company.id,
+      key: `canonical-approver-${randomUUID().slice(0, 8)}`,
+      name: "Canonical approver",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "working" },
+        {
+          key: "review",
+          name: "Review",
+          kind: "review",
+          config: {
+            approveToStageKey: "done",
+            rejectToStageKey: "cancelled",
+            requireApproval: true,
+            approver: { kind: "agent", id: liveAgent!.id.toUpperCase() },
+          },
+        },
+        { key: "done", name: "Done", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const reviewStage = created.stages.find((stage) => stage.key === "review")!;
+    expect((reviewStage.config as PipelineStageConfig).approver).toEqual({
+      kind: "agent",
+      id: liveAgent!.id,
+    });
+
+    for (const invalidAgentId of [pendingAgent!.id, terminatedAgent!.id]) {
+      await expect(svc.updateStage({
+        companyId: company.id,
+        pipelineId: created.id,
+        stageId: reviewStage.id,
+        patch: {
+          config: {
+            ...(reviewStage.config as PipelineStageConfig),
+            approver: { kind: "agent", id: invalidAgentId },
+          },
+        },
+        actor: userActor,
+      })).rejects.toMatchObject({
+        status: 409,
+        details: { code: "agent_lifecycle_reference_forbidden" },
+      });
+    }
+    await expect(svc.updateStage({
+      companyId: company.id,
+      pipelineId: created.id,
+      stageId: reviewStage.id,
+      patch: {
+        config: {
+          ...(reviewStage.config as PipelineStageConfig),
+          approver: { kind: "agent", id: foreignAgent!.id },
+        },
+      },
+      actor: userActor,
+    })).rejects.toMatchObject({
+      status: 404,
+      message: "Agent not found",
+    });
+
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, liveAgent!.id));
+    await expect(svc.updateStage({
+      companyId: company.id,
+      pipelineId: created.id,
+      stageId: reviewStage.id,
+      patch: { name: "Still retains invalid approver" },
+      actor: userActor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "agent_lifecycle_reference_forbidden" },
+    });
+    const repaired = await svc.updateStage({
+      companyId: company.id,
+      pipelineId: created.id,
+      stageId: reviewStage.id,
+      patch: {
+        config: {
+          ...(reviewStage.config as PipelineStageConfig),
+          approver: { kind: "any_human" },
+        },
+      },
+      actor: userActor,
+    });
+    expect((repaired.config as PipelineStageConfig).approver).toEqual({ kind: "any_human" });
+  });
+
+  it("fails legacy tombstone stage approval closed while allowing board repair", async () => {
+    const { company, pipeline, byKey } = await seedPipeline();
+    const mixedCaseTombstoneId = HISTORICAL_TOMBSTONE_ID.toUpperCase();
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId: company.id,
+      name: "Historical runtime approver",
+      role: "reviewer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const reviewStage = byKey.get("review")!;
+    const legacyConfig = {
+      ...(reviewStage.config as Record<string, unknown>),
+      requireApproval: true,
+      approver: { kind: "agent", id: mixedCaseTombstoneId },
+    };
+    await db.update(pipelineStages).set({ config: legacyConfig }).where(eq(pipelineStages.id, reviewStage.id));
+    const created = await svc.ingestCase({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      caseKey: "legacy-approver-runtime",
+      title: "Legacy approver runtime",
+      actor: userActor,
+    });
+    const moved = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "review",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const beforeCase = (await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id)))[0];
+    const beforeEvents = await db.select().from(pipelineCaseEvents).where(eq(pipelineCaseEvents.caseId, created.case.id));
+
+    await expect(svc.reviewCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      decision: "approve",
+      expectedVersion: moved.case.version,
+      actor: { type: "agent", agentId: mixedCaseTombstoneId, runId: randomUUID() },
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+    expect((await db.select().from(pipelineCases).where(eq(pipelineCases.id, created.case.id)))[0])
+      .toEqual(beforeCase);
+    expect(await db.select().from(pipelineCaseEvents).where(eq(pipelineCaseEvents.caseId, created.case.id)))
+      .toEqual(beforeEvents);
+
+    const repaired = await svc.updateStage({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      stageId: reviewStage.id,
+      patch: {
+        config: {
+          ...legacyConfig,
+          approver: { kind: "any_human" },
+        },
+      },
+      actor: userActor,
+    });
+    expect((repaired.config as Record<string, unknown>).approver).toEqual({ kind: "any_human" });
+    const reviewed = await svc.reviewCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      decision: "approve",
+      expectedVersion: moved.case.version,
+      actor: userActor,
+    });
+    expect(reviewed.case.terminalKind).toBe("done");
+  });
+
+  it("does not create or stamp a stage for a terminated automation assignee", async () => {
+    const { company, pipeline } = await seedPipeline();
+    const terminatedAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: terminatedAgentId,
+      companyId: company.id,
+      name: "Terminated automation agent",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const [routine] = await db.insert(routines).values({
+      companyId: company.id,
+      title: "Terminated automation",
+      assigneeAgentId: terminatedAgentId,
+      status: "active",
+      originKind: "manual",
+    }).returning();
+    const stagesBefore = await db.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, pipeline.id));
+    const routineBefore = (await db.select().from(routines).where(eq(routines.id, routine!.id)))[0];
+    const activitiesBefore = await db.select().from(activityLog);
+
+    await expect(svc.createStage({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      key: "forbidden_automation",
+      name: "Forbidden automation",
+      kind: "working",
+      position: 150,
+      config: { onEnter: { type: "run_routine", routineId: routine!.id } },
+      actor: userActor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "agent_lifecycle_reference_forbidden", reason: "terminated" },
+    });
+
+    expect(await db.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, pipeline.id)))
+      .toEqual(stagesBefore);
+    expect((await db.select().from(routines).where(eq(routines.id, routine!.id)))[0]).toEqual(routineBefore);
+    expect(await db.select().from(activityLog)).toEqual(activitiesBefore);
+  });
+
+  it("keeps agent-before-routine lock order during concurrent automation/approver configuration and termination", async () => {
+    const company = await seedCompany();
+    const routine = await seedRoutine(company.id, "Lifecycle race");
+    const assigneeAgentId = routine.assigneeAgentId!;
+    const blockerDb = createDb(tempDb!.connectionString);
+    const observerDb = createDb(tempDb!.connectionString);
+    let allowDependencyScan!: () => void;
+    const dependencyScanGate = new Promise<void>((resolve) => {
+      allowDependencyScan = resolve;
+    });
+    let reportLocked!: () => void;
+    const lockedGate = new Promise<void>((resolve) => {
+      reportLocked = resolve;
+    });
+    const blocker = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`set local lock_timeout = '3s'`);
+      await tx.execute(sql`select id from agents where id = ${assigneeAgentId} for update`);
+      reportLocked();
+      await dependencyScanGate;
+      // Mirrors retirement's Agent -> operational dependency lock order.
+      // The stage writer must still be waiting on the agent and must not own
+      // this routine row, otherwise the two transactions deadlock.
+      await tx.execute(sql`select id from routines where id = ${routine.id} for update`);
+      await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, assigneeAgentId));
+    });
+
+    try {
+      await lockedGate;
+      let writerSettled = false;
+      const writerOutcome = svc.createPipeline({
+        companyId: company.id,
+        key: "raced-automation",
+        name: "Raced automation pipeline",
+        actor: userActor,
+        stages: [
+          {
+            key: "intake",
+            name: "Intake",
+            kind: "working",
+            config: { onEnter: { type: "run_routine", routineId: routine.id } },
+          },
+          {
+            key: "review",
+            name: "Review",
+            kind: "review",
+            config: {
+              approveToStageKey: "done",
+              rejectToStageKey: "cancelled",
+              requireApproval: true,
+              approver: { kind: "agent", id: assigneeAgentId },
+            },
+          },
+          { key: "done", name: "Done", kind: "done" },
+          { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+        ],
+      }).then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      ).finally(() => {
+        writerSettled = true;
+      });
+
+      let observedBlockedLock = false;
+      for (let attempt = 0; attempt < 200 && !writerSettled; attempt += 1) {
+        const [row] = await observerDb.execute<{ blocked: boolean }>(sql`
+          select exists(select 1 from pg_locks where granted = false) as blocked
+        `);
+        if (row?.blocked) {
+          observedBlockedLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(observedBlockedLock).toBe(true);
+      allowDependencyScan();
+      await blocker;
+      const outcome = await writerOutcome;
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status === "rejected") {
+        expect(outcome.error).toMatchObject({
+          status: 409,
+          details: { code: "agent_lifecycle_reference_forbidden", reason: "terminated" },
+        });
+      }
+      await expect(
+        db.select().from(pipelines).where(eq(pipelines.key, "raced-automation")),
+      ).resolves.toHaveLength(0);
+    } finally {
+      allowDependencyScan();
+      await blocker.catch(() => undefined);
+      await blockerDb.$client.end();
+      await observerDb.$client.end();
+    }
+  }, 15_000);
+
+  it("rolls back stage deletion instead of clearing origin on a tombstone-owned automation routine", async () => {
+    const { company, pipeline, byKey } = await seedPipeline();
+    const historicalTombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    await db.insert(agents).values({
+      id: historicalTombstoneId,
+      companyId: company.id,
+      name: "Historical tombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const [routine] = await db.insert(routines).values({
+      companyId: company.id,
+      title: "Historical origin",
+      assigneeAgentId: historicalTombstoneId,
+      status: "active",
+      originKind: "pipeline_automation",
+      originId: pipeline.id,
+    }).returning();
+    const stage = byKey.get("in_progress")!;
+    await db.update(pipelineStages).set({
+      config: { onEnter: { type: "run_routine", routineId: routine!.id } },
+    }).where(eq(pipelineStages.id, stage.id));
+    const routineBefore = (await db.select().from(routines).where(eq(routines.id, routine!.id)))[0];
+    const activitiesBefore = await db.select().from(activityLog);
+
+    await expect(svc.deleteStage({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      stageId: stage.id,
+      actor: userActor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+
+    await expect(db.select().from(pipelineStages).where(eq(pipelineStages.id, stage.id)))
+      .resolves.toHaveLength(1);
+    expect((await db.select().from(routines).where(eq(routines.id, routine!.id)))[0]).toEqual(routineBefore);
+    expect(await db.select().from(activityLog)).toEqual(activitiesBefore);
+  });
+
+  it("does not change env or append a revision for a terminated stage automation assignee", async () => {
+    const { company, pipeline, byKey } = await seedPipeline();
+    const terminatedAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: terminatedAgentId,
+      companyId: company.id,
+      name: "Terminated env agent",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const [routine] = await db.insert(routines).values({
+      companyId: company.id,
+      title: "Terminated env automation",
+      assigneeAgentId: terminatedAgentId,
+      status: "active",
+      originKind: "pipeline_automation",
+      originId: pipeline.id,
+      env: null,
+    }).returning();
+    const stage = byKey.get("in_progress")!;
+    await db.update(pipelineStages).set({
+      config: { onEnter: { type: "run_routine", routineId: routine!.id } },
+    }).where(eq(pipelineStages.id, stage.id));
+    const routineBefore = (await db.select().from(routines).where(eq(routines.id, routine!.id)))[0];
+    const revisionsBefore = await db.select().from(routineRevisions).where(eq(routineRevisions.routineId, routine!.id));
+    const activitiesBefore = await db.select().from(activityLog);
+
+    await expect(svc.updateStageAutomationEnv({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      stageId: stage.id,
+      env: null,
+      actor: userActor,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "agent_not_assignable", reason: "assignee_terminated" },
+    });
+
+    expect((await db.select().from(routines).where(eq(routines.id, routine!.id)))[0]).toEqual(routineBefore);
+    expect(await db.select().from(routineRevisions).where(eq(routineRevisions.routineId, routine!.id)))
+      .toEqual(revisionsBefore);
+    expect(await db.select().from(activityLog)).toEqual(activitiesBefore);
   });
 
   it("auto-advances after retry creates a fresh terminal child rollup", async () => {

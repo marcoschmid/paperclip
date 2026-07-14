@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -23,9 +23,14 @@ import {
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
   type SourceTrustMetadata,
+  type AgentLifecycleCanaryGate,
+  type AgentLifecycleSystemReplacementProof,
+  agentLifecycleSystemReplacementProofSchema,
+  agentLifecycleSchema,
 } from "@paperclipai/shared";
 import {
   agents,
+  agentPortfolioMaintenanceGates,
   agentConfigRevisions,
   agentRuntimeState,
   agentTaskSessions,
@@ -53,6 +58,7 @@ import {
   projectWorkspaces,
   routineRevisions,
   routineRuns,
+  routineTriggers,
   routines,
   workspaceOperations,
 } from "@paperclipai/db";
@@ -75,6 +81,8 @@ import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
+import { accessService } from "./access.js";
+import { agentInstructionsService } from "./agent-instructions.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -90,6 +98,10 @@ import {
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
+import {
+  assertHistoricalAgentTombstoneMutable,
+  isHistoricalAgentTombstoneId,
+} from "./agent-retirement-historical-tombstones.js";
 import {
   classifyRunLiveness,
   type RunLivenessClassificationInput,
@@ -135,7 +147,17 @@ import {
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import { isProcessGroupAlive } from "./local-service-supervisor.js";
+import {
+  captureSpawnedLocalProcessIdentity,
+  type LocalProcessIdentity,
+  verifyStoredLocalProcessIdentity,
+} from "./local-process-identity.js";
+import {
+  finalizeHeartbeatRunWithoutSignalWithinFence,
+  terminateHeartbeatRunProcessWithinFence,
+  type HeartbeatRunProcessFenceContext,
+} from "./heartbeat-run-process-fence.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -175,6 +197,11 @@ import { productivityReviewService } from "./productivity-review.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
+import { agentMaintenanceLeaseService } from "./agent-maintenance-leases.js";
+import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
   shouldCancelRunsForNonInvokableAgent,
@@ -198,6 +225,9 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
+  PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+  extractPaperclipLifecycleCanaryResultFromFinalSummary,
+  parsePaperclipLifecycleCanaryResult,
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -224,18 +254,124 @@ import {
 } from "./low-trust-runtime-containment.js";
 import { resolveCoreTrustPreset, type TrustPresetResolution } from "./trust-preset-resolver.js";
 import {
+  createAgentConfigurationFingerprint,
   createEffectiveRunConfigFingerprints,
   createEffectiveRunConfigSubcategoryFingerprints,
   EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
   type EffectiveRunConfigFingerprints,
   type EffectiveRunConfigSecretManifestEntry,
 } from "./effective-run-config-fingerprints.js";
+import {
+  computeAgentLifecycleConfigFingerprint,
+  createAgentLifecycleValidationReceipt,
+  hashAgentLifecycleContent,
+  parseAgentLifecycleCanaryGate,
+  parseAgentLifecycleGate,
+  resolveAgentLifecycleDesiredSkills,
+  satisfyAgentLifecycleFreshSession,
+  validateAgentLifecycleCanaryReceipt,
+} from "./agent-lifecycle.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+const LIFECYCLE_CANARY_RESULT_PROOF_KEY = "lifecycleCanaryResultV1";
+
+type PersistedLifecycleCanaryResultProof = {
+  schemaVersion: "1.0.0";
+  source: "adapter_final_summary";
+  outcome: "passed";
+  evidence: string;
+  companyId: string;
+  agentId: string;
+  runId: string;
+  canaryIssueId: string;
+  receiptHash: string;
+  configFingerprint: string;
+  finalSummarySha256: string;
+};
+
+function createPersistedLifecycleCanaryResultProof(input: {
+  summary: unknown;
+  companyId: string;
+  agentId: string;
+  runId: string;
+  canaryIssueId: string;
+  receiptHash: string;
+  configFingerprint: string;
+}): PersistedLifecycleCanaryResultProof | null {
+  const parsed = extractPaperclipLifecycleCanaryResultFromFinalSummary(input.summary);
+  if (!parsed || typeof input.summary !== "string") return null;
+  const evidence = redactSensitiveText(parsed.evidence);
+  if (evidence !== parsed.evidence) return null;
+  const sanitized = parsePaperclipLifecycleCanaryResult([
+    PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+    JSON.stringify({ outcome: "passed", evidence }),
+  ].join("\n"));
+  if (!sanitized) return null;
+  return {
+    schemaVersion: "1.0.0",
+    source: "adapter_final_summary",
+    outcome: "passed",
+    evidence: sanitized.evidence,
+    companyId: input.companyId,
+    agentId: input.agentId,
+    runId: input.runId,
+    canaryIssueId: input.canaryIssueId,
+    receiptHash: input.receiptHash,
+    configFingerprint: input.configFingerprint,
+    finalSummarySha256: `sha256:${createHash("sha256").update(input.summary, "utf8").digest("hex")}`,
+  };
+}
+
+function parsePersistedLifecycleCanaryResultProof(
+  value: unknown,
+  expected: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    canaryIssueId: string;
+    receiptHash: string;
+    configFingerprint: string;
+  },
+): PersistedLifecycleCanaryResultProof | null {
+  const proof = parseObject(value);
+  const exactKeys = [
+    "agentId",
+    "canaryIssueId",
+    "companyId",
+    "configFingerprint",
+    "evidence",
+    "finalSummarySha256",
+    "outcome",
+    "receiptHash",
+    "runId",
+    "schemaVersion",
+    "source",
+  ];
+  if (Object.keys(proof).sort().join(",") !== exactKeys.join(",")) return null;
+  if (
+    proof.schemaVersion !== "1.0.0"
+    || proof.source !== "adapter_final_summary"
+    || proof.outcome !== "passed"
+    || proof.companyId !== expected.companyId
+    || proof.agentId !== expected.agentId
+    || proof.runId !== expected.runId
+    || proof.canaryIssueId !== expected.canaryIssueId
+    || proof.receiptHash !== expected.receiptHash
+    || proof.configFingerprint !== expected.configFingerprint
+    || typeof proof.evidence !== "string"
+    || typeof proof.finalSummarySha256 !== "string"
+    || !/^sha256:[a-f0-9]{64}$/.test(proof.finalSummarySha256)
+  ) return null;
+  const parsed = parsePaperclipLifecycleCanaryResult([
+    PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+    JSON.stringify({ outcome: "passed", evidence: proof.evidence }),
+  ].join("\n"));
+  return parsed ? proof as PersistedLifecycleCanaryResultProof : null;
+}
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -282,6 +418,80 @@ export function sanitizeHeartbeatTaskSessionParamsForStorage(input: {
     rawParams: input.sessionParamsJson,
     sanitizedParams: sanitized,
   });
+}
+
+export type HeartbeatTaskSessionUpsertInput = {
+  companyId: string;
+  agentId: string;
+  adapterType: string;
+  taskKey: string;
+  sessionParamsJson: Record<string, unknown> | null;
+  sessionDisplayId: string | null;
+  lastRunId: string | null;
+  lastError: string | null;
+};
+
+export async function upsertHeartbeatTaskSession(
+  targetDb: Db,
+  input: HeartbeatTaskSessionUpsertInput,
+) {
+  const agentId = canonicalizeAgentReferenceId(input.agentId);
+  const canonicalInput = { ...input, agentId };
+  const sessionParamsJson = sanitizeHeartbeatTaskSessionParamsForStorage(canonicalInput);
+  const lastError = input.lastError ? redactSensitiveText(input.lastError) : input.lastError;
+  return withAgentStartLock(agentId, () => targetDb.transaction(async (tx) => {
+    const txDb = tx as unknown as Db;
+    await lockAgentLifecycleReference(txDb, {
+      companyId: input.companyId,
+      agentId,
+    });
+    const existing = await txDb
+      .select()
+      .from(agentTaskSessions)
+      .where(
+        and(
+          eq(agentTaskSessions.companyId, input.companyId),
+          eq(agentTaskSessions.agentId, agentId),
+          eq(agentTaskSessions.adapterType, input.adapterType),
+          eq(agentTaskSessions.taskKey, input.taskKey),
+        ),
+      )
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (existing) {
+      return txDb
+        .update(agentTaskSessions)
+        .set({
+          sessionParamsJson,
+          sessionDisplayId: input.sessionDisplayId,
+          lastRunId: input.lastRunId,
+          lastError,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(agentTaskSessions.id, existing.id),
+          eq(agentTaskSessions.companyId, input.companyId),
+          eq(agentTaskSessions.agentId, agentId),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+    }
+
+    return txDb
+      .insert(agentTaskSessions)
+      .values({
+        companyId: input.companyId,
+        agentId,
+        adapterType: input.adapterType,
+        taskKey: input.taskKey,
+        sessionParamsJson,
+        sessionDisplayId: input.sessionDisplayId,
+        lastRunId: input.lastRunId,
+        lastError,
+      })
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  }));
 }
 
 function restoreDeterministicPaperclipSessionKey(input: {
@@ -359,13 +569,37 @@ export function sanitizeHeartbeatRunPatchForStorage(
   return sanitizeHeartbeatRunWriteForStorage(patch, identity);
 }
 
+const TRUSTED_HEARTBEAT_WAKE_REASON_CODES = new Set([
+  "agent.lifecycle_pending_canary_only",
+  "agent.not_invokable",
+  "agent.portfolio_maintenance_gate",
+  "budget.blocked",
+  "company.inactive",
+  "heartbeat.daily_cost_limit",
+  "heartbeat.daily_run_limit",
+  "heartbeat.disabled",
+  "heartbeat.scheduling_suppressed",
+  "heartbeat.timer.no_actionable_work",
+  "heartbeat.wakeOnDemand.disabled",
+  "issue_tree_hold_active",
+]);
+
 function sanitizeHeartbeatWakeupWriteForStorage<
   T extends Partial<typeof agentWakeupRequests.$inferInsert>,
 >(write: T): T {
   const sanitized: Partial<typeof agentWakeupRequests.$inferInsert> = { ...write };
-  for (const key of ["reason", "error"] as const) {
-    const value = sanitized[key];
-    if (typeof value === "string") sanitized[key] = redactSensitiveText(value);
+  const reason = sanitized.reason;
+  if (typeof reason === "string") {
+    // These are closed, server-owned machine codes. Some happen to match the
+    // deliberately broad JWT detector (for example heartbeat.wakeOnDemand.disabled),
+    // so preserve only exact known values and redact every other reason normally.
+    sanitized.reason = TRUSTED_HEARTBEAT_WAKE_REASON_CODES.has(reason)
+      ? reason
+      : redactSensitiveText(reason);
+  }
+  const error = sanitized.error;
+  if (typeof error === "string") {
+    sanitized.error = redactSensitiveText(error);
   }
   const payload = sanitized.payload;
   if (payload && typeof payload === "object" && !Array.isArray(payload)) {
@@ -969,6 +1203,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     const readiness = await evaluateCodexCredentialReadiness({
       env: process.env,
       companyId: input.companyId,
+      agentId: input.agentId,
       configuredCodexHome: readNonEmptyString(resolvedEnv.CODEX_HOME),
       configuredApiKey: readNonEmptyString(resolvedEnv.OPENAI_API_KEY),
     });
@@ -4747,7 +4982,7 @@ export function buildPaperclipTaskMarkdown(input: {
 // A positive liveness check means some process currently owns the PID.
 // On Linux, PIDs can be recycled, so this is a best-effort signal rather
 // than proof that the original child is still alive.
-function isProcessAlive(pid: number | null | undefined) {
+export function isProcessAlive(pid: number | null | undefined) {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -4758,30 +4993,6 @@ function isProcessAlive(pid: number | null | undefined) {
     if (code === "ESRCH") return false;
     return false;
   }
-}
-
-async function terminateHeartbeatRunProcess(input: {
-  pid: number | null | undefined;
-  processGroupId: number | null | undefined;
-  graceMs?: number;
-}) {
-  const pid = input.pid ?? null;
-  const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
-
-  await terminateLocalService(
-    {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
-          ? processGroupId
-          : null,
-    },
-    input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
-  );
 }
 
 function buildProcessLossMessage(run: {
@@ -5024,7 +5235,1547 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export interface EnqueueLifecycleCanaryRunInput {
+  agentId: string;
+  companyId: string;
+  canaryIssueId: string;
+  receipt: AgentLifecycleCanaryGate;
+  expectedAgentUpdatedAt: Date;
+  requestedByUserId: string;
+  systemReplacementProof?: AgentLifecycleSystemReplacementProof;
+}
+
+export interface LifecycleCanaryIsolationBlocker {
+  code:
+    | "issue_scope_invalid"
+    | "active_run"
+    | "active_wakeup"
+    | "active_routine"
+    | "enabled_routine_trigger"
+    | "received_routine_run";
+  message: string;
+}
+
+export async function inspectLifecycleCanaryIsolation(
+  db: Db,
+  input: { agentId: string; companyId: string; canaryIssueId: string },
+) {
+  const [assignedIssues, activeRun, activeWakeup, activeRoutine, activeTrigger, activeRoutineRun] = await Promise.all([
+    db.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, input.companyId),
+      eq(issues.assigneeAgentId, input.agentId),
+      notInArray(issues.status, ["done", "cancelled"]),
+    )),
+    db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId),
+      inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+    )).limit(1).then((rows) => rows[0] ?? null),
+    db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, input.companyId),
+      eq(agentWakeupRequests.agentId, input.agentId),
+      inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+    )).limit(1).then((rows) => rows[0] ?? null),
+    db.select({ id: routines.id }).from(routines).where(and(
+      eq(routines.companyId, input.companyId),
+      eq(routines.assigneeAgentId, input.agentId),
+      eq(routines.status, "active"),
+    )).limit(1).then((rows) => rows[0] ?? null),
+    db.select({ id: routineTriggers.id })
+      .from(routineTriggers)
+      .innerJoin(routines, and(eq(routines.id, routineTriggers.routineId), eq(routines.companyId, input.companyId)))
+      .where(and(eq(routines.assigneeAgentId, input.agentId), eq(routineTriggers.enabled, true)))
+      .limit(1)
+      .then((rows) => rows[0] ?? null),
+    db.select({ id: routineRuns.id })
+      .from(routineRuns)
+      .innerJoin(routines, and(eq(routines.id, routineRuns.routineId), eq(routines.companyId, input.companyId)))
+      .where(and(eq(routines.assigneeAgentId, input.agentId), eq(routineRuns.status, "received")))
+      .limit(1)
+      .then((rows) => rows[0] ?? null),
+  ]);
+  const blockers: LifecycleCanaryIsolationBlocker[] = [];
+  if (assignedIssues.length !== 1 || assignedIssues[0]?.id !== input.canaryIssueId) {
+    blockers.push({
+      code: "issue_scope_invalid",
+      message: "Exactly the declared canary issue must be the agent's only assigned nonterminal issue.",
+    });
+  }
+  if (activeRun) blockers.push({ code: "active_run", message: "An active heartbeat run already exists." });
+  if (activeWakeup) blockers.push({ code: "active_wakeup", message: "An active wake request already exists." });
+  if (activeRoutine) blockers.push({ code: "active_routine", message: "An active assigned routine exists." });
+  if (activeTrigger) blockers.push({ code: "enabled_routine_trigger", message: "An enabled assigned routine trigger exists." });
+  if (activeRoutineRun) blockers.push({ code: "received_routine_run", message: "A received assigned routine run exists." });
+  return { ready: blockers.length === 0, blockers };
+}
+
+type PendingLifecycleCanaryAuthorization =
+  | { ok: true; pending: false; reason: "not_pending" }
+  | { ok: true; pending: true; reason: "authorized"; receipt: AgentLifecycleCanaryGate }
+  | {
+      ok: false;
+      pending: true;
+      reason:
+        | "lifecycle_invalid"
+        | "receipt_invalid"
+        | "run_binding_mismatch"
+        | "context_binding_mismatch"
+        | "fresh_session_required";
+    };
+
+/**
+ * Complete-mediation guard for the exceptional pending-lifecycle execution path.
+ * A normal (non-pending) agent is deliberately out of scope; a raw lifecycle
+ * declaring `pending` must prove the full server receipt and run/context binding.
+ */
+export function authorizePendingLifecycleCanaryRun(input: {
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "metadata">;
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "id" | "agentId" | "companyId" | "contextSnapshot" | "sessionIdBefore" | "createdAt" | "startedAt"
+  >;
+  now?: Date;
+}): PendingLifecycleCanaryAuthorization {
+  const metadata = parseObject(input.agent.metadata);
+  const rawLifecycle = parseObject(metadata.lifecycle);
+  if (rawLifecycle.lastCanaryResult !== "pending") {
+    return { ok: true, pending: false, reason: "not_pending" };
+  }
+  const lifecycleResult = agentLifecycleSchema.safeParse(metadata.lifecycle);
+  if (
+    !lifecycleResult.success
+    || lifecycleResult.data.lastCanaryResult !== "pending"
+    || !lifecycleResult.data.canaryIssueId
+  ) {
+    return { ok: false, pending: true, reason: "lifecycle_invalid" };
+  }
+  const receipt = parseAgentLifecycleCanaryGate(metadata.lifecycleCanaryGate);
+  if (!receipt) return { ok: false, pending: true, reason: "receipt_invalid" };
+  if (
+    input.run.id !== receipt.runId
+    || input.run.agentId !== input.agent.id
+    || input.run.companyId !== input.agent.companyId
+  ) {
+    return { ok: false, pending: true, reason: "run_binding_mismatch" };
+  }
+  const context = parseObject(input.run.contextSnapshot);
+  const binding = parseObject(context.lifecycleCanary);
+  if (
+    context.forceFreshSession !== true
+    || context.issueId !== lifecycleResult.data.canaryIssueId
+    || context.taskId !== lifecycleResult.data.canaryIssueId
+    || context.taskKey !== `lifecycle-canary:${lifecycleResult.data.canaryIssueId}`
+    || context.wakeReason !== "lifecycle_pending_canary"
+    || binding.agentId !== input.agent.id
+    || binding.companyId !== input.agent.companyId
+    || binding.canaryIssueId !== lifecycleResult.data.canaryIssueId
+    || binding.runId !== input.run.id
+    || binding.configFingerprint !== receipt.configFingerprint
+    || binding.receiptHash !== receipt.receiptHash
+  ) {
+    return { ok: false, pending: true, reason: "context_binding_mismatch" };
+  }
+  if (input.run.sessionIdBefore !== null) {
+    return { ok: false, pending: true, reason: "fresh_session_required" };
+  }
+  const receiptResult = validateAgentLifecycleCanaryReceipt({
+    receipt,
+    agentId: input.agent.id,
+    companyId: input.agent.companyId,
+    canaryIssueId: lifecycleResult.data.canaryIssueId,
+    runId: input.run.id,
+    configFingerprint: receipt.configFingerprint,
+    now: input.now ?? input.run.startedAt ?? input.run.createdAt,
+  });
+  return receiptResult.ok
+    ? { ok: true, pending: true, reason: "authorized", receipt: receiptResult.receipt }
+    : { ok: false, pending: true, reason: "receipt_invalid" };
+}
+
+function hasLifecycleCanaryRunBinding(input: {
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "metadata">;
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "agentId" | "companyId" | "contextSnapshot">;
+}) {
+  const context = parseObject(input.run.contextSnapshot);
+  const binding = parseObject(context.lifecycleCanary);
+  const canaryIssueId = readNonEmptyString(binding.canaryIssueId);
+  return Boolean(
+    canaryIssueId
+    && input.run.agentId === input.agent.id
+    && input.run.companyId === input.agent.companyId
+    && context.forceFreshSession === true
+    && context.issueId === canaryIssueId
+    && context.taskId === canaryIssueId
+    && context.taskKey === `lifecycle-canary:${canaryIssueId}`
+    && context.wakeReason === "lifecycle_pending_canary"
+    && binding.agentId === input.agent.id
+    && binding.companyId === input.agent.companyId
+    && binding.runId === input.run.id
+    && typeof binding.configFingerprint === "string"
+    && /^v1:sha256:[a-f0-9]{64}$/.test(binding.configFingerprint)
+    && typeof binding.receiptHash === "string"
+    && /^v1:sha256:[a-f0-9]{64}$/.test(binding.receiptHash)
+  );
+}
+
+export async function enqueueLifecycleCanaryRun(
+  db: Db,
+  input: EnqueueLifecycleCanaryRunInput,
+) {
+  assertHistoricalAgentTombstoneMutable(input.agentId);
+  const homeOpsAgentId = "2f430983-3c02-4e58-90e3-821ae00f80c2";
+  const systemProofResult = agentLifecycleSystemReplacementProofSchema.safeParse(
+    input.systemReplacementProof,
+  );
+  if (input.agentId === homeOpsAgentId && !systemProofResult.success) {
+    throw conflict("Chief of Home Ops canary requires the exact workspace project proof", {
+      code: "agent_lifecycle_canary_system_proof_required",
+    });
+  }
+  if (input.agentId !== homeOpsAgentId && input.systemReplacementProof !== undefined) {
+    throw conflict("System replacement proof is not valid for this canary agent", {
+      code: "agent_lifecycle_canary_system_proof_forbidden",
+    });
+  }
+  const systemReplacementReceipt = systemProofResult.success
+    ? {
+      ...systemProofResult.data,
+      runId: input.receipt.runId,
+      canaryIssueId: input.canaryIssueId,
+      configFingerprint: input.receipt.configFingerprint,
+    }
+    : null;
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`
+      select id from agents
+      where id = ${input.agentId} and company_id = ${input.companyId}
+      for update
+    `);
+    await tx.execute(sql`
+      select id from issues
+      where id = ${input.canaryIssueId} and company_id = ${input.companyId}
+      for update
+    `);
+
+    const agent = await tx
+      .select()
+      .from(agents)
+      .where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!agent) throw notFound("Agent not found");
+    if (agent.status !== "paused") {
+      throw conflict("Lifecycle canary bootstrap requires a paused agent", {
+        code: "agent_lifecycle_canary_status_invalid",
+      });
+    }
+    if (agent.updatedAt.getTime() !== input.expectedAgentUpdatedAt.getTime()) {
+      throw conflict("Agent configuration changed before lifecycle canary queueing", {
+        code: "agent_lifecycle_canary_agent_changed",
+      });
+    }
+    const metadata = parseObject(agent.metadata);
+    const lifecycleResult = agentLifecycleSchema.safeParse(metadata.lifecycle);
+    if (
+      !lifecycleResult.success
+      || lifecycleResult.data.lastCanaryResult !== "pending"
+      || lifecycleResult.data.canaryIssueId !== input.canaryIssueId
+    ) {
+      throw conflict("Agent no longer has the requested pending lifecycle canary", {
+        code: "agent_lifecycle_canary_lifecycle_invalid",
+      });
+    }
+    const receiptResult = validateAgentLifecycleCanaryReceipt({
+      receipt: input.receipt,
+      agentId: input.agentId,
+      companyId: input.companyId,
+      canaryIssueId: input.canaryIssueId,
+      runId: input.receipt.runId,
+      configFingerprint: input.receipt.configFingerprint,
+    });
+    if (!receiptResult.ok) {
+      throw conflict("Lifecycle canary receipt is invalid", {
+        code: "agent_lifecycle_canary_receipt_invalid",
+        reason: receiptResult.reason,
+      });
+    }
+
+    const assignedNonterminalIssues = await tx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.assigneeAgentId, input.agentId),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ));
+    if (
+      assignedNonterminalIssues.length !== 1
+      || assignedNonterminalIssues[0]?.id !== input.canaryIssueId
+    ) {
+      throw conflict("Lifecycle canary requires exactly one assigned nonterminal issue", {
+        code: "agent_lifecycle_canary_issue_scope_invalid",
+      });
+    }
+
+    const [activeRun, activeWakeup, activeRoutine, activeTrigger, activeRoutineRun] = await Promise.all([
+      tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+      )).limit(1).then((rows) => rows[0] ?? null),
+      tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+      )).limit(1).then((rows) => rows[0] ?? null),
+      tx.select({ id: routines.id }).from(routines).where(and(
+        eq(routines.companyId, input.companyId),
+        eq(routines.assigneeAgentId, input.agentId),
+        eq(routines.status, "active"),
+      )).limit(1).then((rows) => rows[0] ?? null),
+      tx.select({ id: routineTriggers.id })
+        .from(routineTriggers)
+        .innerJoin(routines, and(
+          eq(routines.id, routineTriggers.routineId),
+          eq(routines.companyId, input.companyId),
+        ))
+        .where(and(
+          eq(routines.assigneeAgentId, input.agentId),
+          eq(routineTriggers.enabled, true),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      tx.select({ id: routineRuns.id })
+        .from(routineRuns)
+        .innerJoin(routines, and(
+          eq(routines.id, routineRuns.routineId),
+          eq(routines.companyId, input.companyId),
+        ))
+        .where(and(
+          eq(routines.assigneeAgentId, input.agentId),
+          eq(routineRuns.status, "received"),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+    const isolationConflict = activeRun
+      ? "agent_lifecycle_canary_active_run"
+      : activeWakeup
+        ? "agent_lifecycle_canary_active_wakeup"
+        : activeRoutine
+          ? "agent_lifecycle_canary_active_routine"
+          : activeTrigger
+            ? "agent_lifecycle_canary_active_trigger"
+            : activeRoutineRun
+              ? "agent_lifecycle_canary_active_routine_run"
+              : null;
+    if (isolationConflict) {
+      throw conflict("Lifecycle canary isolation preconditions are not satisfied", {
+        code: isolationConflict,
+      });
+    }
+
+    const wakeupRequestId = randomUUID();
+    const contextSnapshot = {
+      issueId: input.canaryIssueId,
+      taskId: input.canaryIssueId,
+      taskKey: `lifecycle-canary:${input.canaryIssueId}`,
+      wakeReason: "lifecycle_pending_canary",
+      forceFreshSession: true,
+      lifecycleCanary: {
+        agentId: input.agentId,
+        companyId: input.companyId,
+        canaryIssueId: input.canaryIssueId,
+        runId: input.receipt.runId,
+        configFingerprint: input.receipt.configFingerprint,
+        receiptHash: input.receipt.receiptHash,
+        ...(systemReplacementReceipt ? { systemReplacementReceipt } : {}),
+      },
+    };
+    const nextMetadata: Record<string, unknown> = { ...metadata, lifecycleCanaryGate: input.receipt };
+    delete nextMetadata.lifecycleGate;
+    const updatedAgent = await tx
+      .update(agents)
+      .set({
+        status: "idle",
+        pauseReason: null,
+        pausedAt: null,
+        metadata: nextMetadata,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(agents.id, input.agentId),
+        eq(agents.companyId, input.companyId),
+        eq(agents.status, "paused"),
+      ))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!updatedAgent) {
+      throw conflict("Lifecycle canary bootstrap lost its atomic agent lock", {
+        code: "agent_lifecycle_canary_race_lost",
+      });
+    }
+
+    const [wakeupRequest] = await tx.insert(agentWakeupRequests).values(
+      sanitizeHeartbeatWakeupWriteForStorage({
+        id: wakeupRequestId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        source: "on_demand",
+        triggerDetail: "system",
+        reason: "lifecycle_pending_canary",
+        payload: { issueId: input.canaryIssueId },
+        // The DB fence deliberately excludes this inert staging state.  The
+        // wake becomes claimable only after its receipt-bound run exists and
+        // the guarded update below can validate both halves atomically.
+        status: "lifecycle_canary_staging",
+        requestedByActorType: "user",
+        requestedByActorId: input.requestedByUserId,
+        idempotencyKey: `lifecycle-canary:${input.receipt.runId}`,
+      }),
+    ).returning();
+    const [run] = await tx.insert(heartbeatRuns).values(
+      sanitizeHeartbeatRunWriteForStorage({
+        id: input.receipt.runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "on_demand",
+        triggerDetail: "system",
+        status: "queued",
+        responsibleUserId: input.requestedByUserId,
+        wakeupRequestId,
+        contextSnapshot,
+        sessionIdBefore: null,
+      }, { companyId: input.companyId, agentId: input.agentId }),
+    ).returning();
+    const [queuedWakeupRequest] = await tx
+      .update(agentWakeupRequests)
+      .set({ status: "queued", runId: input.receipt.runId, updatedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .returning();
+
+    await tx.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "user",
+      actorId: input.requestedByUserId,
+      action: "agent.lifecycle_canary_queued",
+      entityType: "agent",
+      entityId: input.agentId,
+      agentId: input.agentId,
+      runId: run!.id,
+      details: {
+        canaryIssueId: input.canaryIssueId,
+        runId: run!.id,
+        configFingerprint: input.receipt.configFingerprint,
+        receiptExpiresAt: input.receipt.expiresAt,
+      },
+      createdAt: new Date(),
+    });
+
+    return {
+      agent: updatedAgent,
+      wakeupRequest: queuedWakeupRequest ?? { ...wakeupRequest!, status: "queued", runId: input.receipt.runId },
+      run: run!,
+      receipt: input.receipt,
+    };
+  }, { isolationLevel: "serializable" });
+}
+
+async function resolveLifecycleFingerprintInput(
+  db: Db,
+  agent: typeof agents.$inferSelect,
+  lifecycle: unknown,
+) {
+  const adapterConfig = parseObject(agent.adapterConfig);
+  const runtimeConfig = parseObject(agent.runtimeConfig);
+  const desiredSkillEntries = readPaperclipSkillSyncPreference(adapterConfig).desiredSkillEntries;
+  const [grants, instructionsBundle, skillCatalog] = await Promise.all([
+    accessService(db).listPrincipalGrants(agent.companyId, "agent", agent.id),
+    agentInstructionsService().exportFiles(agent),
+    desiredSkillEntries.length > 0
+      ? db
+        .select({
+          id: companySkillsTable.id,
+          key: companySkillsTable.key,
+          currentVersionId: companySkillsTable.currentVersionId,
+        })
+        .from(companySkillsTable)
+        .where(and(
+          eq(companySkillsTable.companyId, agent.companyId),
+          inArray(companySkillsTable.key, desiredSkillEntries.map((entry) => entry.key)),
+        ))
+      : Promise.resolve([]),
+  ]);
+  const companyProfileSha256 = [adapterConfig.companyProfileSha256, runtimeConfig.companyProfileSha256]
+    .find((value): value is string =>
+      typeof value === "string" && /^(?:sha256:|v1:sha256:)[a-f0-9]{64}$/.test(value),
+    ) ?? null;
+  return {
+    agentId: agent.id,
+    companyId: agent.companyId,
+    adapterType: agent.adapterType,
+    adapterConfig,
+    runtimeConfig,
+    permissions: parseObject(agent.permissions),
+    grants: grants.map((grant) => ({
+      permissionKey: grant.permissionKey,
+      scope: grant.scope && typeof grant.scope === "object" && !Array.isArray(grant.scope)
+        ? parseObject(grant.scope)
+        : null,
+    })),
+    desiredSkills: resolveAgentLifecycleDesiredSkills(desiredSkillEntries, skillCatalog),
+    lifecycle,
+    contextPackSha256: hashAgentLifecycleContent(instructionsBundle.files[instructionsBundle.entryFile] ?? ""),
+    managedInstructionsSha256: hashAgentLifecycleContent(instructionsBundle.files),
+    companyProfileSha256,
+  };
+}
+
+type LifecycleBoundaryTransaction = Pick<Db, "select" | "update" | "insert" | "execute">;
+
+function normalizeLifecycleCanaryFailureOutcome(outcome: string) {
+  if (outcome === "fresh session requirement failed") return "fresh_session_required";
+  if (outcome === "Lifecycle canary scope changed; manual review required") return "scope_invalid";
+  return outcome.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 120)
+    || "failed";
+}
+
+async function failLifecycleCanaryInTransaction(input: {
+  tx: LifecycleBoundaryTransaction;
+  agent: typeof agents.$inferSelect;
+  run: typeof heartbeatRuns.$inferSelect;
+  lifecycle: Extract<ReturnType<typeof agentLifecycleSchema.safeParse>, { success: true }>["data"];
+  receipt: AgentLifecycleCanaryGate;
+  outcome: string;
+  reasonDetail: string;
+  now: Date;
+  terminateRun?: boolean;
+}) {
+  const normalizedOutcome = normalizeLifecycleCanaryFailureOutcome(input.outcome);
+  const failedLifecycle = agentLifecycleSchema.parse({
+    ...input.lifecycle,
+    lastCanaryResult: "failed",
+    lastCanaryAt: input.now.toISOString(),
+    pause: {
+      reasonCode: "canary_failed",
+      reasonDetail: input.reasonDetail,
+      outcome: normalizedOutcome,
+      repairIssueId: input.receipt.canaryIssueId,
+      startedAt: input.now.toISOString(),
+      expiresAt: new Date(input.now.getTime() + 7 * 24 * 60 * 60 * 1_000).toISOString(),
+    },
+  });
+  const metadata = parseObject(input.agent.metadata);
+  const nextMetadata: Record<string, unknown> = { ...metadata, lifecycle: failedLifecycle };
+  delete nextMetadata.lifecycleCanaryGate;
+  delete nextMetadata.lifecycleGate;
+
+  // A pending lifecycle canary is the only execution admitted through an
+  // active portfolio-maintenance fence. Terminalize its exact bound run and
+  // wake while the one-shot gate is still present; the database triggers can
+  // then validate the full receipt/run/wake binding. Everything remains in
+  // this transaction, so any later agent/issue/audit failure rolls it back.
+  if (input.terminateRun) {
+    if (!input.run.wakeupRequestId) {
+      throw conflict("Lifecycle canary failure is missing its exact wake binding", {
+        code: "agent_lifecycle_canary_failure_wake_missing",
+      });
+    }
+    const errorCode = `agent_lifecycle_canary_${normalizedOutcome}`;
+    const cancelledRun = await input.tx.update(heartbeatRuns).set({
+      status: "cancelled",
+      error: input.reasonDetail,
+      errorCode,
+      finishedAt: input.now,
+      updatedAt: input.now,
+    }).where(and(
+      eq(heartbeatRuns.id, input.run.id),
+      eq(heartbeatRuns.companyId, input.agent.companyId),
+      eq(heartbeatRuns.agentId, input.agent.id),
+      inArray(heartbeatRuns.status, ["queued", "running"]),
+    )).returning({ id: heartbeatRuns.id }).then((rows) => rows[0] ?? null);
+    if (!cancelledRun) {
+      throw conflict("Lifecycle canary failure lost its exact run CAS", {
+        code: "agent_lifecycle_canary_failure_run_race",
+      });
+    }
+    const cancelledWake = await input.tx.update(agentWakeupRequests).set({
+      status: "cancelled",
+      error: input.reasonDetail,
+      finishedAt: input.now,
+      updatedAt: input.now,
+    }).where(and(
+      eq(agentWakeupRequests.id, input.run.wakeupRequestId),
+      eq(agentWakeupRequests.companyId, input.agent.companyId),
+      eq(agentWakeupRequests.agentId, input.agent.id),
+      eq(agentWakeupRequests.runId, input.run.id),
+      eq(agentWakeupRequests.reason, "lifecycle_pending_canary"),
+      eq(agentWakeupRequests.idempotencyKey, `lifecycle-canary:${input.run.id}`),
+      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.receipt.canaryIssueId}`,
+      inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+    )).returning({ id: agentWakeupRequests.id }).then((rows) => rows[0] ?? null);
+    if (!cancelledWake) {
+      throw conflict("Lifecycle canary failure lost its exact wake CAS", {
+        code: "agent_lifecycle_canary_failure_wake_race",
+      });
+    }
+  }
+
+  const updatedAgent = await input.tx
+    .update(agents)
+    .set({
+      status: "paused",
+      pauseReason: "system",
+      pausedAt: input.now,
+      errorReason: `Lifecycle canary ${normalizedOutcome}; manual review required`,
+      metadata: nextMetadata,
+      updatedAt: input.now,
+    })
+    .where(and(
+      eq(agents.id, input.agent.id),
+      eq(agents.companyId, input.agent.companyId),
+      sql`${agents.metadata} -> 'lifecycleCanaryGate' ->> 'receiptHash' = ${input.receipt.receiptHash}`,
+    ))
+    .returning({ id: agents.id })
+    .then((rows) => rows[0] ?? null);
+  if (!updatedAgent) {
+    if (input.terminateRun) {
+      throw conflict("Lifecycle canary failure lost its exact agent CAS", {
+        code: "agent_lifecycle_canary_failure_agent_race",
+      });
+    }
+    return false;
+  }
+
+  const blockedIssue = await input.tx.update(issues).set({
+    status: "blocked",
+    checkoutRunId: null,
+    executionRunId: null,
+    executionAgentNameKey: null,
+    executionLockedAt: null,
+    updatedAt: input.now,
+  }).where(and(
+    eq(issues.id, input.receipt.canaryIssueId),
+    eq(issues.companyId, input.agent.companyId),
+  )).returning({ id: issues.id }).then((rows) => rows[0] ?? null);
+  if (!blockedIssue) {
+    throw conflict("Lifecycle canary failure lost its exact issue CAS", {
+      code: "agent_lifecycle_canary_failure_issue_race",
+    });
+  }
+  await input.tx.insert(issueComments).values({
+    companyId: input.agent.companyId,
+    issueId: input.receipt.canaryIssueId,
+    authorType: "system",
+    createdByRunId: input.run.id,
+    body: `Lifecycle canary failed closed (${normalizedOutcome}). ${input.reasonDetail}`,
+  });
+  return true;
+}
+
+export async function finalizePendingLifecycleCanaryFailure(
+  db: Db,
+  runId: string,
+  outcome: string,
+  reasonDetailOverride?: string,
+) {
+  const normalizedOutcome = normalizeLifecycleCanaryFailureOutcome(outcome);
+  const reasonDetail = redactSensitiveText(
+    reasonDetailOverride ?? (outcome === "failed"
+      ? "The bounded lifecycle canary failed and requires reviewed repair before another attempt."
+      : `The bounded lifecycle canary ended with ${outcome}; reviewed repair is required before another attempt.`),
+  );
+
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select id from heartbeat_runs where id = ${runId} for update`);
+    const run = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!run) return { updated: false, reason: "run_missing" as const };
+    await tx.execute(sql`
+      select id from agents
+      where id = ${run.agentId} and company_id = ${run.companyId}
+      for update
+    `);
+    const agent = await tx
+      .select()
+      .from(agents)
+      .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!agent) return { updated: false, reason: "agent_missing" as const };
+    const metadata = parseObject(agent.metadata);
+    const lifecycleResult = agentLifecycleSchema.safeParse(metadata.lifecycle);
+    const receipt = parseAgentLifecycleCanaryGate(metadata.lifecycleCanaryGate);
+    if (
+      !lifecycleResult.success
+      || lifecycleResult.data.lastCanaryResult !== "pending"
+      || !lifecycleResult.data.canaryIssueId
+      || !receipt
+      || receipt.agentId !== agent.id
+      || receipt.companyId !== agent.companyId
+      || receipt.canaryIssueId !== lifecycleResult.data.canaryIssueId
+      || receipt.runId !== run.id
+    ) {
+      return { updated: false, reason: "canary_not_bound" as const };
+    }
+    const hashValidation = validateAgentLifecycleCanaryReceipt({
+      receipt,
+      agentId: agent.id,
+      companyId: agent.companyId,
+      canaryIssueId: receipt.canaryIssueId,
+      runId: receipt.runId,
+      configFingerprint: receipt.configFingerprint,
+      // Failure cleanup remains possible after expiry, but only for a receipt
+      // whose deterministic server hash was valid at issuance.
+      now: new Date(receipt.issuedAt),
+    });
+    if (!hashValidation.ok) return { updated: false, reason: "receipt_invalid" as const };
+
+    await tx.execute(sql`
+      select id from issues
+      where id = ${receipt.canaryIssueId} and company_id = ${agent.companyId}
+      for update
+    `);
+    const updated = await failLifecycleCanaryInTransaction({
+      tx,
+      agent,
+      run,
+      lifecycle: lifecycleResult.data,
+      receipt,
+      outcome: normalizedOutcome,
+      reasonDetail,
+      now: new Date(),
+    });
+    return updated
+      ? { updated: true, reason: "canary_failed_closed" as const }
+      : { updated: false, reason: "receipt_changed" as const };
+  }, { isolationLevel: "serializable" });
+}
+
+export type LifecycleCanaryBoundaryPhase = "claim" | "execute";
+export type LifecycleCanaryBoundaryFailureReason =
+  | "authorization_invalid"
+  | "lifecycle_not_pending"
+  | "run_status_invalid"
+  | "fingerprint_mismatch"
+  | "issue_scope_invalid"
+  | "issue_checkout_invalid"
+  | "other_active_run"
+  | "other_active_wakeup"
+  | "current_wakeup_invalid"
+  | "active_routine"
+  | "enabled_routine_trigger"
+  | "received_routine_run";
+
+export async function revalidatePendingLifecycleCanaryBoundary(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    phase: LifecycleCanaryBoundaryPhase;
+    now?: Date;
+    claim?: { responsibleUserId: string; claimedAt: Date };
+  },
+) {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`
+      select id from agents
+      where id = ${input.agentId} and company_id = ${input.companyId}
+      for update
+    `);
+    await tx.execute(sql`
+      select id from heartbeat_runs
+      where id = ${input.runId} and company_id = ${input.companyId}
+      for update
+    `);
+    const [agent, run] = await Promise.all([
+      tx.select().from(agents).where(and(
+        eq(agents.id, input.agentId),
+        eq(agents.companyId, input.companyId),
+      )).then((rows) => rows[0] ?? null),
+      tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      )).then((rows) => rows[0] ?? null),
+    ]);
+    if (!agent || !run) {
+      return { ok: false, pending: true, reason: "authorization_invalid" as const };
+    }
+    const metadata = parseObject(agent.metadata);
+    const rawLifecycleResult = parseObject(metadata.lifecycle).lastCanaryResult;
+    const canaryBoundRun = hasLifecycleCanaryRunBinding({ agent, run });
+    if (rawLifecycleResult !== "pending" && !canaryBoundRun) {
+      return { ok: true, pending: false, reason: "not_pending" as const };
+    }
+    const lifecycleResult = agentLifecycleSchema.safeParse(metadata.lifecycle);
+    const receipt = parseAgentLifecycleCanaryGate(metadata.lifecycleCanaryGate);
+    const now = input.now ?? new Date();
+    const authorization = authorizePendingLifecycleCanaryRun({ agent, run, now });
+    if (
+      !lifecycleResult.success
+      || !receipt
+    ) {
+      return { ok: false, pending: true, reason: "authorization_invalid" as const };
+    }
+
+    await tx.execute(sql`
+      select id from issues
+      where id = ${receipt.canaryIssueId} and company_id = ${input.companyId}
+      for update
+    `);
+    const expectedRunStatus = input.phase === "claim" ? "queued" : "running";
+    let reason: LifecycleCanaryBoundaryFailureReason | null = rawLifecycleResult !== "pending"
+      ? "lifecycle_not_pending"
+      : !authorization.ok || !authorization.pending || authorization.reason !== "authorized"
+      ? "authorization_invalid"
+      : run.status !== expectedRunStatus
+        ? "run_status_invalid"
+        : null;
+    if (!reason) {
+      const fingerprintInput = await resolveLifecycleFingerprintInput(
+        tx as unknown as Db,
+        agent,
+        lifecycleResult.data,
+      );
+      if (computeAgentLifecycleConfigFingerprint(fingerprintInput) !== receipt.configFingerprint) {
+        reason = "fingerprint_mismatch";
+      }
+    }
+
+    const [canaryIssue, assignedIssues, activeRuns, activeWakeups, activeRoutine, activeTrigger, activeRoutineRun] = await Promise.all([
+      tx.select().from(issues).where(and(
+        eq(issues.id, receipt.canaryIssueId),
+        eq(issues.companyId, input.companyId),
+      )).then((rows) => rows[0] ?? null),
+      tx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.assigneeAgentId, input.agentId),
+        notInArray(issues.status, ["done", "cancelled"]),
+      )),
+      tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+      )),
+      tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+      )),
+      tx.select({ id: routines.id }).from(routines).where(and(
+        eq(routines.companyId, input.companyId),
+        eq(routines.assigneeAgentId, input.agentId),
+        eq(routines.status, "active"),
+      )).limit(1).then((rows) => rows[0] ?? null),
+      tx.select({ id: routineTriggers.id })
+        .from(routineTriggers)
+        .innerJoin(routines, and(
+          eq(routines.id, routineTriggers.routineId),
+          eq(routines.companyId, input.companyId),
+        ))
+        .where(and(eq(routines.assigneeAgentId, input.agentId), eq(routineTriggers.enabled, true)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      tx.select({ id: routineRuns.id })
+        .from(routineRuns)
+        .innerJoin(routines, and(
+          eq(routines.id, routineRuns.routineId),
+          eq(routines.companyId, input.companyId),
+        ))
+        .where(and(eq(routines.assigneeAgentId, input.agentId), eq(routineRuns.status, "received")))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+    if (!reason && (assignedIssues.length !== 1 || assignedIssues[0]?.id !== receipt.canaryIssueId)) {
+      reason = "issue_scope_invalid";
+    }
+    const issueCheckoutValid = input.phase === "claim"
+      ? Boolean(
+          canaryIssue
+          && canaryIssue.assigneeAgentId === input.agentId
+          && (canaryIssue.status === "backlog" || canaryIssue.status === "todo")
+          && canaryIssue.checkoutRunId === null
+          && canaryIssue.executionRunId === null
+          && canaryIssue.completedAt === null,
+        )
+      : Boolean(
+          canaryIssue
+          && canaryIssue.assigneeAgentId === input.agentId
+          && canaryIssue.status === "in_progress"
+          && canaryIssue.checkoutRunId === run.id
+          && canaryIssue.executionRunId === run.id
+          && canaryIssue.completedAt === null,
+        );
+    if (!reason && !issueCheckoutValid) reason = "issue_checkout_invalid";
+    if (!reason && activeRuns.some((row) => row.id !== run.id)) reason = "other_active_run";
+    if (!reason && activeRuns.every((row) => row.id !== run.id)) reason = "run_status_invalid";
+    if (!reason && activeWakeups.some((row) => row.id !== run.wakeupRequestId)) reason = "other_active_wakeup";
+    if (!reason && (!run.wakeupRequestId || activeWakeups.every((row) => row.id !== run.wakeupRequestId))) {
+      reason = "current_wakeup_invalid";
+    }
+    if (!reason && activeRoutine) reason = "active_routine";
+    if (!reason && activeTrigger) reason = "enabled_routine_trigger";
+    if (!reason && activeRoutineRun) reason = "received_routine_run";
+
+    if (reason) {
+      const outcome = `${input.phase}_${reason}`;
+      const reasonDetail = `Lifecycle canary ${input.phase} boundary rejected current state: ${reason}.`;
+      await failLifecycleCanaryInTransaction({
+        tx,
+        agent,
+        run,
+        lifecycle: lifecycleResult.data,
+        receipt,
+        outcome,
+        reasonDetail,
+        now,
+        terminateRun: true,
+      });
+      return { ok: false, pending: true, reason };
+    }
+
+    if (input.phase === "claim" && input.claim) {
+      const previousIssueStatus = canaryIssue!.status;
+      const checkedOutIssue = await tx.update(issues).set({
+        status: "in_progress",
+        checkoutRunId: run.id,
+        executionRunId: run.id,
+        executionAgentNameKey: normalizeAgentNameKey(agent.name),
+        executionLockedAt: input.claim.claimedAt,
+        startedAt: input.claim.claimedAt,
+        updatedAt: input.claim.claimedAt,
+      }).where(and(
+        eq(issues.id, receipt.canaryIssueId),
+        eq(issues.companyId, input.companyId),
+        eq(issues.assigneeAgentId, input.agentId),
+        inArray(issues.status, ["backlog", "todo"]),
+        isNull(issues.checkoutRunId),
+        isNull(issues.executionRunId),
+        isNull(issues.completedAt),
+      )).returning({ id: issues.id }).then((rows) => rows[0] ?? null);
+      if (!checkedOutIssue) {
+        throw conflict("Lifecycle canary checkout lost its atomic issue CAS", {
+          code: "agent_lifecycle_canary_checkout_race",
+        });
+      }
+      const claimed = await tx.update(heartbeatRuns).set({
+        status: "running",
+        responsibleUserId: input.claim.responsibleUserId,
+        startedAt: run.startedAt ?? input.claim.claimedAt,
+        updatedAt: input.claim.claimedAt,
+      }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) {
+        throw conflict("Lifecycle canary claim lost its atomic run CAS", {
+          code: "agent_lifecycle_canary_claim_race",
+        });
+      }
+      await tx.insert(activityLog).values({
+        companyId: input.companyId,
+        actorType: "agent",
+        actorId: input.agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: receipt.canaryIssueId,
+        agentId: input.agentId,
+        runId: run.id,
+        details: {
+          status: "in_progress",
+          _previous: { status: previousIssueStatus },
+          source: "lifecycle_canary_server_checkout",
+        },
+        createdAt: input.claim.claimedAt,
+      });
+      return { ok: true, pending: true, reason: "authorized" as const, run: claimed };
+    }
+    return { ok: true, pending: true, reason: "authorized" as const, run };
+  }, { isolationLevel: "serializable" });
+}
+
+async function promotePendingLifecycleCanaryAfterSuccessfulRun(
+  db: Db,
+  input: {
+    id: string;
+    companyId: string;
+    agentId: string;
+    agentConfigurationFingerprint: string;
+  },
+  initialAgent: typeof agents.$inferSelect,
+) {
+  const persistedRun = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.id, input.id),
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId),
+    ))
+    .then((rows) => rows[0] ?? null);
+  if (!persistedRun || persistedRun.status !== "succeeded") {
+    await finalizePendingLifecycleCanaryFailure(db, input.id, "run_state_invalid", "The successful canary run state no longer matches its receipt.");
+    return { updated: false, reason: "canary_run_invalid" as const };
+  }
+  const authorization = authorizePendingLifecycleCanaryRun({
+    agent: initialAgent,
+    run: persistedRun,
+  });
+  if (!authorization.ok || !authorization.pending) {
+    await finalizePendingLifecycleCanaryFailure(db, input.id, "authorization_invalid", "The successful canary run authorization no longer matches its receipt.");
+    return { updated: false, reason: "canary_authorization_invalid" as const };
+  }
+  const adapterConfig = parseObject(initialAgent.adapterConfig);
+  const runtimeConfig = parseObject(initialAgent.runtimeConfig);
+  const currentAgentConfigurationFingerprint = createAgentConfigurationFingerprint({
+    adapterType: initialAgent.adapterType,
+    adapterConfig,
+    runtimeConfig,
+  });
+  if (input.agentConfigurationFingerprint !== currentAgentConfigurationFingerprint) {
+    await finalizePendingLifecycleCanaryFailure(db, input.id, "run_config_mismatch", "The effective run configuration changed before canary promotion.");
+    return { updated: false, reason: "canary_run_config_mismatch" as const };
+  }
+  const metadata = parseObject(initialAgent.metadata);
+  const lifecycleResult = agentLifecycleSchema.safeParse(metadata.lifecycle);
+  if (
+    !lifecycleResult.success
+    || lifecycleResult.data.lastCanaryResult !== "pending"
+    || lifecycleResult.data.canaryIssueId !== authorization.receipt.canaryIssueId
+  ) {
+    await finalizePendingLifecycleCanaryFailure(db, input.id, "lifecycle_invalid", "The lifecycle contract changed before canary promotion.");
+    return { updated: false, reason: "canary_lifecycle_invalid" as const };
+  }
+  const pendingFingerprintInput = await resolveLifecycleFingerprintInput(
+    db,
+    initialAgent,
+    lifecycleResult.data,
+  );
+  const currentLifecycleFingerprint = computeAgentLifecycleConfigFingerprint(pendingFingerprintInput);
+  if (currentLifecycleFingerprint !== authorization.receipt.configFingerprint) {
+    await finalizePendingLifecycleCanaryFailure(db, input.id, "fingerprint_mismatch", "The full lifecycle fingerprint changed before canary promotion.");
+    return { updated: false, reason: "canary_fingerprint_mismatch" as const };
+  }
+
+  const now = new Date();
+
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`
+      select id from agents
+      where id = ${initialAgent.id} and company_id = ${initialAgent.companyId}
+      for update
+    `);
+    await tx.execute(sql`
+      select id from heartbeat_runs
+      where id = ${persistedRun.id} and company_id = ${persistedRun.companyId}
+      for update
+    `);
+    await tx.execute(sql`
+      select id from issues
+      where id = ${authorization.receipt.canaryIssueId} and company_id = ${initialAgent.companyId}
+      for update
+    `);
+    const [lockedAgent, lockedRun, lockedCanaryIssue] = await Promise.all([
+      tx.select().from(agents).where(and(
+        eq(agents.id, initialAgent.id),
+        eq(agents.companyId, initialAgent.companyId),
+      )).then((rows) => rows[0] ?? null),
+      tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, persistedRun.id),
+        eq(heartbeatRuns.companyId, persistedRun.companyId),
+      )).then((rows) => rows[0] ?? null),
+      tx.select().from(issues).where(and(
+        eq(issues.id, authorization.receipt.canaryIssueId),
+        eq(issues.companyId, initialAgent.companyId),
+      )).then((rows) => rows[0] ?? null),
+    ]);
+    if (!lockedAgent || !lockedRun || !lockedCanaryIssue) {
+      return { updated: false, reason: "canary_race_lost" as const };
+    }
+    const lockedAuthorization = authorizePendingLifecycleCanaryRun({
+      agent: lockedAgent,
+      run: lockedRun,
+    });
+    const configurationUnchanged = lockedAgent.updatedAt.getTime() === initialAgent.updatedAt.getTime();
+    const lockedRunValid = lockedRun.status === "succeeded";
+    const lockedMetadataForPromotion = parseObject(lockedAgent.metadata);
+    const lockedLifecycleForPromotion = agentLifecycleSchema.safeParse(lockedMetadataForPromotion.lifecycle);
+    let lockedFingerprintInput: Awaited<ReturnType<typeof resolveLifecycleFingerprintInput>> | null = null;
+    let lockedLifecycleFingerprintValid = false;
+    if (
+      lockedAuthorization.ok
+      && lockedAuthorization.pending
+      && lockedLifecycleForPromotion.success
+      && lockedLifecycleForPromotion.data.lastCanaryResult === "pending"
+      && lockedLifecycleForPromotion.data.canaryIssueId === lockedAuthorization.receipt.canaryIssueId
+    ) {
+      lockedFingerprintInput = await resolveLifecycleFingerprintInput(
+        tx as unknown as Db,
+        lockedAgent,
+        lockedLifecycleForPromotion.data,
+      );
+      lockedLifecycleFingerprintValid =
+        computeAgentLifecycleConfigFingerprint(lockedFingerprintInput)
+        === lockedAuthorization.receipt.configFingerprint;
+    }
+
+    const [canaryCompletionAudit, otherAssignedIssues, activeRuns, activeWakeups, activeRoutine, activeTrigger, activeRoutineRun] = await Promise.all([
+      tx.select({ id: activityLog.id }).from(activityLog).where(and(
+        eq(activityLog.companyId, lockedAgent.companyId),
+        eq(activityLog.actorType, "agent"),
+        eq(activityLog.actorId, lockedAgent.id),
+        eq(activityLog.action, "issue.updated"),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, authorization.receipt.canaryIssueId),
+        eq(activityLog.agentId, lockedAgent.id),
+        eq(activityLog.runId, lockedRun.id),
+        sql`${activityLog.details} ->> 'status' = 'done'`,
+        sql`${activityLog.details} -> '_previous' ->> 'status' = 'in_progress'`,
+      )).limit(1).then((rows) => rows[0] ?? null),
+      tx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.companyId, lockedAgent.companyId),
+        eq(issues.assigneeAgentId, lockedAgent.id),
+        ne(issues.id, authorization.receipt.canaryIssueId),
+        notInArray(issues.status, ["done", "cancelled"]),
+      )),
+      tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, lockedAgent.companyId),
+        eq(heartbeatRuns.agentId, lockedAgent.id),
+        inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+      )),
+      tx.select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, lockedAgent.companyId),
+        eq(agentWakeupRequests.agentId, lockedAgent.id),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+      )),
+      tx.select({ id: routines.id }).from(routines).where(and(
+        eq(routines.companyId, lockedAgent.companyId),
+        eq(routines.assigneeAgentId, lockedAgent.id),
+        eq(routines.status, "active"),
+      )).limit(1).then((rows) => rows[0] ?? null),
+      tx.select({ id: routineTriggers.id })
+        .from(routineTriggers)
+        .innerJoin(routines, and(
+          eq(routines.id, routineTriggers.routineId),
+          eq(routines.companyId, lockedAgent.companyId),
+        ))
+        .where(and(eq(routines.assigneeAgentId, lockedAgent.id), eq(routineTriggers.enabled, true)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      tx.select({ id: routineRuns.id })
+        .from(routineRuns)
+        .innerJoin(routines, and(
+          eq(routines.id, routineRuns.routineId),
+          eq(routines.companyId, lockedAgent.companyId),
+        ))
+        .where(and(eq(routines.assigneeAgentId, lockedAgent.id), eq(routineRuns.status, "received")))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+    const sharedIsolationValid = otherAssignedIssues.length === 0
+      && activeRuns.every((row) => row.id === persistedRun.id)
+      && activeWakeups.every((row) => row.id === persistedRun.wakeupRequestId)
+      && !activeRoutine
+      && !activeTrigger
+      && !activeRoutineRun;
+    const apiCompletionValid = lockedCanaryIssue.status === "done"
+      && lockedCanaryIssue.assigneeAgentId === lockedAgent.id
+      && Boolean(canaryCompletionAudit);
+    const serverMediatedWakeValid = Boolean(
+      lockedRun.wakeupRequestId
+      && activeWakeups.length === 1
+      && activeWakeups[0]?.id === lockedRun.wakeupRequestId
+      && activeWakeups[0]?.status === "claimed",
+    );
+    const serverMediatedProof =
+      lockedAuthorization.ok && lockedAuthorization.pending
+        ? parsePersistedLifecycleCanaryResultProof(
+            parseObject(lockedRun.resultJson)[LIFECYCLE_CANARY_RESULT_PROOF_KEY],
+            {
+              companyId: lockedAgent.companyId,
+              agentId: lockedAgent.id,
+              runId: lockedRun.id,
+              canaryIssueId: lockedAuthorization.receipt.canaryIssueId,
+              receiptHash: lockedAuthorization.receipt.receiptHash,
+              configFingerprint: lockedAuthorization.receipt.configFingerprint,
+            },
+          )
+        : null;
+    let serverMediatedCompletionValid = false;
+    if (
+      lockedAuthorization.ok
+      && lockedAuthorization.pending
+      && configurationUnchanged
+      && lockedRunValid
+      && lockedLifecycleFingerprintValid
+      && sharedIsolationValid
+      && serverMediatedWakeValid
+      && serverMediatedProof
+      && lockedCanaryIssue.assigneeAgentId === lockedAgent.id
+      && lockedCanaryIssue.status === "in_progress"
+      && lockedCanaryIssue.checkoutRunId === lockedRun.id
+      && lockedCanaryIssue.executionRunId === lockedRun.id
+      && lockedCanaryIssue.completedAt === null
+    ) {
+      const previousStatus = lockedCanaryIssue.status;
+      const completedIssue = await tx.update(issues).set({
+        status: "done",
+        completedAt: now,
+        cancelledAt: null,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: now,
+      }).where(and(
+        eq(issues.id, lockedCanaryIssue.id),
+        eq(issues.companyId, lockedAgent.companyId),
+        eq(issues.assigneeAgentId, lockedAgent.id),
+        eq(issues.status, "in_progress"),
+        eq(issues.checkoutRunId, lockedRun.id),
+        eq(issues.executionRunId, lockedRun.id),
+        isNull(issues.completedAt),
+      )).returning({ id: issues.id }).then((rows) => rows[0] ?? null);
+      if (completedIssue) {
+        await tx.insert(activityLog).values({
+          companyId: lockedAgent.companyId,
+          actorType: "agent",
+          actorId: lockedAgent.id,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: lockedCanaryIssue.id,
+          agentId: lockedAgent.id,
+          runId: lockedRun.id,
+          details: {
+            status: "done",
+            _previous: { status: previousStatus },
+            source: "lifecycle_canary_adapter_result_v1",
+            finalSummarySha256: serverMediatedProof.finalSummarySha256,
+          },
+        });
+        await tx.insert(issueComments).values({
+          companyId: lockedAgent.companyId,
+          issueId: lockedCanaryIssue.id,
+          authorType: "agent",
+          authorAgentId: lockedAgent.id,
+          createdByRunId: lockedRun.id,
+          body: [
+            "Lifecycle canary passed via a server-mediated, run-bound adapter result.",
+            "",
+            `Evidence: ${serverMediatedProof.evidence}`,
+          ].join("\n"),
+        });
+        serverMediatedCompletionValid = true;
+      }
+    }
+    const isolated = sharedIsolationValid && (apiCompletionValid || serverMediatedCompletionValid);
+
+    if (
+      !lockedAuthorization.ok
+      || !lockedAuthorization.pending
+      || !configurationUnchanged
+      || !lockedRunValid
+      || !lockedLifecycleFingerprintValid
+      || !isolated
+    ) {
+      logger.warn({
+        runId: lockedRun.id,
+        agentId: lockedAgent.id,
+        lifecycleCanaryPromotionGuards: {
+          authorizationValid: lockedAuthorization.ok && lockedAuthorization.pending,
+          configurationUnchanged,
+          runValid: lockedRunValid,
+          lifecycleFingerprintValid: lockedLifecycleFingerprintValid,
+          sharedIsolationValid,
+          apiCompletionValid,
+          serverMediatedCompletionValid,
+          serverMediatedWakeValid,
+          serverMediatedProofValid: Boolean(serverMediatedProof),
+          canaryIssueStatus: lockedCanaryIssue.status,
+          canaryIssueAssigned: lockedCanaryIssue.assigneeAgentId === lockedAgent.id,
+          canaryIssueCheckoutBound: lockedCanaryIssue.checkoutRunId === lockedRun.id,
+          canaryIssueExecutionBound: lockedCanaryIssue.executionRunId === lockedRun.id,
+          canaryIssueIncomplete: lockedCanaryIssue.completedAt === null,
+          otherAssignedIssueCount: otherAssignedIssues.length,
+          activeRunCount: activeRuns.length,
+          activeWakeCount: activeWakeups.length,
+          activeRoutine: Boolean(activeRoutine),
+          activeTrigger: Boolean(activeTrigger),
+          activeRoutineRun: Boolean(activeRoutineRun),
+        },
+      }, "lifecycle canary promotion failed closed on a scope guard");
+      const lockedMetadata = parseObject(lockedAgent.metadata);
+      const lockedReceipt = parseAgentLifecycleCanaryGate(lockedMetadata.lifecycleCanaryGate);
+      const lockedLifecycle = agentLifecycleSchema.safeParse(lockedMetadata.lifecycle);
+      if (
+        lockedReceipt?.receiptHash === authorization.receipt.receiptHash
+        && lockedLifecycle.success
+        && lockedLifecycle.data.lastCanaryResult === "pending"
+      ) {
+        const reasonDetail = "The lifecycle canary scope changed before promotion; reviewed repair is required.";
+        const failedLifecycle = agentLifecycleSchema.parse({
+          ...lockedLifecycle.data,
+          lastCanaryResult: "failed",
+          lastCanaryAt: now.toISOString(),
+          pause: {
+            reasonCode: "canary_failed",
+            reasonDetail,
+            outcome: "scope_invalid",
+            repairIssueId: authorization.receipt.canaryIssueId,
+            startedAt: now.toISOString(),
+            expiresAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1_000).toISOString(),
+          },
+        });
+        const failedMetadata: Record<string, unknown> = {
+          ...lockedMetadata,
+          lifecycle: failedLifecycle,
+        };
+        delete failedMetadata.lifecycleCanaryGate;
+        delete failedMetadata.lifecycleGate;
+        await tx.update(agents).set({
+          status: "paused",
+          pauseReason: "system",
+          pausedAt: now,
+          errorReason: "Lifecycle canary scope changed; manual review required",
+          metadata: failedMetadata,
+          updatedAt: now,
+        }).where(and(eq(agents.id, lockedAgent.id), eq(agents.companyId, lockedAgent.companyId)));
+        await tx.update(issues).set({
+          status: "blocked",
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        }).where(and(
+          eq(issues.id, authorization.receipt.canaryIssueId),
+          eq(issues.companyId, lockedAgent.companyId),
+        ));
+        await tx.insert(issueComments).values({
+          companyId: lockedAgent.companyId,
+          issueId: authorization.receipt.canaryIssueId,
+          authorType: "system",
+          createdByRunId: lockedRun.id,
+          body: `Lifecycle canary failed closed (scope_invalid). ${reasonDetail}`,
+        });
+      }
+      return {
+        updated: false,
+        reason: !isolated ? "canary_scope_invalid" as const : "canary_race_lost" as const,
+      };
+    }
+
+    if (!lockedLifecycleForPromotion.success || !lockedFingerprintInput) {
+      throw conflict("Lifecycle canary promotion lost its locked fingerprint input", {
+        code: "agent_lifecycle_canary_locked_fingerprint_missing",
+      });
+    }
+    const passedLifecycle = {
+      ...lockedLifecycleForPromotion.data,
+      lastCanaryResult: "passed" as const,
+      lastCanaryAt: now.toISOString(),
+      canaryIssueId: authorization.receipt.canaryIssueId,
+    };
+    const normalGate = createAgentLifecycleValidationReceipt({
+      fingerprintInput: { ...lockedFingerprintInput, lifecycle: passedLifecycle },
+      satisfiedRunId: persistedRun.id,
+      now,
+    });
+    const promotedMetadata: Record<string, unknown> = {
+      ...parseObject(lockedAgent.metadata),
+      lifecycle: passedLifecycle,
+      lifecycleGate: normalGate,
+    };
+    delete promotedMetadata.lifecycleCanaryGate;
+    const lockedContextSnapshot = parseObject(lockedRun.contextSnapshot);
+    const lockedCanaryBinding = parseObject(lockedContextSnapshot.lifecycleCanary);
+    const promotedRun = await tx.update(heartbeatRuns).set({
+      contextSnapshot: {
+        ...lockedContextSnapshot,
+        lifecycleCanary: {
+          ...lockedCanaryBinding,
+          configFingerprint: normalGate.configFingerprint,
+          receiptHash: normalGate.receiptHash,
+        },
+      },
+      updatedAt: now,
+    }).where(and(
+      eq(heartbeatRuns.id, lockedRun.id),
+      eq(heartbeatRuns.companyId, lockedRun.companyId),
+      eq(heartbeatRuns.agentId, lockedRun.agentId),
+      eq(heartbeatRuns.status, "succeeded"),
+      sql`${heartbeatRuns.contextSnapshot} -> 'lifecycleCanary' ->> 'receiptHash' = ${authorization.receipt.receiptHash}`,
+    )).returning({ id: heartbeatRuns.id }).then((rows) => rows[0] ?? null);
+    if (!promotedRun) {
+      throw conflict("Lifecycle canary promotion lost its atomic run receipt CAS", {
+        code: "agent_lifecycle_canary_run_promotion_race",
+      });
+    }
+    const updated = await tx.update(agents).set({
+      metadata: promotedMetadata,
+      errorReason: null,
+      updatedAt: now,
+    }).where(and(
+      eq(agents.id, lockedAgent.id),
+      eq(agents.companyId, lockedAgent.companyId),
+      sql`${agents.metadata} -> 'lifecycleCanaryGate' ->> 'receiptHash' = ${authorization.receipt.receiptHash}`,
+    )).returning({ id: agents.id }).then((rows) => rows[0] ?? null);
+    if (!updated) {
+      throw conflict("Lifecycle canary promotion lost its atomic agent receipt CAS", {
+        code: "agent_lifecycle_canary_promotion_race",
+      });
+    }
+    return updated
+      ? { updated: true, reason: "canary_promoted" as const }
+      : { updated: false, reason: "receipt_changed" as const };
+  }, { isolationLevel: "serializable" });
+}
+
+export async function satisfyLifecycleFreshSessionAfterSuccessfulRun(
+  db: Db,
+  run: {
+    id: string;
+    companyId: string;
+    agentId: string;
+    status: string;
+    freshSession: boolean;
+    agentConfigurationFingerprint: string;
+  },
+) {
+  if (isHistoricalAgentTombstoneId(run.agentId)) {
+    return { updated: false, reason: "agent_missing" as const };
+  }
+  if (run.status !== "succeeded") {
+    return { updated: false, reason: "run_not_successful_fresh" as const };
+  }
+  if (!run.freshSession) {
+    const pendingAgent = await db
+      .select({ metadata: agents.metadata })
+      .from(agents)
+      .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (parseObject(parseObject(pendingAgent?.metadata).lifecycle).lastCanaryResult === "pending") {
+      await finalizePendingLifecycleCanaryFailure(db, run.id, "fresh_session_required", "The canary reused an existing session instead of starting fresh.");
+      return { updated: false, reason: "canary_fresh_session_required" as const };
+    }
+    return { updated: false, reason: "run_not_successful_fresh" as const };
+  }
+  const agent = await db
+    .select()
+    .from(agents)
+    .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!agent) return { updated: false, reason: "agent_missing" as const };
+
+  const metadata = parseObject(agent.metadata);
+  if (parseObject(metadata.lifecycle).lastCanaryResult === "pending") {
+    try {
+      return await promotePendingLifecycleCanaryAfterSuccessfulRun(db, run, agent);
+    } catch (error) {
+      await finalizePendingLifecycleCanaryFailure(
+        db,
+        run.id,
+        "promotion_failed",
+        error instanceof Error ? error.message : "Lifecycle canary promotion failed.",
+      );
+      return { updated: false, reason: "canary_promotion_failed" as const };
+    }
+  }
+  const lifecycleGate = parseAgentLifecycleGate(metadata.lifecycleGate);
+  if (!metadata.lifecycle) {
+    return { updated: false, reason: "receipt_missing" as const };
+  }
+  if (!lifecycleGate) {
+    return { updated: false, reason: "receipt_invalid" as const };
+  }
+  const adapterConfig = parseObject(agent.adapterConfig);
+  const runtimeConfig = parseObject(agent.runtimeConfig);
+  const currentAgentConfigurationFingerprint = createAgentConfigurationFingerprint({
+    adapterType: agent.adapterType,
+    adapterConfig,
+    runtimeConfig,
+  });
+  if (run.agentConfigurationFingerprint !== currentAgentConfigurationFingerprint) {
+    return { updated: false, reason: "run_config_mismatch" as const };
+  }
+
+  const desiredSkillEntries = readPaperclipSkillSyncPreference(adapterConfig).desiredSkillEntries;
+  const [grants, instructionsBundle, skillCatalog] = await Promise.all([
+    accessService(db).listPrincipalGrants(agent.companyId, "agent", agent.id),
+    agentInstructionsService().exportFiles(agent),
+    desiredSkillEntries.length > 0
+      ? db
+        .select({
+          id: companySkillsTable.id,
+          key: companySkillsTable.key,
+          currentVersionId: companySkillsTable.currentVersionId,
+        })
+        .from(companySkillsTable)
+        .where(and(
+          eq(companySkillsTable.companyId, agent.companyId),
+          inArray(companySkillsTable.key, desiredSkillEntries.map((entry) => entry.key)),
+        ))
+      : Promise.resolve([]),
+  ]);
+  const desiredSkills = resolveAgentLifecycleDesiredSkills(desiredSkillEntries, skillCatalog);
+  const companyProfileSha256 = [adapterConfig.companyProfileSha256, runtimeConfig.companyProfileSha256]
+    .find((value): value is string =>
+      typeof value === "string" && /^(?:sha256:|v1:sha256:)[a-f0-9]{64}$/.test(value),
+    ) ?? null;
+  const currentLifecycleFingerprint = computeAgentLifecycleConfigFingerprint({
+    agentId: agent.id,
+    companyId: agent.companyId,
+    adapterType: agent.adapterType,
+    adapterConfig,
+    runtimeConfig,
+    permissions: parseObject(agent.permissions),
+    grants: grants.map((grant) => ({
+      permissionKey: grant.permissionKey,
+      scope: grant.scope && typeof grant.scope === "object" && !Array.isArray(grant.scope)
+        ? parseObject(grant.scope)
+        : null,
+    })),
+    desiredSkills,
+    lifecycle: metadata.lifecycle,
+    contextPackSha256: hashAgentLifecycleContent(instructionsBundle.files[instructionsBundle.entryFile] ?? ""),
+    managedInstructionsSha256: hashAgentLifecycleContent(instructionsBundle.files),
+    companyProfileSha256,
+  });
+  const satisfiedGate = satisfyAgentLifecycleFreshSession({
+    agentId: agent.id,
+    companyId: agent.companyId,
+    gate: lifecycleGate,
+    run: {
+      id: run.id,
+      status: run.status,
+      freshSession: run.freshSession,
+      configFingerprint: currentLifecycleFingerprint,
+    },
+  });
+  if (!satisfiedGate) return { updated: false, reason: "lifecycle_fingerprint_mismatch" as const };
+
+  const updated = await db
+    .update(agents)
+    .set({
+      metadata: { ...metadata, lifecycleGate: satisfiedGate },
+      updatedAt: new Date(),
+    })
+    .where(and(
+      eq(agents.id, agent.id),
+      eq(agents.companyId, agent.companyId),
+      sql`${agents.metadata} -> 'lifecycleGate' ->> 'receiptHash' = ${lifecycleGate.receiptHash}`,
+    ))
+    .returning({ id: agents.id })
+    .then((rows) => rows[0] ?? null);
+  return updated
+    ? { updated: true, reason: "fresh_session_satisfied" as const }
+    : { updated: false, reason: "receipt_changed" as const };
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const maintenanceLeases = agentMaintenanceLeaseService(db);
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -5111,6 +6862,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function hasPortfolioMaintenanceGate(
+    agentId: string,
+    companyId: string,
+    queryDb: Db = db,
+  ) {
+    return queryDb
+      .select({ id: agentPortfolioMaintenanceGates.id })
+      .from(agentPortfolioMaintenanceGates)
+      .where(and(
+        eq(agentPortfolioMaintenanceGates.agentId, agentId),
+        eq(agentPortfolioMaintenanceGates.companyId, companyId),
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+  }
+
+  async function portfolioGateAllowsRun(
+    agent: typeof agents.$inferSelect,
+    run: typeof heartbeatRuns.$inferSelect,
+    queryDb: Db = db,
+  ) {
+    if (!(await hasPortfolioMaintenanceGate(agent.id, agent.companyId, queryDb))) return true;
+    const authorization = authorizePendingLifecycleCanaryRun({ agent, run });
+    return authorization.ok && authorization.pending && authorization.reason === "authorized";
   }
 
   async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined) {
@@ -6630,54 +8407,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function upsertTaskSession(input: {
-    companyId: string;
-    agentId: string;
-    adapterType: string;
-    taskKey: string;
-    sessionParamsJson: Record<string, unknown> | null;
-    sessionDisplayId: string | null;
-    lastRunId: string | null;
-    lastError: string | null;
-  }) {
-    const sessionParamsJson = sanitizeHeartbeatTaskSessionParamsForStorage(input);
-    const lastError = input.lastError ? redactSensitiveText(input.lastError) : input.lastError;
-    const existing = await getTaskSession(
-      input.companyId,
-      input.agentId,
-      input.adapterType,
-      input.taskKey,
-    );
-    if (existing) {
-      return db
-        .update(agentTaskSessions)
-        .set({
-          sessionParamsJson,
-          sessionDisplayId: input.sessionDisplayId,
-          lastRunId: input.lastRunId,
-          lastError,
-          updatedAt: new Date(),
-        })
-        .where(eq(agentTaskSessions.id, existing.id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-    }
-
-    return db
-      .insert(agentTaskSessions)
-      .values({
-        companyId: input.companyId,
-        agentId: input.agentId,
-        adapterType: input.adapterType,
-        taskKey: input.taskKey,
-        sessionParamsJson,
-        sessionDisplayId: input.sessionDisplayId,
-        lastRunId: input.lastRunId,
-        lastError,
-      })
-      .returning()
-      .then((rows) => rows[0] ?? null);
-  }
+  const upsertTaskSession = (input: HeartbeatTaskSessionUpsertInput) =>
+    upsertHeartbeatTaskSession(db, input);
 
   async function clearTaskSessions(
     companyId: string,
@@ -6728,10 +8459,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return ensured;
   }
 
+  function publishRunStatusUpdate(
+    updated: typeof heartbeatRuns.$inferSelect,
+    options: { suppressEvents?: boolean } = {},
+  ) {
+    if (isHeartbeatRunTerminalStatus(updated.status)) {
+      clearHeartbeatRunRuntimeStatus(updated.id);
+    }
+    if (options.suppressEvents) return;
+    publishLiveEvent({
+      companyId: updated.companyId,
+      type: "heartbeat.run.status",
+      payload: {
+        runId: updated.id,
+        agentId: updated.agentId,
+        status: updated.status,
+        invocationSource: updated.invocationSource,
+        triggerDetail: updated.triggerDetail,
+        error: updated.error ?? null,
+        errorCode: updated.errorCode ?? null,
+        startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
+        finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
+      },
+    });
+    publishRunLifecyclePluginEvent(updated);
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    options: { suppressEvents?: boolean } = {},
   ) {
     const sanitizedPatch = sanitizeHeartbeatRunPatchForStorage(patch);
     const updated = await db
@@ -6741,27 +8499,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .returning()
       .then((rows) => rows[0] ?? null);
 
-    if (updated) {
-      if (isHeartbeatRunTerminalStatus(updated.status)) {
-        clearHeartbeatRunRuntimeStatus(updated.id);
-      }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: {
-          runId: updated.id,
-          agentId: updated.agentId,
-          status: updated.status,
-          invocationSource: updated.invocationSource,
-          triggerDetail: updated.triggerDetail,
-          error: updated.error ?? null,
-          errorCode: updated.errorCode ?? null,
-          startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
-          finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
-        },
-      });
-      publishRunLifecyclePluginEvent(updated);
-    }
+    if (updated) publishRunStatusUpdate(updated, options);
 
     return updated;
   }
@@ -7405,13 +9143,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string },
   ) {
-    const startedAt = new Date(meta.startedAt);
+    const identity = await captureSpawnedLocalProcessIdentity(meta);
     return db
       .update(heartbeatRuns)
       .set({
-        processPid: meta.pid,
-        processGroupId: meta.processGroupId,
-        processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
+        processPid: identity.pid,
+        processGroupId: identity.processGroupId,
+        processStartedAt: new Date(identity.processStartedAt),
+        processExecutable: identity.processExecutable,
+        processCommandSha256: identity.processCommandSha256,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, runId))
@@ -9054,6 +10794,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function markTimerHeartbeatChecked(agentId: string, source: WakeupOptions["source"]) {
     if (source !== "timer") return;
+    if (isHistoricalAgentTombstoneId(agentId)) return;
     await db
       .update(agents)
       .set({
@@ -9117,9 +10858,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
+    if (await maintenanceLeases.isAgentLeased(run.agentId)) return null;
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
+      return null;
+    }
+    const lifecycleCanaryAuthorization = authorizePendingLifecycleCanaryRun({ agent, run });
+    const lifecycleCanaryBoundRun = hasLifecycleCanaryRunBinding({ agent, run });
+    if (!(await portfolioGateAllowsRun(agent, run))) return null;
+    if (!lifecycleCanaryAuthorization.ok) {
+      await finalizePendingLifecycleCanaryFailure(
+        db,
+        run.id,
+        "claim_authorization_invalid",
+        `Claim authorization failed: ${lifecycleCanaryAuthorization.reason}`,
+      );
+      await cancelRunInternal(
+        run.id,
+        "Cancelled because the pending lifecycle canary authorization is invalid",
+        { errorCode: "agent_lifecycle_canary_authorization_invalid" },
+      );
       return null;
     }
     const invokability = companyAgents
@@ -9210,17 +10969,74 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const lifecycleCanaryClaim = lifecycleCanaryAuthorization.pending || lifecycleCanaryBoundRun;
+    const claimed = lifecycleCanaryClaim
+      ? await revalidatePendingLifecycleCanaryBoundary(db, {
+        companyId: run.companyId,
+        agentId: run.agentId,
+        runId: run.id,
+        phase: "claim",
+        now: claimedAt,
+        claim: { responsibleUserId, claimedAt },
+      }).then((result) =>
+        result.ok === true && result.pending === true && result.reason === "authorized"
+          ? result.run
+          : null,
+      )
+      : await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        // The maintenance triggers on heartbeat_runs/agent_wakeup_requests
+        // lock the owning agent. Pre-lock it before either dependent row so
+        // concurrent cancellation keeps the canonical Agent -> Run order.
+        const currentAgent = await txDb
+          .select()
+          .from(agents)
+          .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!currentAgent || await hasPortfolioMaintenanceGate(run.agentId, run.companyId, txDb)) {
+          return null;
+        }
+        const currentInvokability = await evaluateAgentInvokabilityFromDb(txDb, currentAgent);
+        if (!currentInvokability.invokable) return null;
+
+        const currentRun = await txDb
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.agentId, run.agentId),
+          ))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!currentRun || currentRun.status !== "queued") return null;
+
+        const updated = await txDb
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            responsibleUserId,
+            startedAt: currentRun.startedAt ?? claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, currentRun.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return null;
+
+        if (updated.wakeupRequestId) {
+          await txDb
+            .update(agentWakeupRequests)
+            .set({ status: "claimed", claimedAt, updatedAt: claimedAt })
+            .where(and(
+              eq(agentWakeupRequests.id, updated.wakeupRequestId),
+              eq(agentWakeupRequests.companyId, updated.companyId),
+              eq(agentWakeupRequests.agentId, updated.agentId),
+            ));
+        }
+        return updated;
+      });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -9240,7 +11056,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     publishRunLifecyclePluginEvent(claimed);
 
-    await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
+    if (lifecycleCanaryClaim) {
+      await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
+    }
 
     // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
     // not at queue time. Guard is idempotent — safe if called more than once.
@@ -9544,7 +11362,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
     failureReason?: string | null,
+    runId?: string,
   ) {
+    if (isHistoricalAgentTombstoneId(agentId)) return;
+    if (outcome !== "succeeded" && runId) {
+      await finalizePendingLifecycleCanaryFailure(
+        db,
+        runId,
+        outcome,
+        failureReason ?? `Lifecycle canary ended with ${outcome}.`,
+      );
+    }
     const existing = await getAgent(agentId);
     if (!existing) return;
 
@@ -9575,7 +11403,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(eq(agents.id, agentId), notInArray(agents.status, ["paused", "terminated"])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -9817,6 +11645,154 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function proveRunProcessIdentityForSignal(run: typeof heartbeatRuns.$inferSelect) {
+    const running = runningProcesses.get(run.id);
+    const hasSignalTarget = [
+      running?.child.pid,
+      running?.processGroupId,
+      run.processPid,
+      run.processGroupId,
+    ].some((value) => typeof value === "number" && Number.isInteger(value) && value > 0);
+    if (!hasSignalTarget) return { kind: "absent" as const, running };
+
+    const verification = await verifyStoredLocalProcessIdentity(run);
+    if (verification.kind === "not_running") {
+      if (run.processGroupId && isProcessGroupAlive(run.processGroupId)) {
+        return {
+          kind: "unproven" as const,
+          reason: "owner_pid_not_running_group_alive",
+          running,
+        };
+      }
+      return { kind: "not_running" as const, running };
+    }
+    if (verification.kind === "unproven") return { ...verification, running };
+    if (
+      running
+      && (
+        running.child.pid !== verification.identity.pid
+        || running.processGroupId !== verification.identity.processGroupId
+      )
+    ) {
+      return { kind: "unproven" as const, reason: "in_memory_identity_mismatch", running };
+    }
+    return { ...verification, running };
+  }
+
+  async function requireRunProcessIdentityForSignal(
+    run: typeof heartbeatRuns.$inferSelect,
+    code: string,
+  ) {
+    const proof = await proveRunProcessIdentityForSignal(run);
+    if (proof.kind === "unproven") {
+      throw conflict("Heartbeat process identity could not be proven before signalling", {
+        code,
+        runId: run.id,
+        reason: proof.reason,
+        manualInterventionRequired: true,
+      });
+    }
+    return proof;
+  }
+
+  async function terminalizeHeartbeatRunWithProcessFence(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agentStatus?: string | null;
+    processProof: Awaited<ReturnType<typeof proveRunProcessIdentityForSignal>>;
+    status: string;
+    patch: Partial<typeof heartbeatRuns.$inferInsert>;
+    wakeupStatus: string;
+    wakeupPatch: Partial<typeof agentWakeupRequests.$inferInsert>;
+    graceMs?: number;
+    suppressEvents?: boolean;
+    allowManualReconcileUnprovenTarget?: boolean;
+  }) {
+    const terminalize = async ({
+      db: fencedDb,
+      run: lockedRun,
+      now,
+    }: HeartbeatRunProcessFenceContext & { now: Date }) => {
+      const sanitizedPatch = sanitizeHeartbeatRunPatchForStorage(input.patch);
+      const updated = await fencedDb
+        .update(heartbeatRuns)
+        .set({ status: input.status, ...sanitizedPatch, updatedAt: now })
+        .where(and(
+          eq(heartbeatRuns.id, lockedRun.id),
+          eq(heartbeatRuns.companyId, lockedRun.companyId),
+          eq(heartbeatRuns.agentId, lockedRun.agentId),
+          eq(heartbeatRuns.status, lockedRun.status),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updated) {
+        throw conflict("Heartbeat run status changed inside process fence", {
+          code: "heartbeat_run_terminal_cas_lost",
+          runId: lockedRun.id,
+        });
+      }
+
+      if (lockedRun.wakeupRequestId) {
+        const sanitizedWakeupPatch = sanitizeHeartbeatWakeupWriteForStorage(input.wakeupPatch);
+        await fencedDb
+          .update(agentWakeupRequests)
+          .set({ status: input.wakeupStatus, ...sanitizedWakeupPatch, updatedAt: now })
+          .where(and(
+            eq(agentWakeupRequests.id, lockedRun.wakeupRequestId),
+            eq(agentWakeupRequests.companyId, lockedRun.companyId),
+            eq(agentWakeupRequests.agentId, lockedRun.agentId),
+          ));
+      }
+      return updated;
+    };
+
+    const expectedAgentStatus = input.agentStatus === undefined
+      ? undefined
+      : input.agentStatus;
+    const validateLocked = async () => {
+      if (input.processProof.kind === "verified") return;
+      const currentRunning = runningProcesses.get(input.run.id);
+      if (
+        currentRunning
+        && (
+          (typeof currentRunning.child.pid === "number" && currentRunning.child.pid > 0)
+          || (typeof currentRunning.processGroupId === "number" && currentRunning.processGroupId > 0)
+        )
+      ) {
+        throw conflict("Heartbeat process target appeared before no-signal terminalization", {
+          code: "heartbeat_process_signal_target_drift",
+          runId: input.run.id,
+        });
+      }
+    };
+    const fencedInput = {
+      db,
+      expectedRun: input.run,
+      ...(expectedAgentStatus !== undefined ? { expectedAgentStatus } : {}),
+      hooks: { validateLocked, terminalize },
+    };
+    const terminalized = input.processProof.kind === "verified"
+      ? (await terminateHeartbeatRunProcessWithinFence({
+          ...fencedInput,
+          identity: input.processProof.identity,
+          graceMs: input.graceMs,
+        })).terminalized
+      : await finalizeHeartbeatRunWithoutSignalWithinFence({
+          ...fencedInput,
+          ...(input.allowManualReconcileUnprovenTarget && input.processProof.kind === "unproven"
+            ? { allowManualReconcileUnprovenTarget: true }
+            : {}),
+        });
+    if (!terminalized) {
+      throw conflict("Heartbeat run reached no terminal result inside process fence", {
+        code: "heartbeat_run_terminal_result_missing",
+        runId: input.run.id,
+      });
+    }
+    runningProcesses.delete(input.run.id);
+    publishRunStatusUpdate(terminalized, { suppressEvents: input.suppressEvents });
+    return terminalized;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -9827,6 +11803,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         run: heartbeatRuns,
         adapterType: agents.adapterType,
         adapterConfig: agents.adapterConfig,
+        agentStatus: agents.status,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -9834,7 +11811,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const reaped: string[] = [];
 
-    for (const { run, adapterType, adapterConfig } of activeRuns) {
+    for (const { run, adapterType, adapterConfig, agentStatus } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
@@ -9849,10 +11826,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
+          const detachedResult = await setRunStatusIfRunning(run.id, "running", {
             error: detachedMessage,
             errorCode: DETACHED_PROCESS_ERROR_CODE,
           });
+          const detachedRun = detachedResult.updated ? detachedResult.run : null;
           if (detachedRun) {
             await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
               eventType: "lifecycle",
@@ -9868,38 +11846,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
-      let descendantOnlyCleanup = false;
-      if (processGroupAlive) {
-        descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
+      const processProof = await proveRunProcessIdentityForSignal(run);
+      const descendantOnlyCleanup = Boolean(processGroupAlive && processProof.kind === "verified");
+      const processIdentityUnprovenReason = processGroupAlive && processProof.kind !== "verified"
+        ? processProof.kind === "unproven"
+          ? processProof.reason
+          : `process_identity_${processProof.kind}`
+        : null;
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const shouldRetry = processIdentityUnprovenReason === null
+        && tracksLocalChild
+        && (!!run.processPid || !!run.processGroupId)
+        && (run.processLossRetryCount ?? 0) < 1;
+      const baseMessage = processIdentityUnprovenReason
+        ? `${buildProcessLossMessage(run)}; process group was not signalled because its Paperclip identity could not be proven (${processIdentityUnprovenReason}); manual intervention is required`
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const processLossErrorCode = processIdentityUnprovenReason
+        ? "process_identity_unproven"
+        : "process_lost";
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
-        finishedAt: now,
-        resultJson: mergeRunStopMetadataForAgent(
-          { adapterType, adapterConfig },
-          "failed",
-          {
-            resultJson: parseObject(run.resultJson),
-            errorCode: "process_lost",
-            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-          },
-        ),
+      let finalizedRun = await terminalizeHeartbeatRunWithProcessFence({
+        run,
+        agentStatus,
+        processProof,
+        status: "failed",
+        patch: {
+          error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+          errorCode: processLossErrorCode,
+          finishedAt: now,
+          resultJson: mergeRunStopMetadataForAgent(
+            { adapterType, adapterConfig },
+            "failed",
+            {
+              resultJson: parseObject(run.resultJson),
+              errorCode: processLossErrorCode,
+              errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+            },
+          ),
+        },
+        wakeupStatus: "failed",
+        wakeupPatch: {
+          finishedAt: now,
+          error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        },
+        ...(processProof.running
+          ? { graceMs: Math.max(1, processProof.running.graceSec) * 1000 }
+          : {}),
+        allowManualReconcileUnprovenTarget: processIdentityUnprovenReason !== null,
       });
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-      });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
@@ -9916,7 +11910,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
         }
       } else {
-        await releaseIssueExecutionAndPromote(finalizedRun);
+        await releaseIssueExecutionAndPromote(finalizedRun, processIdentityUnprovenReason
+          ? { suppressImmediateRecovery: true, suppressDeferredPromotion: true }
+          : undefined);
       }
 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
@@ -9934,8 +11930,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage);
-      await startNextQueuedRunForAgent(run.agentId);
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, run.id);
+      if (!processIdentityUnprovenReason) await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
@@ -10078,6 +12074,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (getSchedulingSuppression().suppressed) return [];
 
     return withAgentStartLock(agentId, async () => {
+      if (await maintenanceLeases.isAgentLeased(agentId)) return [];
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -10140,6 +12137,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
+        if (await maintenanceLeases.isAgentLeased(agentId)) break;
         const claimed = await claimQueuedRun(queuedRun, companyAgents);
         if (claimed) claimedRuns.push(claimed);
       }
@@ -10154,6 +12152,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  async function enqueueLifecycleCanary(input: EnqueueLifecycleCanaryRunInput) {
+    const company = await db
+      .select({ status: companies.status })
+      .from(companies)
+      .where(eq(companies.id, input.companyId))
+      .then((rows) => rows[0] ?? null);
+    if (!company || company.status !== "active") {
+      throw conflict("Company is not active", {
+        code: "agent_lifecycle_canary_company_inactive",
+        status: company?.status ?? "missing",
+      });
+    }
+    const budgetBlock = await budgets.getInvocationBlock(input.companyId, input.agentId, {
+      issueId: input.canaryIssueId,
+    });
+    if (budgetBlock) {
+      throw conflict(budgetBlock.reason, {
+        code: "agent_lifecycle_canary_budget_blocked",
+        scopeType: budgetBlock.scopeType,
+        scopeId: budgetBlock.scopeId,
+      });
+    }
+    const queued = await enqueueLifecycleCanaryRun(db, input);
+    publishLiveEvent({
+      companyId: queued.run.companyId,
+      type: "heartbeat.run.queued",
+      payload: {
+        runId: queued.run.id,
+        agentId: queued.run.agentId,
+        invocationSource: queued.run.invocationSource,
+        triggerDetail: queued.run.triggerDetail,
+        wakeupRequestId: queued.run.wakeupRequestId,
+      },
+    });
+    try {
+      await startNextQueuedRunForAgent(input.agentId);
+    } catch (error) {
+      // Queueing and its audit receipt already committed atomically. A dispatch
+      // failure must leave a recoverable queued run, not turn that commit into
+      // an ambiguous HTTP error that tempts a second canary enqueue.
+      logger.error({ err: error, runId: queued.run.id }, "lifecycle canary dispatch deferred after committed enqueue");
+    }
+    return queued;
+  }
+
+  async function inspectPendingLifecycleCanaryIsolation(input: {
+    agentId: string;
+    companyId: string;
+    canaryIssueId: string;
+  }) {
+    return inspectLifecycleCanaryIsolation(db, input);
+  }
+
   async function executeRun(runId: string) {
     if (getSchedulingSuppression().suppressed) return;
 
@@ -10162,7 +12213,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
-      const claimed = await claimQueuedRun(run);
+      const claimed = await withAgentStartLock(run.agentId, async () => {
+        const current = await getRun(run.id);
+        if (!current || current.status !== "queued") return null;
+        if (await maintenanceLeases.isAgentLeased(current.agentId)) return null;
+        return claimQueuedRun(current);
+      });
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
         return;
@@ -10186,6 +12242,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const failedRun = await getRun(runId);
       if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
+      return;
+    }
+
+    const lifecycleCanaryAuthorization = authorizePendingLifecycleCanaryRun({ agent, run });
+    const lifecycleCanaryBoundRun = hasLifecycleCanaryRunBinding({ agent, run });
+    if (!(await portfolioGateAllowsRun(agent, run))) return;
+    if (!lifecycleCanaryAuthorization.ok) {
+      await finalizePendingLifecycleCanaryFailure(
+        db,
+        run.id,
+        "execute_authorization_invalid",
+        `Runtime authorization failed: ${lifecycleCanaryAuthorization.reason}`,
+      );
+      await cancelRunInternal(
+        run.id,
+        "Cancelled because the pending lifecycle canary runtime binding is invalid",
+        { errorCode: "agent_lifecycle_canary_authorization_invalid" },
+      );
       return;
     }
 
@@ -11330,6 +13404,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         taskSessionReused: taskSessionForRun != null,
         storedFingerprintPresent: Boolean(sessionConfigFreshness.storedFingerprint),
         nextFingerprint: sessionConfigFreshness.nextFingerprint,
+        agentConfigurationFingerprint: createAgentConfigurationFingerprint({
+          adapterType: agent.adapterType,
+          adapterConfig: parseObject(agent.adapterConfig),
+          runtimeConfig: parseObject(agent.runtimeConfig),
+        }),
       },
       workspace: {
         fingerprintVersion: latestWorkspaceConfigMetadata.version,
@@ -11822,15 +13901,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
+      const runtimeCommandSpec = adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null;
+      if (lifecycleCanaryAuthorization.pending || lifecycleCanaryBoundRun) {
+        const boundary = await revalidatePendingLifecycleCanaryBoundary(db, {
+          companyId: run.companyId,
+          agentId: run.agentId,
+          runId: run.id,
+          phase: "execute",
+        });
+        if (
+          boundary.ok !== true
+          || boundary.pending !== true
+          || boundary.reason !== "authorized"
+        ) return;
+      }
+
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
+        const [dispatchAgent, dispatchRun] = await Promise.all([
+          getAgent(run.agentId),
+          getRun(run.id, { unsafeFullResultJson: true }),
+        ]);
+        if (
+          !dispatchAgent
+          || !dispatchRun
+          || dispatchRun.status !== "running"
+          || !(await portfolioGateAllowsRun(dispatchAgent, dispatchRun))
+        ) return;
         adapterResult = await adapter.execute({
           runId: run.id,
           agent,
           runtime: runtimeForAdapter,
           config: runtimeConfig,
           context,
-          runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+          runtimeCommandSpec,
           executionTarget,
           executionTransport: remoteExecution
             ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
@@ -12022,13 +14126,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
+      const pendingCanaryReceipt =
+        lifecycleCanaryAuthorization.ok && lifecycleCanaryAuthorization.pending
+          ? lifecycleCanaryAuthorization.receipt
+          : null;
+      const lifecycleCanaryResultProof =
+        outcome === "succeeded" && pendingCanaryReceipt
+          ? createPersistedLifecycleCanaryResultProof({
+              summary: adapterResult.summary,
+              companyId: run.companyId,
+              agentId: run.agentId,
+              runId: run.id,
+              canaryIssueId: pendingCanaryReceipt.canaryIssueId,
+              receiptHash: pendingCanaryReceipt.receiptHash,
+              configFingerprint: pendingCanaryReceipt.configFingerprint,
+            })
+          : null;
+      const adapterResultJsonForStorage: Record<string, unknown> = {
+        ...parseObject(adapterResult.resultJson),
+      };
+      // This namespace is server-owned. Never allow an adapter-supplied value
+      // to spoof a parsed final-result proof, including on the invalid path.
+      delete adapterResultJsonForStorage[LIFECYCLE_CANARY_RESULT_PROOF_KEY];
+      if (pendingCanaryReceipt) {
+        adapterResultJsonForStorage[LIFECYCLE_CANARY_RESULT_PROOF_KEY] = lifecycleCanaryResultProof;
+      }
+
       const persistedResultJson = sanitizeHeartbeatResultJsonForStorage(
         mergeHeartbeatRunResultJson(
           mergeRunStopMetadataForAgent(agent, outcome, {
             resultJson: mergeModelProfileRunMetadata(
               mergeAdapterRecoveryMetadata({
                 resultJson: {
-                  ...parseObject(adapterResult.resultJson),
+                  ...adapterResultJsonForStorage,
                   configFreshness: configFreshnessResultMetadata,
                 },
                 errorFamily: adapterResult.errorFamily ?? null,
@@ -12075,10 +14205,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
 
+      if (outcome === "succeeded") {
+        try {
+          await satisfyLifecycleFreshSessionAfterSuccessfulRun(db, {
+            id: run.id,
+            companyId: run.companyId,
+            agentId: run.agentId,
+            status: "succeeded",
+            freshSession: runtimeForAdapter.sessionId == null && runtimeForAdapter.sessionDisplayId == null,
+            agentConfigurationFingerprint: configFreshnessResultMetadata.session.agentConfigurationFingerprint,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, runId: run.id, agentId: run.agentId },
+            "failed to reconcile lifecycle fresh-session receipt after successful run",
+          );
+        }
+      }
+
       await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
         finishedAt: new Date(),
         error: runErrorMessage,
       });
+      if (outcome !== "succeeded") {
+        await finalizePendingLifecycleCanaryFailure(
+          db,
+          run.id,
+          outcome,
+          runErrorMessage ?? `Lifecycle canary ended with ${outcome}.`,
+        );
+      }
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
@@ -12262,6 +14418,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent.id,
         outcome,
         outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
+        run.id,
       );
     } catch (err) {
       const message = redactSensitiveText(
@@ -12329,6 +14486,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: new Date(),
         error: message,
       });
+      await finalizePendingLifecycleCanaryFailure(db, run.id, "failed", message);
 
       if (failedRun) {
         await appendRunEvent(failedRun, seq++, {
@@ -12371,7 +14529,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message);
+      await finalizeAgentStatus(agent.id, "failed", message, run.id);
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
@@ -12423,6 +14581,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               finishedAt: new Date(),
               error: message,
             }).catch(() => undefined);
+            await finalizePendingLifecycleCanaryFailure(db, run.id, "failed", message).catch((canaryError) => {
+              logger.error(
+                { err: canaryError, runId },
+                "failed to quarantine lifecycle canary after heartbeat setup failure",
+              );
+            });
           }
           const failedRun = await getRun(runId).catch(() => null);
           if (setupFailureWrite.updated && failedRun) {
@@ -12453,7 +14617,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
           if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
+            await finalizeAgentStatus(run.agentId, "failed", message, run.id).catch(() => undefined);
           }
         } finally {
           const latestRun = await getRun(run.id).catch(() => null);
@@ -12526,7 +14690,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; suppressDeferredPromotion?: boolean } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -12641,6 +14805,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+      if (options.suppressDeferredPromotion) return null;
 
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.
@@ -13277,6 +15442,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
+    assertHistoricalAgentTombstoneMutable(agentId);
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
@@ -13326,6 +15492,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
     };
+
+    if (await hasPortfolioMaintenanceGate(agent.id, agent.companyId)) {
+      await writeSkippedRequest("agent.portfolio_maintenance_gate", {
+        error: "Agent is fenced by an active portfolio maintenance operation",
+      });
+      throw conflict("Agent is fenced by an active portfolio maintenance operation", {
+        code: "agent_portfolio_maintenance_gate_active",
+        agentId: agent.id,
+      });
+    }
+
+    if (parseObject(parseObject(agent.metadata).lifecycle).lastCanaryResult === "pending") {
+      await writeSkippedRequest("agent.lifecycle_pending_canary_only", {
+        error: "Pending lifecycle agents accept only their server-bound one-shot canary run",
+      });
+      throw conflict("Pending lifecycle agent accepts only its bound canary run", {
+        code: "agent_lifecycle_canary_only",
+        agentId: agent.id,
+      });
+    }
 
     const schedulingSuppression = getSchedulingSuppression();
     if (schedulingSuppression.suppressed) {
@@ -13544,7 +15730,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // same issue workspace while the assignee already has a live run.
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
-      const outcome = await db.transaction(async (tx) => {
+      const outcome = await withAgentStartLock(agent.id, () => db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
+        );
+        const currentAgent = await tx
+          .select()
+          .from(agents)
+          .where(and(eq(agents.id, agentId), eq(agents.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!currentAgent || await hasPortfolioMaintenanceGate(agentId, agent.companyId, tx as unknown as Db)) {
+          throw conflict("Agent is fenced by an active portfolio maintenance operation", {
+            code: "agent_portfolio_maintenance_gate_active",
+            agentId,
+          });
+        }
+        const currentInvokability = await evaluateAgentInvokabilityFromDb(tx as unknown as Db, currentAgent);
+        if (!currentInvokability.invokable) {
+          throw conflict(currentInvokability.message, {
+            status: currentAgent.status,
+            reason: currentInvokability.reason,
+          });
+        }
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
@@ -13994,7 +16201,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 lastHeartbeatAt: now,
                 updatedAt: now,
               })
-              .where(eq(agents.id, agentId));
+              .where(and(eq(agents.id, agentId), ne(agents.status, "terminated")));
           }
           return { kind: "skipped" as const };
         }
@@ -14046,7 +16253,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // transitions to "running" — Fix A (lazy locking).
 
         return { kind: "queued" as const, run: newRun };
-      });
+      }));
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {
@@ -14105,38 +16312,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
       );
-      const mergedRun = await db
-        .update(heartbeatRuns)
-        .set(sanitizeHeartbeatRunWriteForStorage({
-          contextSnapshot: mergedContextSnapshot,
-          updatedAt: new Date(),
-        }, { companyId: agent.companyId, agentId }))
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-        .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
-
-      await db.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
+      const mergedRun = await withAgentStartLock(agent.id, () => db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
+        );
+        const currentAgent = await tx
+          .select()
+          .from(agents)
+          .where(and(eq(agents.id, agentId), eq(agents.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!currentAgent || await hasPortfolioMaintenanceGate(agentId, agent.companyId, tx as unknown as Db)) {
+          throw conflict("Agent is fenced by an active portfolio maintenance operation", {
+            code: "agent_portfolio_maintenance_gate_active",
+            agentId,
+          });
+        }
+        const currentInvokability = await evaluateAgentInvokabilityFromDb(tx as unknown as Db, currentAgent);
+        if (!currentInvokability.invokable) {
+          throw conflict(currentInvokability.message, {
+            status: currentAgent.status,
+            reason: currentInvokability.reason,
+          });
+        }
+        const currentTarget = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, coalescedTargetRun.id),
+            eq(heartbeatRuns.companyId, agent.companyId),
+            eq(heartbeatRuns.agentId, agentId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          ))
+          .then((rows) => rows[0] ?? null);
+        if (!currentTarget) return null;
+        const updated = await tx
+          .update(heartbeatRuns)
+          .set(sanitizeHeartbeatRunWriteForStorage({
+            contextSnapshot: mergeCoalescedContextSnapshot(
+              currentTarget.contextSnapshot,
+              mergedContextSnapshot,
+            ),
+            updatedAt: new Date(),
+          }, { companyId: agent.companyId, agentId }))
+          .where(and(
+            eq(heartbeatRuns.id, currentTarget.id),
+            eq(heartbeatRuns.status, currentTarget.status),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return null;
+        await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason,
+          payload,
+          status: "coalesced",
+          coalescedCount: 1,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          runId: updated.id,
+          finishedAt: new Date(),
+        }));
+        return updated;
       }));
-      return mergedRun;
+      if (mergedRun) return mergedRun;
     }
 
-    const queueOutcome = await db.transaction(async (tx) => {
+    const queueOutcome = await withAgentStartLock(agent.id, () => db.transaction(async (tx) => {
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
       );
+      const currentAgent = await tx
+        .select()
+        .from(agents)
+        .where(and(eq(agents.id, agentId), eq(agents.companyId, agent.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!currentAgent || await hasPortfolioMaintenanceGate(agentId, agent.companyId, tx as unknown as Db)) {
+        throw conflict("Agent is fenced by an active portfolio maintenance operation", {
+          code: "agent_portfolio_maintenance_gate_active",
+          agentId,
+        });
+      }
+      const currentInvokability = await evaluateAgentInvokabilityFromDb(tx as unknown as Db, currentAgent);
+      if (!currentInvokability.invokable) {
+        throw conflict(currentInvokability.message, {
+          status: currentAgent.status,
+          reason: currentInvokability.reason,
+        });
+      }
 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
@@ -14168,7 +16434,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               lastHeartbeatAt: now,
               updatedAt: now,
             })
-            .where(eq(agents.id, agentId));
+            .where(and(eq(agents.id, agentId), ne(agents.status, "terminated")));
         }
         return { kind: "skipped" as const };
       }
@@ -14216,7 +16482,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       return { kind: "queued" as const, run: newRun };
-    });
+    }));
 
     if (queueOutcome.kind === "skipped") return null;
     const newRun = queueOutcome.run;
@@ -14361,35 +16627,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : options.resultJson;
 
-    const running = runningProcesses.get(run.id);
-    try {
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
-    } finally {
-      runningProcesses.delete(run.id);
-    }
-
+    const processProof = await requireRunProcessIdentityForSignal(
+      run,
+      "heartbeat_process_identity_unproven",
+    );
     const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
-      finishedAt,
-      error: reason,
-      errorCode,
-      ...(resultJson ? { resultJson } : {}),
-    });
-
-    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-      finishedAt,
-      error: reason,
+    const cancelled = await terminalizeHeartbeatRunWithProcessFence({
+      run,
+      ...(agent ? { agentStatus: agent.status } : {}),
+      processProof,
+      status: "cancelled",
+      patch: {
+        finishedAt,
+        error: reason,
+        errorCode,
+        ...(resultJson ? { resultJson } : {}),
+      },
+      wakeupStatus: "cancelled",
+      wakeupPatch: {
+        finishedAt,
+        error: reason,
+      },
+      ...(processProof.running
+        ? { graceMs: Math.max(1, processProof.running.graceSec) * 1000 }
+        : {}),
     });
 
     if (cancelled) {
@@ -14403,12 +16664,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled");
+    await finalizeAgentStatus(run.agentId, "cancelled", null, run.id);
     await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
   }
 
-  async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause", errorCode = "cancelled") {
+  async function cancelActiveForAgentInternal(
+    agentId: string,
+    reason = "Cancelled due to agent pause",
+    errorCode = "cancelled",
+    options: {
+      suppressDeferredPromotion?: boolean;
+      suppressEvents?: boolean;
+      requireProcessTerminationEvidence?: boolean;
+    } = {},
+  ) {
     const agent = await getAgent(agentId);
     const runs = await db
       .select()
@@ -14416,39 +16686,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-        errorCode,
-        ...(agent ? {
-          resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
-            resultJson: parseObject(run.resultJson),
-            errorCode,
-            errorMessage: reason,
-          }),
-        } : {}),
-      });
-
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-      });
-
-      const running = runningProcesses.get(run.id);
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-        runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
+      const processProof = await requireRunProcessIdentityForSignal(
+        run,
+        options.requireProcessTerminationEvidence
+          ? "portfolio_maintenance_process_identity_unproven"
+          : "heartbeat_process_identity_unproven",
+      );
+      if (
+        processProof.kind === "absent"
+        && options.requireProcessTerminationEvidence
+        && run.status === "running"
+      ) {
+        throw conflict("Running heartbeat has no terminable process evidence", {
+          code: "portfolio_maintenance_process_evidence_missing",
+          runId: run.id,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
+      const finishedAt = new Date();
+      const cancelled = await terminalizeHeartbeatRunWithProcessFence({
+        run,
+        ...(agent ? { agentStatus: agent.status } : {}),
+        processProof,
+        status: "cancelled",
+        patch: {
+          finishedAt,
+          error: reason,
+          errorCode,
+          ...(agent ? {
+            resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
+              resultJson: parseObject(run.resultJson),
+              errorCode,
+              errorMessage: reason,
+            }),
+          } : {}),
+        },
+        wakeupStatus: "cancelled",
+        wakeupPatch: {
+          finishedAt,
+          error: reason,
+        },
+        ...(processProof.running
+          ? { graceMs: Math.max(1, processProof.running.graceSec) * 1000 }
+          : {}),
+        suppressEvents: options.suppressEvents,
+      });
+      await releaseIssueExecutionAndPromote(cancelled, {
+        suppressDeferredPromotion: options.suppressDeferredPromotion,
+      });
     }
 
     return runs.length;
@@ -14486,13 +16770,113 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return wakeupIds.length;
   }
 
-  async function cancelInvocationsForAgentsInternal(agentIds: string[], reason: string) {
+  async function terminateTerminalOrphanProcessesInternal(runIds: string[]) {
+    const uniqueRunIds = [...new Set(runIds)].filter((runId) => runId.length > 0);
+    if (uniqueRunIds.length === 0) return { terminatedRunIds: [] as string[] };
+    const rows = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, uniqueRunIds));
+    if (rows.length !== uniqueRunIds.length) {
+      throw conflict("Terminal orphan process coverage changed", {
+        code: "portfolio_maintenance_orphan_drift",
+      });
+    }
+    const terminatedRunIds: string[] = [];
+    for (const run of rows) {
+      const agent = await getAgent(run.agentId);
+      if (CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(
+        run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number],
+      )) {
+        throw conflict("Terminal orphan process changed back to an active run", {
+          code: "portfolio_maintenance_orphan_drift",
+          runId: run.id,
+        });
+      }
+      const verification = await verifyStoredLocalProcessIdentity(run);
+      if (verification.kind === "not_running") {
+        await finalizeHeartbeatRunWithoutSignalWithinFence({
+          db,
+          expectedRun: run,
+          ...(agent ? { expectedAgentStatus: agent.status } : {}),
+          hooks: {},
+        });
+        runningProcesses.delete(run.id);
+        continue;
+      }
+      if (verification.kind !== "verified") {
+        throw conflict("Terminal process identity could not be proven", {
+          code: "portfolio_maintenance_process_identity_unproven",
+          runId: run.id,
+          reason: verification.reason,
+          manualInterventionRequired: true,
+        });
+      }
+      const running = runningProcesses.get(run.id);
+      const pid = verification.identity.pid;
+      const processGroupId = verification.identity.processGroupId;
+      if (
+        running
+        && (running.child.pid !== pid || running.processGroupId !== processGroupId)
+      ) {
+        throw conflict("In-memory terminal process identity disagreed with persisted evidence", {
+          code: "portfolio_maintenance_process_identity_unproven",
+          runId: run.id,
+          reason: "in_memory_identity_mismatch",
+          manualInterventionRequired: true,
+        });
+      }
+      await terminateHeartbeatRunProcessWithinFence({
+        db,
+        expectedRun: run,
+        ...(agent ? { expectedAgentStatus: agent.status } : {}),
+        identity: verification.identity,
+        ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+        hooks: {},
+      });
+      runningProcesses.delete(run.id);
+      terminatedRunIds.push(run.id);
+    }
+    return { terminatedRunIds: terminatedRunIds.sort() };
+  }
+
+  async function cancelInvocationsForAgentsInternal(
+    agentIds: string[],
+    reason: string,
+    options: {
+      errorCode?: string;
+      suppressDeferredPromotion?: boolean;
+      suppressEvents?: boolean;
+      requireProcessTerminationEvidence?: boolean;
+      agentStartLocksHeld?: boolean;
+    } = {},
+  ) {
     const uniqueAgentIds = [...new Set(agentIds)].filter((agentId) => agentId.length > 0);
     let runsCancelled = 0;
+    let wakeupsCancelled = 0;
     for (const agentId of uniqueAgentIds) {
-      runsCancelled += await cancelActiveForAgentInternal(agentId, reason);
+      const cancelForAgent = async () => ({
+        runs: await cancelActiveForAgentInternal(
+          agentId,
+          reason,
+          options.errorCode ?? "cancelled",
+          {
+            suppressDeferredPromotion: options.suppressDeferredPromotion,
+            suppressEvents: options.suppressEvents,
+            requireProcessTerminationEvidence: options.requireProcessTerminationEvidence,
+          },
+        ),
+        wakeups: await cancelPendingWakeupsForAgentsInternal([agentId], reason),
+      });
+      // Portfolio maintenance already holds every target's FIFO start lock
+      // across its fenced transaction. The lock is deliberately non-reentrant,
+      // so that caller must execute directly instead of queueing behind itself.
+      const cancelled = options.agentStartLocksHeld
+        ? await cancelForAgent()
+        : await withAgentStartLock(agentId, cancelForAgent);
+      runsCancelled += cancelled.runs;
+      wakeupsCancelled += cancelled.wakeups;
     }
-    const wakeupsCancelled = await cancelPendingWakeupsForAgentsInternal(uniqueAgentIds, reason);
     return {
       agentIds: uniqueAgentIds,
       runsCancelled,
@@ -14632,7 +17016,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const state = await getRuntimeState(agentId);
       const agent = await getAgent(agentId);
       if (!agent) return null;
-      const ensured = state ?? (await ensureRuntimeState(agent));
+      const ensured = state ?? (
+        isHistoricalAgentTombstoneId(agentId)
+          ? null
+          : await ensureRuntimeState(agent)
+      );
+      if (!ensured) return null;
       const latestTaskSession = await db
         .select()
         .from(agentTaskSessions)
@@ -14659,6 +17048,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     resetRuntimeSession: async (agentId: string, opts?: { taskKey?: string | null }) => {
+      assertHistoricalAgentTombstoneMutable(agentId);
       const agent = await getAgent(agentId);
       if (!agent) throw notFound("Agent not found");
       await ensureRuntimeState(agent);
@@ -14769,6 +17159,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
 
     wakeup: enqueueWakeup,
+    enqueueLifecycleCanary,
+    inspectLifecycleCanaryIsolation: inspectPendingLifecycleCanaryIsolation,
     triggerIssueMonitor,
 
     reportRunActivity: clearDetachedRunWarning,
@@ -14878,8 +17270,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      */
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason, "agent_paused"),
 
-    cancelInvocationsForAgents: (agentIds: string[], reason: string) =>
-      cancelInvocationsForAgentsInternal(agentIds, reason),
+    cancelInvocationsForAgents: (
+      agentIds: string[],
+      reason: string,
+      options?: {
+        errorCode?: string;
+        suppressDeferredPromotion?: boolean;
+        suppressEvents?: boolean;
+        requireProcessTerminationEvidence?: boolean;
+        agentStartLocksHeld?: boolean;
+      },
+    ) => cancelInvocationsForAgentsInternal(agentIds, reason, options),
+
+    terminateTerminalOrphanProcesses: (runIds: string[]) =>
+      terminateTerminalOrphanProcessesInternal(runIds),
 
     cancelBudgetScopeWork,
 

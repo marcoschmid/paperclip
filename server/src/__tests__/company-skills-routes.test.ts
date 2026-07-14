@@ -15,6 +15,8 @@ const mockCompanySkillService = vi.hoisted(() => ({
   list: vi.fn(),
   categoryCounts: vi.fn(),
   detail: vi.fn(),
+  resyncPreflight: vi.fn(),
+  resyncFromSource: vi.fn(),
   listVersions: vi.fn(),
   getVersion: vi.fn(),
   createVersion: vi.fn(),
@@ -127,6 +129,55 @@ describe("company skill mutation permissions", () => {
     mockCompanySkillService.list.mockResolvedValue([]);
     mockCompanySkillService.categoryCounts.mockResolvedValue([]);
     mockCompanySkillService.detail.mockResolvedValue(null);
+    mockCompanySkillService.resyncPreflight.mockResolvedValue({
+      schemaVersion: "1.0.0",
+      companyId: "00000000-0000-4000-8000-000000000001",
+      skillId: "00000000-0000-4000-8000-000000000002",
+      skillKey: "local/example/review",
+      sourceType: "local_path",
+      sourceLocator: "/tmp/review",
+      sourceLocatorSha256: `v1:sha256:${"1".repeat(64)}`,
+      sourceInventoryMode: "full",
+      skillUpdatedAt: "2026-07-13T08:00:00.000Z",
+      currentVersionId: "11111111-1111-4111-8111-111111111111",
+      currentVersionLabel: "old",
+      baseMarkdownSha256: `v1:sha256:${"2".repeat(64)}`,
+      currentVersionInventorySha256: `v1:sha256:${"3".repeat(64)}`,
+      sourceSkillMarkdownSha256: `v1:sha256:${"4".repeat(64)}`,
+      sourceInventorySha256: `v1:sha256:${"5".repeat(64)}`,
+      baseFileInventorySha256: `v1:sha256:${"8".repeat(64)}`,
+      sourceFileInventorySha256: `v1:sha256:${"9".repeat(64)}`,
+      baseTrustLevel: "markdown_only",
+      sourceTrustLevel: "markdown_only",
+      sourceFileCount: 2,
+      sourceTotalBytes: 128,
+      affectedAgentIds: ["44444444-4444-4444-8444-444444444444"],
+    });
+    mockCompanySkillService.resyncFromSource.mockResolvedValue({
+      schemaVersion: "1.0.0",
+      companyId: "00000000-0000-4000-8000-000000000001",
+      skillId: "00000000-0000-4000-8000-000000000002",
+      skillKey: "local/example/review",
+      previousVersionId: "11111111-1111-4111-8111-111111111111",
+      currentVersionId: "22222222-2222-4222-8222-222222222222",
+      skillUpdatedAt: "2026-07-13T08:01:00.000Z",
+      label: "TEC-355 skill-resync test",
+      sourceSkillMarkdownSha256: `v1:sha256:${"4".repeat(64)}`,
+      sourceInventorySha256: `v1:sha256:${"5".repeat(64)}`,
+      previousBaseMarkdownSha256: `v1:sha256:${"2".repeat(64)}`,
+      baseMarkdownSha256: `v1:sha256:${"4".repeat(64)}`,
+      previousBaseFileInventorySha256: `v1:sha256:${"8".repeat(64)}`,
+      baseFileInventorySha256: `v1:sha256:${"9".repeat(64)}`,
+      previousTrustLevel: "assets",
+      trustLevel: "markdown_only",
+      currentVersionInventorySha256: `v1:sha256:${"5".repeat(64)}`,
+      baseMarkdownChanged: true,
+      baseFileInventoryChanged: true,
+      trustLevelChanged: true,
+      versionCreated: true,
+      idempotentReplay: false,
+      auditReceiptId: "55555555-5555-4555-8555-555555555555",
+    });
     mockCompanySkillService.listVersions.mockResolvedValue([]);
     mockCompanySkillService.getVersion.mockResolvedValue(null);
     mockCompanySkillService.createVersion.mockResolvedValue({
@@ -827,6 +878,181 @@ describe("company skill mutation permissions", () => {
       entityType: "company_skill_version",
       entityId: "version-1",
     }));
+  });
+
+  it("exposes board-only GET preflight and CAS source resync without agent mutations", async () => {
+    const app = await createApp({ type: "board", source: "local_implicit", userId: "user-1" });
+    const preflight = await request(app)
+      .get("/api/companies/company-1/skills/skill-1/resync-preflight")
+      .expect(200);
+    const body = {
+      schemaVersion: "1.0.0",
+      approvalIssue: "TEC-355",
+      maintenanceOperationId: "33333333-3333-4333-8333-333333333333",
+      maintenanceAgentIds: ["44444444-4444-4444-8444-444444444444"],
+      maintenanceReceiptId: `v1:sha256:${"6".repeat(64)}`,
+      maintenanceExpectedSnapshotFingerprint: `v1:sha256:${"7".repeat(64)}`,
+      label: "TEC-355 skill-resync test",
+      expectedSkillKey: preflight.body.skillKey,
+      expectedSourceType: "local_path",
+      expectedSourceInventoryMode: preflight.body.sourceInventoryMode,
+      expectedSourceLocatorSha256: preflight.body.sourceLocatorSha256,
+      expectedSkillUpdatedAt: preflight.body.skillUpdatedAt,
+      expectedCurrentVersionId: preflight.body.currentVersionId,
+      expectedBaseMarkdownSha256: preflight.body.baseMarkdownSha256,
+      expectedCurrentVersionInventorySha256: preflight.body.currentVersionInventorySha256,
+      expectedSourceSkillMarkdownSha256: preflight.body.sourceSkillMarkdownSha256,
+      expectedSourceInventorySha256: preflight.body.sourceInventorySha256,
+      expectedBaseFileInventorySha256: preflight.body.baseFileInventorySha256,
+      expectedSourceFileInventorySha256: preflight.body.sourceFileInventorySha256,
+      expectedBaseTrustLevel: preflight.body.baseTrustLevel,
+      expectedSourceTrustLevel: preflight.body.sourceTrustLevel,
+    };
+
+    await request(app)
+      .post("/api/companies/company-1/skills/skill-1/resync")
+      .send(body)
+      .expect(200);
+
+    expect(mockCompanySkillService.resyncPreflight).toHaveBeenCalledWith("company-1", "skill-1");
+    expect(mockCompanySkillService.resyncFromSource).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      body,
+      { type: "user", userId: "user-1" },
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "company.skill_source_resynced",
+      entityType: "company_skill",
+      entityId: "skill-1",
+      details: expect.objectContaining({
+        approvalIssue: "TEC-355",
+        auditReceiptId: "55555555-5555-4555-8555-555555555555",
+        versionCreated: true,
+        previousBaseFileInventorySha256: `v1:sha256:${"8".repeat(64)}`,
+        baseFileInventorySha256: `v1:sha256:${"9".repeat(64)}`,
+        previousTrustLevel: "assets",
+        trustLevel: "markdown_only",
+        baseFileInventoryChanged: true,
+        trustLevelChanged: true,
+        sourceInventorySha256: `v1:sha256:${"5".repeat(64)}`,
+      }),
+    }));
+  });
+
+  it("returns a valid GET preflight when no agent currently consumes the skill", async () => {
+    mockCompanySkillService.resyncPreflight.mockResolvedValue({
+      schemaVersion: "1.0.0",
+      companyId: "00000000-0000-4000-8000-000000000001",
+      skillId: "00000000-0000-4000-8000-000000000002",
+      skillKey: "local/example/review",
+      sourceType: "local_path",
+      sourceLocator: "/tmp/review",
+      sourceLocatorSha256: `v1:sha256:${"1".repeat(64)}`,
+      sourceInventoryMode: "full",
+      skillUpdatedAt: "2026-07-13T08:00:00.000Z",
+      currentVersionId: "11111111-1111-4111-8111-111111111111",
+      currentVersionLabel: "old",
+      baseMarkdownSha256: `v1:sha256:${"2".repeat(64)}`,
+      currentVersionInventorySha256: `v1:sha256:${"3".repeat(64)}`,
+      sourceSkillMarkdownSha256: `v1:sha256:${"4".repeat(64)}`,
+      sourceInventorySha256: `v1:sha256:${"5".repeat(64)}`,
+      baseFileInventorySha256: `v1:sha256:${"8".repeat(64)}`,
+      sourceFileInventorySha256: `v1:sha256:${"9".repeat(64)}`,
+      baseTrustLevel: "markdown_only",
+      sourceTrustLevel: "markdown_only",
+      sourceFileCount: 2,
+      sourceTotalBytes: 128,
+      affectedAgentIds: [],
+    });
+    const app = await createApp({ type: "board", source: "local_implicit", userId: "user-1" });
+
+    const response = await request(app)
+      .get("/api/companies/company-1/skills/skill-1/resync-preflight")
+      .expect(200);
+
+    expect(response.body.affectedAgentIds).toEqual([]);
+  });
+
+  it("fails closed instead of exposing unexpected resync preflight fields", async () => {
+    mockCompanySkillService.resyncPreflight.mockResolvedValue({
+      schemaVersion: "1.0.0",
+      companyId: "00000000-0000-4000-8000-000000000001",
+      skillId: "00000000-0000-4000-8000-000000000002",
+      skillKey: "local/example/review",
+      sourceType: "local_path",
+      sourceLocator: "/tmp/review",
+      sourceLocatorSha256: `v1:sha256:${"1".repeat(64)}`,
+      sourceInventoryMode: "full",
+      skillUpdatedAt: "2026-07-13T08:00:00.000Z",
+      currentVersionId: "11111111-1111-4111-8111-111111111111",
+      currentVersionLabel: "old",
+      baseMarkdownSha256: `v1:sha256:${"2".repeat(64)}`,
+      currentVersionInventorySha256: `v1:sha256:${"3".repeat(64)}`,
+      sourceSkillMarkdownSha256: `v1:sha256:${"4".repeat(64)}`,
+      sourceInventorySha256: `v1:sha256:${"5".repeat(64)}`,
+      baseFileInventorySha256: `v1:sha256:${"8".repeat(64)}`,
+      sourceFileInventorySha256: `v1:sha256:${"9".repeat(64)}`,
+      baseTrustLevel: "markdown_only",
+      sourceTrustLevel: "markdown_only",
+      sourceFileCount: 2,
+      sourceTotalBytes: 128,
+      affectedAgentIds: ["44444444-4444-4444-8444-444444444444"],
+      secret: "must-not-be-serialized",
+    });
+    const app = await createApp({ type: "board", source: "local_implicit", userId: "user-1" });
+
+    const response = await request(app)
+      .get("/api/companies/company-1/skills/skill-1/resync-preflight")
+      .expect(400);
+
+    expect(JSON.stringify(response.body)).not.toContain("must-not-be-serialized");
+  });
+
+  it("rejects company-skill resync for agents even when ordinary skill creation is allowed", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      id: "agent-1",
+      companyId: "company-1",
+      permissions: { canCreateSkills: true },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    await request(app)
+      .get("/api/companies/company-1/skills/skill-1/resync-preflight")
+      .expect(403);
+    await request(app)
+      .post("/api/companies/company-1/skills/skill-1/resync")
+      .send({
+        schemaVersion: "1.0.0",
+        approvalIssue: "TEC-355",
+        maintenanceOperationId: "33333333-3333-4333-8333-333333333333",
+        maintenanceAgentIds: ["44444444-4444-4444-8444-444444444444"],
+        maintenanceReceiptId: `v1:sha256:${"6".repeat(64)}`,
+        maintenanceExpectedSnapshotFingerprint: `v1:sha256:${"7".repeat(64)}`,
+        label: "TEC-355 skill-resync test",
+        expectedSkillKey: "local/example/review",
+        expectedSourceType: "local_path",
+        expectedSourceInventoryMode: "full",
+        expectedSourceLocatorSha256: `v1:sha256:${"1".repeat(64)}`,
+        expectedSkillUpdatedAt: "2026-07-13T08:00:00.000Z",
+        expectedCurrentVersionId: "11111111-1111-4111-8111-111111111111",
+        expectedBaseMarkdownSha256: `v1:sha256:${"2".repeat(64)}`,
+        expectedCurrentVersionInventorySha256: `v1:sha256:${"3".repeat(64)}`,
+        expectedSourceSkillMarkdownSha256: `v1:sha256:${"4".repeat(64)}`,
+        expectedSourceInventorySha256: `v1:sha256:${"5".repeat(64)}`,
+        expectedBaseFileInventorySha256: `v1:sha256:${"8".repeat(64)}`,
+        expectedSourceFileInventorySha256: `v1:sha256:${"9".repeat(64)}`,
+        expectedBaseTrustLevel: "markdown_only",
+        expectedSourceTrustLevel: "markdown_only",
+      })
+      .expect(403);
+    expect(mockCompanySkillService.resyncPreflight).not.toHaveBeenCalled();
+    expect(mockCompanySkillService.resyncFromSource).not.toHaveBeenCalled();
   });
 
   it("stars, forks, and comments on skills through company-scoped endpoints", async () => {

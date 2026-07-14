@@ -1,7 +1,7 @@
 import type {
   AgentAdapterType,
   ModelProfileKey,
-  PauseReason,
+  AgentPauseReason,
   AgentRole,
   AgentStatus,
 } from "../constants.js";
@@ -19,8 +19,132 @@ import type { AgentApiKeyScope } from "../validators/agent.js";
 export interface AgentPermissions extends Record<string, unknown> {
   canCreateAgents: boolean;
   canCreateSkills?: boolean;
+  canAssignTasks?: boolean;
+  bypass?: {
+    claudePermissionMode: boolean;
+    codexApprovalsAndSandbox: boolean;
+  };
+  exception?: AgentLifecyclePermissionException;
   trustPreset?: TrustPreset;
   authorizationPolicy?: TrustAuthorizationPolicy;
+}
+
+export type AgentLifecyclePermissionBypass =
+  | "claude_permission_mode"
+  | "codex_approvals_and_sandbox";
+
+export type AgentLifecyclePermissionException =
+  | { kind: "none" }
+  | {
+      kind: "approved";
+      exceptionIssueId: string;
+      owner: AgentLifecycleOwner;
+      scope: {
+        cwdRoots: string[];
+        tools: string[];
+        networkHosts: string[];
+        bypasses: AgentLifecyclePermissionBypass[];
+      };
+      justification: string;
+      evidence: {
+        canaryIssueId: string;
+        runId: string;
+        configFingerprint: string;
+        result: "passed";
+      };
+      approvedAt: string;
+      expiresAt: string;
+    };
+
+export type AgentLifecycleOwner =
+  | { ownerType: "agent"; ownerAgentId: string }
+  | { ownerType: "board_user"; ownerUserId: string }
+  | { ownerType: "board_role"; ownerRoleSlug: string };
+
+export interface AgentLifecycleServiceLevel {
+  availabilityClass: "routine" | "business_hours" | "on_demand";
+  triageTargetMinutes: number | null;
+  completionTargetMinutes: number | null;
+  targetExceptionReason: string | null;
+}
+
+export interface AgentLifecyclePause {
+  reasonCode: string;
+  reasonDetail: string;
+  outcome?: string;
+  repairIssueId: string;
+  startedAt: string;
+  expiresAt: string;
+  exceptionApprovedByUserId?: string;
+  exceptionReason?: string;
+}
+
+export interface AgentLifecycle {
+  schemaVersion: "1.0.0";
+  owner: AgentLifecycleOwner;
+  purpose: string;
+  acceptedTaskTypes: string[];
+  rejectedTaskTypes: string[];
+  taskSources: string[];
+  operatingMode: "scheduled" | "issue_routed" | "manual_assignment_only";
+  serviceLevel: AgentLifecycleServiceLevel;
+  canaryIssueId: string | null;
+  lastCanaryAt: string | null;
+  lastCanaryResult: "pending" | "passed" | "failed";
+  canaryFreshnessDays: number;
+  reviewAt: string;
+  retirementCriterion: string;
+  decisionIssueId: string;
+  replacementAgentId?: string;
+  replacementSystemRef?: string;
+  pause?: AgentLifecyclePause;
+}
+
+export interface AgentLifecycleFailedRepairTransition {
+  mode: "reviewed_failed_repair";
+  repairIssueId: string;
+  expectedAgentUpdatedAt: string;
+}
+
+export interface AgentLifecyclePassedRevalidationTransition {
+  mode: "reviewed_passed_revalidation";
+  canaryIssueId: string;
+  decisionIssueId: string;
+  reasonCode: "runtime_evidence_invalidated";
+  expectedAgentUpdatedAt: string;
+}
+
+export type AgentLifecycleTransition =
+  | AgentLifecycleFailedRepairTransition
+  | AgentLifecyclePassedRevalidationTransition;
+
+export interface AgentLifecycleGate {
+  schemaVersion: "1.0.0";
+  configFingerprint: string;
+  validatedAt: string;
+  expiresAt: string;
+  findingCount: 0;
+  receiptHash: string;
+  freshSessionRequired: boolean;
+  lastSatisfiedRunId?: string;
+}
+
+export interface AgentLifecycleCanaryGate {
+  schemaVersion: "1.0.0";
+  agentId: string;
+  companyId: string;
+  canaryIssueId: string;
+  runId: string;
+  configFingerprint: string;
+  issuedAt: string;
+  expiresAt: string;
+  receiptHash: string;
+}
+
+export interface AgentMetadata extends Record<string, unknown> {
+  lifecycle?: AgentLifecycle;
+  lifecycleGate?: AgentLifecycleGate;
+  lifecycleCanaryGate?: AgentLifecycleCanaryGate;
 }
 
 export interface AgentModelProfileConfig {
@@ -96,12 +220,12 @@ export interface Agent {
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
-  pauseReason: PauseReason | null;
+  pauseReason: AgentPauseReason | null;
   pausedAt: Date | null;
   errorReason?: string | null;
   permissions: AgentPermissions;
   lastHeartbeatAt: Date | null;
-  metadata: Record<string, unknown> | null;
+  metadata: AgentMetadata | null;
   orgChainHealth?: AgentOrgChainHealth;
   createdAt: Date;
   updatedAt: Date;

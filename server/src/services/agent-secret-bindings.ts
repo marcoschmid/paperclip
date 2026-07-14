@@ -11,12 +11,13 @@ interface AgentSecretBindingSyncService {
       required?: boolean;
       label?: string | null;
     }>,
-    options?: { replaceAll?: boolean },
+    options?: { replaceAll?: boolean; allowPendingApproval?: boolean },
   ) => Promise<unknown>;
   syncEnvBindingsForTarget?: (
     companyId: string,
     target: { targetType: "agent"; targetId: string; pathPrefix?: string },
     envValue: unknown,
+    options?: { allowPendingApproval?: boolean },
   ) => Promise<unknown>;
   syncUserSecretDeclarationsForTarget?: (
     companyId: string,
@@ -30,7 +31,7 @@ interface AgentSecretBindingSyncService {
       allowMissingOverride?: boolean;
       label?: string | null;
     }>,
-    options?: { replaceAll?: boolean },
+    options?: { replaceAll?: boolean; allowPendingApproval?: boolean },
   ) => Promise<unknown>;
 }
 
@@ -140,19 +141,20 @@ export async function syncAgentAdapterEnvBindings(input: {
   companyId: string;
   agentId: string;
   adapterConfig: unknown;
+  allowPendingApproval?: boolean;
 }) {
   if (input.secretsSvc.syncSecretRefsForTarget) {
     await input.secretsSvc.syncSecretRefsForTarget(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
       collectSecretRefs(input.adapterConfig),
-      { replaceAll: true },
+      { replaceAll: true, allowPendingApproval: input.allowPendingApproval },
     );
     await input.secretsSvc.syncUserSecretDeclarationsForTarget?.(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
       collectUserSecretRefs(input.adapterConfig),
-      { replaceAll: true },
+      { replaceAll: true, allowPendingApproval: input.allowPendingApproval },
     );
     return;
   }
@@ -161,5 +163,6 @@ export async function syncAgentAdapterEnvBindings(input: {
     input.companyId,
     { targetType: "agent", targetId: input.agentId },
     envValue,
+    { allowPendingApproval: input.allowPendingApproval },
   );
 }

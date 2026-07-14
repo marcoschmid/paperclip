@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, timestamp, jsonb, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -36,5 +37,8 @@ export const agentWakeupRequests = pgTable(
       table.requestedAt,
     ),
     agentRequestedIdx: index("agent_wakeup_requests_agent_requested_idx").on(table.agentId, table.requestedAt),
+    routineDeliveryIdempotencyUnique: uniqueIndex("agent_wakeup_requests_routine_delivery_idempotency_unique")
+      .on(table.companyId, table.agentId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} like 'routine-delivery:%'`),
   }),
 );

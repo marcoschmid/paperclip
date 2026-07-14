@@ -2029,6 +2029,29 @@ describe("effective run session config freshness", () => {
     }
   });
 
+  it("starts a fresh task session when the resolved runtime model profile changes", async () => {
+    const base = await buildSessionConfigMetadata({ modelProfile: null });
+    const next = await buildSessionConfigMetadata({
+      modelProfile: {
+        requested: "cheap",
+        requestedBy: "issue_override",
+        applied: "cheap",
+        configSource: "agent_runtime",
+        fallbackReason: null,
+      },
+    });
+
+    const decision = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: next,
+    });
+
+    expect(decision.reset).toBe(true);
+    expect(decision.changedCategories).toContain("modelProfile");
+  });
+
   it("detects instructions content drift without storing the contents", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-fingerprint-"));
     const instructionsPath = path.join(root, "AGENTS.md");

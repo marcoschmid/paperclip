@@ -40,6 +40,7 @@ import {
   backfillPrincipalAccessCompatibility,
   bootstrapExecutionPolicyFromEnv,
   environmentCustomImageService,
+  environmentRuntimeService,
   heartbeatService,
   instanceSettingsService,
   reconcileCloudUpstreamRunsOnStartup,
@@ -55,6 +56,7 @@ import {
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { waitForPluginWorkerStartup } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -690,6 +692,7 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
+    deferBackgroundServices: true,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
@@ -711,6 +714,9 @@ export async function startServer(): Promise<StartedServer> {
     port: listenPort,
   });
   const configuredApiUrl = process.env.PAPERCLIP_API_URL?.trim() || runtimeApiUrl;
+  // Host-local adapters must honor an operator's explicit API URL (commonly
+  // loopback) even when Better Auth advertises a separate public origin.
+  const localRuntimeApiUrl = process.env.PAPERCLIP_RUNTIME_API_URL?.trim() || configuredApiUrl;
   const runtimeApiCandidates = buildRuntimeApiCandidateUrls({
     preferredApiUrl: configuredApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
@@ -720,7 +726,7 @@ export async function startServer(): Promise<StartedServer> {
   });
   process.env.PAPERCLIP_LISTEN_HOST = runtimeListenHost;
   process.env.PAPERCLIP_LISTEN_PORT = String(listenPort);
-  process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
+  process.env.PAPERCLIP_RUNTIME_API_URL = localRuntimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
   
@@ -732,18 +738,44 @@ export async function startServer(): Promise<StartedServer> {
     resolveSessionFromHeaders,
   });
 
-  void reconcilePersistedRuntimeServicesOnStartup(db as any)
-    .then((result) => {
-      if (result.reconciled > 0) {
-        logger.warn(
-          { reconciled: result.reconciled },
-          "reconciled persisted runtime services from a previous server process",
-        );
-      }
-    })
-    .catch((err) => {
-      logger.error({ err }, "startup reconciliation of persisted runtime services failed");
-    });
+  // Environment cleanup may need plugin-backed drivers. Wait for the
+  // startup load attempt registered by createApp before classifying a worker as
+  // unavailable; no scheduler or listener is started while this gate is open.
+  await waitForPluginWorkerStartup(pluginWorkerManager);
+
+  try {
+    const result = await reconcilePersistedRuntimeServicesOnStartup(db as any);
+    if (result.reconciled > 0) {
+      logger.warn(
+        { reconciled: result.reconciled },
+        "reconciled persisted runtime services from a previous server process",
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, "startup reconciliation of persisted runtime services failed");
+    throw err;
+  }
+
+  const environmentLeaseReconciliation = await environmentRuntimeService(db as any, {
+    pluginWorkerManager,
+  }).reconcileEnvironmentLeasesOnStartup();
+  if (environmentLeaseReconciliation.reconciled > 0) {
+    if (environmentLeaseReconciliation.failed > 0) {
+      logger.error(
+        environmentLeaseReconciliation,
+        "reconciled environment leases at startup with quarantined failures",
+      );
+    } else {
+      logger.warn(
+        environmentLeaseReconciliation,
+        "reconciled environment leases at startup",
+      );
+    }
+  }
+  const startBackgroundServices = (app as unknown as {
+    locals?: { paperclipStartBackgroundServices?: () => void };
+  }).locals?.paperclipStartBackgroundServices;
+  startBackgroundServices?.();
 
   void reconcileCloudUpstreamRunsOnStartup(db as any)
     .then((result) => {
@@ -801,10 +833,41 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  // The durable routine outbox is a recovery boundary, not a scheduler
+  // convenience. Keep it running when heartbeat timer scheduling is disabled
+  // or suppressed; only its own explicit switch may disable reconciliation.
+  const routines = routineService(db as any, { pluginWorkerManager });
+  if (config.routineDeliveryWorkerEnabled) {
+    await routines
+      .reconcileRunDeliveries()
+      .then((result) => {
+        if (result.scanned > 0) {
+          logger.warn({ ...result }, "startup routine delivery reconciliation processed durable outbox rows");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "startup routine delivery reconciliation failed");
+      });
+
+    setInterval(() => {
+      void routines
+        .reconcileRunDeliveries()
+        .then((result) => {
+          if (result.scanned > 0) {
+            logger.info({ ...result }, "periodic routine delivery reconciliation processed outbox rows");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "periodic routine delivery reconciliation failed");
+        });
+    }, config.routineDeliveryWorkerIntervalMs);
+  } else {
+    logger.warn("routine delivery worker explicitly disabled; durable outbox rows will remain pending");
+  }
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
-    const routines = routineService(db as any, { pluginWorkerManager });
     const heartbeatSchedulingSuppression = resolveHeartbeatSchedulingSuppression();
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
@@ -1068,6 +1131,8 @@ export async function startServer(): Promise<StartedServer> {
         migrationSummary,
         heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
         heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
+        routineDeliveryWorkerEnabled: config.routineDeliveryWorkerEnabled,
+        routineDeliveryWorkerIntervalMs: config.routineDeliveryWorkerIntervalMs,
         databaseBackupEnabled: config.databaseBackupEnabled,
         databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
         databaseBackupRetentionDays: config.databaseBackupRetentionDays,

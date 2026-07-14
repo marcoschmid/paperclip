@@ -20,6 +20,7 @@ import { boardAuthService } from "../services/board-auth.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { logActivity } from "../services/activity-log.js";
 import { forbidden, unprocessable } from "../errors.js";
+import { isHistoricalAgentTombstoneId } from "../services/agent-retirement-historical-tombstones.js";
 
 const AGENT_TOKEN_ACTIVITY_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -326,21 +327,27 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    await db
-      .update(agentApiKeys)
-      .set({ lastUsedAt: new Date() })
-      .where(eq(agentApiKeys.id, key.id));
-
     const agentRecord = await db
       .select()
       .from(agents)
       .where(eq(agents.id, key.agentId))
       .then((rows) => rows[0] ?? null);
 
-    if (!agentRecord || agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
+    if (
+      !agentRecord ||
+      agentRecord.companyId !== key.companyId ||
+      agentRecord.status === "terminated" ||
+      agentRecord.status === "pending_approval" ||
+      isHistoricalAgentTombstoneId(agentRecord.id)
+    ) {
       next();
       return;
     }
+
+    await db
+      .update(agentApiKeys)
+      .set({ lastUsedAt: new Date() })
+      .where(and(eq(agentApiKeys.id, key.id), isNull(agentApiKeys.revokedAt)));
 
     const responsibleUserId = normalizeOptionalString(key.responsibleUserId);
     if (!responsibleUserId) {

@@ -110,6 +110,7 @@ export interface AdapterSessionCodec {
 
 export interface AdapterInvocationMeta {
   adapterType: string;
+  runtimeSurfacePolicyVersion?: string | null;
   command: string;
   cwd?: string;
   commandArgs?: string[];

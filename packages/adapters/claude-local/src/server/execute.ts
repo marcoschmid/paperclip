@@ -65,7 +65,10 @@ import { claudeCommandSupportsEffortFlag } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
-import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
+import {
+  assertClaudePermissionConfigIsFailClosed,
+  buildClaudeExecutionPermissionArgs,
+} from "./permissions.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -374,6 +377,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   const executionTargetIsSandbox = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox";
 
+  assertClaudePermissionConfigIsFailClosed(config);
+
   const promptTemplate = asString(
     config.promptTemplate,
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -382,7 +387,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effort = asString(config.effort, "");
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
-  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, false);
+  const allowedTools = asStringArray(config.allowedTools);
   const configEnv = parseObject(config.env);
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -715,6 +721,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
+      allowedTools,
       targetIsRemote: executionTargetIsRemote,
     }));
     if (chrome) args.push("--chrome");
@@ -760,9 +767,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!resumeSessionId) {
       commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);
     }
-    if (dangerouslySkipPermissions && executionTargetIsRemote) {
+    if (allowedTools.length > 0) {
       commandNotes.push(
-        "Using a broad --allowedTools whitelist for remote execution so hosted targets do not inherit local Claude bypass permissions.",
+        `Using the configured scoped Claude tool allowlist (${allowedTools.join(", ")}).`,
       );
     }
     if (attemptInstructionsFilePath && !resumeSessionId) {
@@ -907,7 +914,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // successful run to Paperclip and the heartbeat stalls silently. See RY-604.
     const claudeRefusal = isClaudeRefusalResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
+    const parsedHasErrors = Array.isArray(parsed.errors) && parsed.errors.length > 0;
+    const controlledTerminalResultCleanup =
+      proc.terminalResultCleanupTriggered === true &&
+      !proc.timedOut &&
+      (proc.signal === "SIGTERM" || proc.exitCode === 143) &&
+      asString(parsed.type, "") === "result" &&
+      asString(parsed.subtype, "").trim().toLowerCase() === "success" &&
+      parsed.is_error === false &&
+      !parsedIsError &&
+      !parsedHasErrors &&
+      !loginMeta.requiresLogin &&
+      !claudeRefusal &&
+      !isClaudeMaxTurnsResult(parsed) &&
+      !isClaudeUnknownSessionError(parsed) &&
+      !isClaudePoisonedPreviousMessageIdError(parsed) &&
+      !isClaudeImageProcessingError(parsed);
+    const resultExitCode = controlledTerminalResultCleanup ? 0 : proc.exitCode;
+    const resultSignal = controlledTerminalResultCleanup ? null : proc.signal;
+    const processFailed = (resultExitCode ?? 0) !== 0 || resultSignal !== null;
+    const failed = processFailed || parsedIsError;
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -932,8 +958,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
-    const errorMessage = failed
-      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+    const errorMessage = parsedIsError
+      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${resultExitCode ?? -1}`
+      : resultSignal
+      ? `Claude exited due to signal ${resultSignal}`
+      : processFailed
+      ? `Claude exited with code ${resultExitCode ?? -1}`
       : null;
     const transientUpstream =
       failed &&
@@ -976,8 +1006,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     return {
-      exitCode: proc.exitCode,
-      signal: proc.signal,
+      exitCode: resultExitCode,
+      signal: resultSignal,
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,

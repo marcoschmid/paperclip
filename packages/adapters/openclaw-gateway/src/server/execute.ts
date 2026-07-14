@@ -459,15 +459,21 @@ function appendWakeText(baseText: string, wakeText: string): string {
   return trimmedBase.length > 0 ? `${trimmedBase}\n\n${wakeText}` : wakeText;
 }
 
-function joinWakePayloadSections(structuredWakePrompt: string, structuredWakeJson: string): string {
-  const sections = [
-    structuredWakePrompt.trim(),
+function renderStructuredWakePayloadJson(structuredWakeJson: string): string {
+  if (!structuredWakeJson.trim()) return "";
+  return [
     "Structured wake payload JSON:",
     "```json",
     structuredWakeJson,
     "```",
-  ].filter((entry) => entry.trim().length > 0);
-  return sections.join("\n");
+  ].join("\n");
+}
+
+function joinPromptSections(...sections: Array<string | null>): string {
+  return sections
+    .map((section) => section?.trim() ?? "")
+    .filter((section) => section.length > 0)
+    .join("\n\n");
 }
 
 export function buildAgentParams(input: {
@@ -1086,17 +1092,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
   const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
   const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
-  const wakeText = buildWakeText(
-    wakePayload,
-    paperclipEnv,
-    structuredWakeJson
-      ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
-      : structuredWakePrompt,
-  );
+  const taskMarkdown = nonEmpty(ctx.context.paperclipTaskMarkdown);
+  const sessionHandoff = nonEmpty(ctx.context.paperclipSessionHandoffMarkdown);
+  const structuredWakeJsonSection = renderStructuredWakePayloadJson(structuredWakeJson ?? "");
+  const structuredWakeReason = nonEmpty(parseObject(ctx.context.paperclipWake).reason);
+  const lifecyclePendingCanary =
+    (structuredWakeReason ?? wakePayload.wakeReason) === "lifecycle_pending_canary";
+  const wakeText = lifecyclePendingCanary
+    ? joinPromptSections(
+        taskMarkdown,
+        sessionHandoff,
+        structuredWakeJsonSection,
+        structuredWakePrompt,
+      )
+    : buildWakeText(
+        wakePayload,
+        paperclipEnv,
+        joinPromptSections(
+          structuredWakePrompt,
+          sessionHandoff,
+          taskMarkdown,
+          structuredWakeJsonSection,
+        ),
+      );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
   const configuredAgentId = nonEmpty(ctx.config.agentId);
+  const forceFreshSession = parseBoolean(ctx.context.forceFreshSession, false);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
     configuredSessionKey,
@@ -1282,6 +1305,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
       );
 
+      if (forceFreshSession) {
+        await ctx.onLog(
+          "stdout",
+          `[openclaw-gateway] resetting session before agent execution key=${sessionKey}\n`,
+        );
+        try {
+          await client.request<Record<string, unknown>>(
+            "sessions.reset",
+            {
+              key: sessionKey,
+              ...(configuredAgentId ? { agentId: configuredAgentId } : {}),
+              reason: "reset",
+            },
+            { timeoutMs: connectTimeoutMs },
+          );
+        } catch (err) {
+          const resetMessage = err instanceof Error ? err.message : String(err);
+          throw new Error(`OpenClaw gateway fresh-session reset failed: ${resetMessage}`);
+        }
+        await ctx.onLog(
+          "stdout",
+          `[openclaw-gateway] fresh session reset completed key=${sessionKey}\n`,
+        );
+      }
+
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
       });
@@ -1321,11 +1369,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
         const waitStatus = nonEmpty(waitPayload?.status)?.toLowerCase() ?? "";
         if (waitStatus === "timeout") {
+          const timeoutPhase = nonEmpty(waitPayload?.timeoutPhase)?.toLowerCase();
           return {
             exitCode: 1,
             signal: null,
             timedOut: true,
-            errorMessage: `OpenClaw gateway run timed out after ${waitTimeoutMs}ms`,
+            errorMessage:
+              timeoutPhase === "gateway_draining"
+                ? `OpenClaw gateway run was still active at the ${waitTimeoutMs}ms wait deadline (gateway_draining)`
+                : `OpenClaw gateway run timed out after ${waitTimeoutMs}ms`,
             errorCode: "openclaw_gateway_wait_timeout",
             resultJson: waitPayload,
           };

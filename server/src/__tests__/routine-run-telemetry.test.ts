@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -62,6 +63,7 @@ describeEmbeddedPostgres("routine run telemetry", () => {
     await db.delete(documents);
     await db.delete(documentRevisions);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
@@ -115,22 +117,40 @@ describeEmbeddedPostgres("routine run telemetry", () => {
             || null;
           if (!issueId) return null;
           const queuedRunId = randomUUID();
-          await db.insert(heartbeatRuns).values({
-            id: queuedRunId,
-            companyId,
-            agentId: wakeupAgentId,
-            invocationSource: wakeupOpts.source ?? "assignment",
-            triggerDetail: wakeupOpts.triggerDetail ?? null,
-            status: "queued",
-            contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+          const wakeupRequestId = randomUUID();
+          await db.transaction(async (tx) => {
+            await tx.insert(agentWakeupRequests).values({
+              id: wakeupRequestId,
+              companyId,
+              agentId: wakeupAgentId,
+              source: wakeupOpts.source ?? "assignment",
+              triggerDetail: wakeupOpts.triggerDetail ?? null,
+              reason: wakeupOpts.reason ?? null,
+              payload: wakeupOpts.payload ?? { issueId },
+              status: "queued",
+              requestedByActorType: wakeupOpts.requestedByActorType ?? null,
+              requestedByActorId: wakeupOpts.requestedByActorId ?? null,
+              idempotencyKey: wakeupOpts.idempotencyKey ?? null,
+              runId: queuedRunId,
+            });
+            await tx.insert(heartbeatRuns).values({
+              id: queuedRunId,
+              companyId,
+              agentId: wakeupAgentId,
+              invocationSource: wakeupOpts.source ?? "assignment",
+              triggerDetail: wakeupOpts.triggerDetail ?? null,
+              status: "queued",
+              wakeupRequestId,
+              contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+            });
+            await tx
+              .update(issues)
+              .set({
+                executionRunId: queuedRunId,
+                executionLockedAt: new Date(),
+              })
+              .where(eq(issues.id, issueId));
           });
-          await db
-            .update(issues)
-            .set({
-              executionRunId: queuedRunId,
-              executionLockedAt: new Date(),
-            })
-            .where(eq(issues.id, issueId));
           return { id: queuedRunId };
         },
       },

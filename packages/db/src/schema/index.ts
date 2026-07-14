@@ -21,6 +21,7 @@ export { agentApiKeys } from "./agent_api_keys.js";
 export { agentRuntimeState } from "./agent_runtime_state.js";
 export { agentTaskSessions } from "./agent_task_sessions.js";
 export { agentWakeupRequests } from "./agent_wakeup_requests.js";
+export { agentPortfolioMaintenanceGates } from "./agent_portfolio_maintenance_gates.js";
 export { projects } from "./projects.js";
 export { projectMemberships } from "./project_memberships.js";
 export { projectWorkspaces } from "./project_workspaces.js";
@@ -31,6 +32,7 @@ export { environmentCustomImageTemplates } from "./environment_custom_image_temp
 export { environmentCustomImageSetupSessions } from "./environment_custom_image_setup_sessions.js";
 export { workspaceOperations } from "./workspace_operations.js";
 export { workspaceRuntimeServices } from "./workspace_runtime_services.js";
+export { workspaceRuntimeStartClaims } from "./workspace_runtime_start_claims.js";
 export { projectGoals } from "./project_goals.js";
 export { goals } from "./goals.js";
 export { issues } from "./issues.js";
@@ -42,6 +44,7 @@ export { externalObjects } from "./external_objects.js";
 export { externalObjectMentions } from "./external_object_mentions.js";
 export { issueRelations } from "./issue_relations.js";
 export { routines, routineRevisions, routineTriggers, routineRuns } from "./routines.js";
+export { routineRunDeliveries } from "./routine_run_deliveries.js";
 export { pipelines, pipelineStages, pipelineTransitions } from "./pipelines.js";
 export {
   pipelineCases,
@@ -83,6 +86,13 @@ export { heartbeatRunWatchdogDecisions } from "./heartbeat_run_watchdog_decision
 export { costEvents } from "./cost_events.js";
 export { financeEvents } from "./finance_events.js";
 export { approvals } from "./approvals.js";
+export { approvalExecutionClaims } from "./approval_execution_claims.js";
+export {
+  agentRetirementPlanClaims,
+  agentRetirementExecutionClaims,
+  agentRetirementPlanEvidenceBundles,
+  agentRetirementExecutionRecoveries,
+} from "./agent_retirement_claims.js";
 export { approvalComments } from "./approval_comments.js";
 export { activityLog } from "./activity_log.js";
 export { companySecretProviderConfigs } from "./company_secret_provider_configs.js";

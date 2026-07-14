@@ -29,6 +29,7 @@ import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { goalRoutes } from "./routes/goals.js";
 import { boardChatRoutes } from "./routes/board-chat.js";
 import { approvalRoutes } from "./routes/approvals.js";
+import { approvalExecutionClaimRoutes } from "./routes/approval-execution-claims.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
@@ -55,7 +56,11 @@ import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader } from "./services/plugin-loader.js";
-import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
+import {
+  createPluginWorkerManager,
+  registerPluginWorkerStartupReadiness,
+  type PluginWorkerManager,
+} from "./services/plugin-worker-manager.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
@@ -157,6 +162,7 @@ export async function createApp(
     localPluginDir?: string;
     pluginMigrationDb?: Db;
     pluginWorkerManager?: PluginWorkerManager;
+    deferBackgroundServices?: boolean;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
   },
@@ -247,6 +253,7 @@ export async function createApp(
   api.use(goalRoutes(db));
   api.use(boardChatRoutes(db, { deploymentMode: opts.deploymentMode }));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(approvalExecutionClaimRoutes(db));
   api.use(secretRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
@@ -448,8 +455,15 @@ export async function createApp(
 
   app.use(errorHandler);
 
-  jobCoordinator.start();
-  scheduler.start();
+  let backgroundServicesStarted = false;
+  const startBackgroundServices = () => {
+    if (backgroundServicesStarted) return;
+    backgroundServicesStarted = true;
+    jobCoordinator.start();
+    scheduler.start();
+  };
+  app.locals.paperclipStartBackgroundServices = startBackgroundServices;
+  if (!opts.deferBackgroundServices) startBackgroundServices();
   let feedbackExportShuttingDown = false;
   let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
   const disableFeedbackExportFlushes = () => {
@@ -547,18 +561,20 @@ export async function createApp(
       );
     }
   };
-  void ensureBundledKubernetesPlugin()
+  const pluginWorkerStartup = ensureBundledKubernetesPlugin()
     .then(() => loader.loadAll())
     .then((result) => {
-    if (!result) return;
-    for (const loaded of result.results) {
-      if (devWatcher && loaded.success && loaded.plugin.packagePath) {
-        devWatcher.watch(loaded.plugin.id, loaded.plugin.packagePath);
+      if (!result) return;
+      for (const loaded of result.results) {
+        if (devWatcher && loaded.success && loaded.plugin.packagePath) {
+          devWatcher.watch(loaded.plugin.id, loaded.plugin.packagePath);
+        }
       }
-    }
-  }).catch((err) => {
-    logger.error({ err }, "Failed to load ready plugins on startup");
-  });
+    }).catch((err) => {
+      logger.error({ err }, "Failed to load ready plugins on startup");
+    });
+  registerPluginWorkerStartupReadiness(workerManager, pluginWorkerStartup);
+  void pluginWorkerStartup;
   let appServicesShutdown = false;
   const shutdownAppServices = () => {
     if (appServicesShutdown) return;

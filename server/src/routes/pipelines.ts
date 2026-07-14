@@ -30,6 +30,7 @@ import {
   PIPELINE_CASE_EVENTS_MAX_LIMIT,
   PIPELINE_CONTEXT_PACK_EVENT_LIMIT,
   ensurePipelineCaseBodyDocumentFromSummary,
+  isPipelineCaseLeaseUsable,
   pipelineService,
   resolvePipelineCaseConversationSource,
   type PipelineActor,
@@ -1178,11 +1179,17 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     if (req.body.description !== undefined) patch.description = req.body.description;
     if (req.body.enforceTransitions !== undefined) patch.enforceTransitions = req.body.enforceTransitions;
     if (req.body.archived !== undefined) patch.archivedAt = req.body.archived ? new Date() : null;
-    const [updated] = await db
-      .update(pipelines)
-      .set(patch)
-      .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)))
-      .returning();
+    const updated = await db.transaction(async (tx) => {
+      if (req.body.archived === false) {
+        await svc.validatePipelineActivation(companyId, pipelineId, tx);
+      }
+      return tx
+        .update(pipelines)
+        .set(patch)
+        .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)))
+        .returning()
+        .then((rows) => rows[0]);
+    });
     res.json(updated);
   });
 
@@ -2584,7 +2591,7 @@ async function derivePipelineCaseLiveness(
     };
   }
 
-  if (row.case.leaseToken && row.case.leaseExpiresAt && row.case.leaseExpiresAt.getTime() > Date.now()) {
+  if (isPipelineCaseLeaseUsable(row.case)) {
     return {
       state: "live",
       reason: "lease_active",

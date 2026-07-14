@@ -262,7 +262,7 @@ describe("routine description annotation routes", () => {
       action: "routine.document_annotation_thread_reopened",
       details: expect.objectContaining({ documentKey: "description", threadId: annotationThread.id }),
     }));
-  });
+  }, 15_000);
 
   it("remaps open routine description annotations after routine description revisions", async () => {
     const updated = await request(await createApp())

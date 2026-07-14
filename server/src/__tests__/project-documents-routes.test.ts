@@ -69,8 +69,37 @@ describe("projectDocumentRoutes", () => {
       projectId: PID,
       key: "project-memory",
       body: "# Memory",
+      createdByAgentId: null,
+      createdByUserId: "tester",
+      createdByRunId: null,
     });
     expect(m.logActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("PUT derives authorship from the authenticated actor instead of request provenance", async () => {
+    m.upsert.mockResolvedValue({
+      created: true,
+      projectDocument: { id: "pd1" },
+      document: { id: "doc1", latestBody: "# Memory", latestRevisionNumber: 1 },
+      revision: { id: "rev1", revisionNumber: 1 },
+    });
+
+    const res = await request(await createApp()).put(keyPath).send({
+      body: "# Memory",
+      createdByAgentId: "8d403783-c4e2-4746-adad-7689cd95ae33",
+      createdByUserId: "forged-user",
+      createdByRunId: "33333333-3333-4333-8333-333333333333",
+    });
+
+    expect(res.status).toBe(201);
+    expect(m.upsert).toHaveBeenCalledWith(CID, {
+      projectId: PID,
+      key: "project-memory",
+      body: "# Memory",
+      createdByAgentId: null,
+      createdByUserId: "tester",
+      createdByRunId: null,
+    });
   });
 
   it("PUT returns 200 when the document already existed (new revision)", async () => {

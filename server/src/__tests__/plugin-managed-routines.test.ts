@@ -4,11 +4,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agentConfigRevisions,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
   documentRevisions,
   documents,
+  heartbeatRuns,
   issues,
   pluginManagedResources,
   plugins,
@@ -116,6 +118,8 @@ describeEmbeddedPostgres("plugin-managed routines", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agentConfigRevisions);
     await db.delete(activityLog);
     await db.delete(pluginManagedResources);
@@ -235,7 +239,66 @@ describeEmbeddedPostgres("plugin-managed routines", () => {
     const agent = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
     const project = await services.projects.reconcileManaged({ companyId, projectKey: "operations" });
     const routine = await services.routines.managedReconcile({ companyId, routineKey: "nightly-lint" });
-    const wakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const wakeup = vi.fn(async (agentId: string, wakeupOpts: {
+      source?: string;
+      triggerDetail?: string | null;
+      reason?: string | null;
+      payload?: Record<string, unknown> | null;
+      idempotencyKey?: string | null;
+      requestedByActorType?: string | null;
+      requestedByActorId?: string | null;
+      contextSnapshot?: Record<string, unknown>;
+    }) => {
+      const issueId = typeof wakeupOpts.payload?.issueId === "string"
+        ? wakeupOpts.payload.issueId
+        : null;
+      if (!issueId) return null;
+      const issue = await db.select({
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        originRunId: issues.originRunId,
+      }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      if (
+        !issue?.originRunId
+        || issue.companyId !== companyId
+        || issue.assigneeAgentId !== agentId
+        || wakeupOpts.idempotencyKey !== `routine-delivery:${issue.originRunId}`
+      ) return null;
+
+      const heartbeatRunId = randomUUID();
+      const wakeupRequestId = randomUUID();
+      await db.transaction(async (tx) => {
+        await tx.insert(agentWakeupRequests).values({
+          id: wakeupRequestId,
+          companyId,
+          agentId,
+          source: wakeupOpts.source ?? "assignment",
+          triggerDetail: wakeupOpts.triggerDetail ?? null,
+          reason: wakeupOpts.reason ?? null,
+          payload: { ...wakeupOpts.payload, issueId, originRunId: issue.originRunId },
+          status: "queued",
+          requestedByActorType: wakeupOpts.requestedByActorType ?? null,
+          requestedByActorId: wakeupOpts.requestedByActorId ?? null,
+          idempotencyKey: wakeupOpts.idempotencyKey,
+          runId: heartbeatRunId,
+        });
+        await tx.insert(heartbeatRuns).values({
+          id: heartbeatRunId,
+          companyId,
+          agentId,
+          invocationSource: wakeupOpts.source ?? "assignment",
+          triggerDetail: wakeupOpts.triggerDetail ?? null,
+          status: "queued",
+          wakeupRequestId,
+          contextSnapshot: {
+            ...(wakeupOpts.contextSnapshot ?? {}),
+            issueId,
+            originRunId: issue.originRunId,
+          },
+        });
+      });
+      return { id: heartbeatRunId };
+    });
     const routinesSvc = routineService(db, { heartbeat: { wakeup } });
 
     const run = await routinesSvc.runRoutine(routine.routineId!, { source: "manual" }, { userId: "board-user" });

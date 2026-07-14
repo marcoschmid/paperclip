@@ -45,17 +45,21 @@ import {
   isCodexUnknownSessionError,
 } from "./parse.js";
 import {
+  acquireManagedCodexHomeLease,
   evaluateCodexCredentialReadiness,
+  ensureManagedCodexHomePath,
   isManagedCodexHomePath,
   pathExists,
   prepareManagedCodexHome,
   resolveManagedCodexHomeDir,
   resolveSharedCodexHomeDir,
-  seedManagedCodexHome,
 } from "./codex-home.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
-import { buildCodexExecArgs } from "./codex-args.js";
+import {
+  buildCodexExecArgs,
+  CODEX_MANAGED_RUNTIME_POLICY_VERSION,
+} from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
@@ -67,6 +71,62 @@ import {
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROLLOUT_NOISE_RE =
   /^\d{4}-\d{2}-\d{2}T[^\s]+\s+ERROR\s+codex_core::rollout::list:\s+state db missing rollout path for thread\s+[a-z0-9-]+$/i;
+const MANAGED_CODEX_CHILD_ENV_ROOT = [".paperclip-runtime", "env"] as const;
+
+function resolveManagedCodexChildEnv(
+  codexHome: string,
+  pathStyle: "native" | "posix",
+): Record<"HOME" | "XDG_CONFIG_HOME" | "XDG_CACHE_HOME" | "XDG_DATA_HOME" | "XDG_STATE_HOME", string> {
+  const join = pathStyle === "posix" ? path.posix.join : path.join;
+  const envRoot = join(codexHome, ...MANAGED_CODEX_CHILD_ENV_ROOT);
+  const xdgRoot = join(envRoot, "xdg");
+  return {
+    HOME: join(envRoot, "home"),
+    XDG_CONFIG_HOME: join(xdgRoot, "config"),
+    XDG_CACHE_HOME: join(xdgRoot, "cache"),
+    XDG_DATA_HOME: join(xdgRoot, "data"),
+    XDG_STATE_HOME: join(xdgRoot, "state"),
+  };
+}
+
+async function ensurePrivateManagedCodexDirectory(
+  codexHome: string,
+  relativeSegments: readonly string[],
+): Promise<void> {
+  const realHome = await fs.realpath(codexHome);
+  let current = codexHome;
+  for (const segment of relativeSegments) {
+    current = path.join(current, segment);
+    let existing = await fs.lstat(current).catch(() => null);
+    if (!existing) {
+      await fs.mkdir(current, { mode: 0o700 }).catch(async (error) => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
+      existing = await fs.lstat(current).catch(() => null);
+    }
+    if (!existing || existing.isSymbolicLink() || !existing.isDirectory()) {
+      throw new Error(`Managed Codex private runtime path must be a real directory: ${current}`);
+    }
+    await fs.chmod(current, 0o700);
+    const realCurrent = await fs.realpath(current);
+    const relative = path.relative(realHome, realCurrent);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`Managed Codex private runtime path escapes CODEX_HOME: ${current}`);
+    }
+  }
+}
+
+async function ensureManagedCodexChildEnvDirectories(codexHome: string): Promise<void> {
+  for (const relativeSegments of [
+    [...MANAGED_CODEX_CHILD_ENV_ROOT, "home"],
+    [...MANAGED_CODEX_CHILD_ENV_ROOT, "xdg", "config"],
+    [...MANAGED_CODEX_CHILD_ENV_ROOT, "xdg", "cache"],
+    [...MANAGED_CODEX_CHILD_ENV_ROOT, "xdg", "data"],
+    [...MANAGED_CODEX_CHILD_ENV_ROOT, "xdg", "state"],
+  ]) {
+    await ensurePrivateManagedCodexDirectory(codexHome, relativeSegments);
+  }
+}
 
 function stripCodexRolloutNoise(text: string): string {
   const parts = text.split(/\r?\n/);
@@ -207,6 +267,7 @@ type EnsureCodexSkillsInjectedOptions = {
   skillsEntries?: Array<{ key: string; runtimeName: string; source: string }>;
   desiredSkillNames?: string[];
   linkSkill?: (source: string, target: string) => Promise<void>;
+  managedHome?: boolean;
 };
 
 type CodexTransientFallbackMode =
@@ -264,10 +325,31 @@ export async function ensureCodexSkillsInjected(
     options.desiredSkillNames ?? allSkillsEntries.map((entry) => entry.key);
   const desiredSet = new Set(desiredSkillNames);
   const skillsEntries = allSkillsEntries.filter((entry) => desiredSet.has(entry.key));
+  const skillsHome = options.skillsHome ?? resolveCodexSkillsDir(resolveSharedCodexHomeDir());
+  let managedSkillsHome = options.managedHome
+    ? await fs.lstat(skillsHome).catch(() => null)
+    : null;
+  if (managedSkillsHome?.isSymbolicLink()) {
+    throw new Error(`Managed Codex skills home must not be a symbolic link: ${skillsHome}`);
+  }
+  if (managedSkillsHome && !managedSkillsHome.isDirectory()) {
+    throw new Error(`Managed Codex skills home must be a directory: ${skillsHome}`);
+  }
+  if (managedSkillsHome) await fs.chmod(skillsHome, 0o700);
   if (skillsEntries.length === 0) return;
 
-  const skillsHome = options.skillsHome ?? resolveCodexSkillsDir(resolveSharedCodexHomeDir());
-  await fs.mkdir(skillsHome, { recursive: true });
+  if (options.managedHome) {
+    if (!managedSkillsHome) {
+      await fs.mkdir(skillsHome, { recursive: true, mode: 0o700 });
+      managedSkillsHome = await fs.lstat(skillsHome).catch(() => null);
+    }
+    if (!managedSkillsHome || managedSkillsHome.isSymbolicLink() || !managedSkillsHome.isDirectory()) {
+      throw new Error(`Managed Codex skills home is not a safe directory: ${skillsHome}`);
+    }
+    await fs.chmod(skillsHome, 0o700);
+  } else {
+    await fs.mkdir(skillsHome, { recursive: true });
+  }
   const linkSkill = options.linkSkill;
   for (const entry of skillsEntries) {
     const target = path.join(skillsHome, entry.runtimeName);
@@ -382,21 +464,53 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // seeded — it ships with no credentials and OPENAI_API_KEY="" by default.
   // Only a genuine external/user-supplied override is treated as self-managed
   // and left untouched.
-  const configuredHomeIsManaged =
+  const configuredHomeWithinManagedCompany =
     configuredCodexHome != null &&
     isManagedCodexHomePath(process.env, agent.companyId, configuredCodexHome);
+  const configuredHomeIsManaged =
+    configuredCodexHome != null &&
+    isManagedCodexHomePath(process.env, agent.companyId, configuredCodexHome, agent.id);
+  if (configuredHomeWithinManagedCompany && !configuredHomeIsManaged) {
+    throw new Error(`Configured managed CODEX_HOME does not belong to agent "${agent.id}"`);
+  }
+  const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId, agent.id);
+  const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
+  const effectiveHomeIsManaged = configuredCodexHome == null || configuredHomeIsManaged;
+  const runtimeSurfacePolicyVersion = asString(
+    parseObject(config.paperclipRuntimeSurface).policyVersion,
+    "",
+  ).trim();
+  if (
+    effectiveHomeIsManaged &&
+    runtimeSurfacePolicyVersion !== CODEX_MANAGED_RUNTIME_POLICY_VERSION
+  ) {
+    throw new Error(
+      `Paperclip-managed Codex runtime requires non-overridable policy version ` +
+        `${JSON.stringify(CODEX_MANAGED_RUNTIME_POLICY_VERSION)}; received ` +
+        `${JSON.stringify(runtimeSurfacePolicyVersion || null)}.`,
+    );
+  }
+  let managedHomeLease: Awaited<ReturnType<typeof acquireManagedCodexHomeLease>> | null = null;
+  if (effectiveHomeIsManaged) {
+    await ensureManagedCodexHomePath(process.env, agent.companyId, agent.id, effectiveCodexHome);
+    managedHomeLease = await acquireManagedCodexHomeLease(effectiveCodexHome);
+  }
+  try {
   if (configuredCodexHome == null) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
+      agentId: agent.id,
     });
   } else if (configuredHomeIsManaged) {
-    await seedManagedCodexHome(configuredCodexHome, process.env, onLog, {
+    await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
+      agentId: agent.id,
     });
   }
-  const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
-  const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
+  if (effectiveHomeIsManaged) {
+    await ensureManagedCodexChildEnvDirectories(effectiveCodexHome);
+  }
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json and
   // with OPENAI_API_KEY="" the provider rejects every request with
@@ -409,6 +523,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const credentialReadiness = await evaluateCodexCredentialReadiness({
     env: process.env,
     companyId: agent.companyId,
+    agentId: agent.id,
     configuredCodexHome,
     configuredApiKey: configuredOpenAiApiKey,
   });
@@ -431,7 +546,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const preparedRuntimeConfig = await prepareCodexRuntimeConfig({
     env: envConfigStrings,
-    codexHome: configuredCodexHome ? null : effectiveCodexHome,
+    codexHome: credentialReadiness.managed ? effectiveCodexHome : null,
   });
   try {
     for (const note of preparedRuntimeConfig.notes) {
@@ -446,6 +561,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         skillsHome: codexSkillsDir,
         skillsEntries: codexSkillEntries,
         desiredSkillNames,
+        managedHome: credentialReadiness.managed,
       },
     );
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
@@ -585,6 +701,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
     }
     env.CODEX_HOME = remoteCodexHome ?? effectiveCodexHome;
+    if (credentialReadiness.managed) {
+      Object.assign(
+        env,
+        resolveManagedCodexChildEnv(
+          env.CODEX_HOME,
+          executionTargetIsRemote ? "posix" : "native",
+        ),
+      );
+    }
     if (!hasExplicitApiKey && authToken) {
       env.PAPERCLIP_API_KEY = authToken;
     }
@@ -699,13 +824,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       run: { id: runId, source: "on_demand" },
       context,
     };
+    const structuredWakeReason = asString(parseObject(context.paperclipWake).reason, "").trim();
+    const lifecyclePendingCanary =
+      (structuredWakeReason || wakeReason) === "lifecycle_pending_canary";
     const renderedBootstrapPrompt =
-      !sessionId && bootstrapPromptTemplate.trim().length > 0
+      !lifecyclePendingCanary && !sessionId && bootstrapPromptTemplate.trim().length > 0
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
+    const promptInstructionsPrefix =
+      lifecyclePendingCanary || shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
     instructionsChars = promptInstructionsPrefix.length;
     const continuationSummary = parseObject(context.paperclipContinuationSummary);
     const continuationSummaryBody = asString(continuationSummary.body, "").trim() || null;
@@ -729,6 +858,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return notes;
       }
       if (instructionsPrefix.length > 0) {
+        if (lifecyclePendingCanary) {
+          return [
+            `Loaded agent instructions from ${instructionsFilePath}`,
+            "Skipped stdin instruction injection because a lifecycle canary uses a bounded one-shot prompt.",
+            repoAgentsNote,
+          ];
+        }
         if (shouldUseResumeDeltaPrompt) {
           const notes = [
             `Loaded agent instructions from ${instructionsFilePath}`,
@@ -776,22 +912,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (preparedRuntimeConfig.notes.length > 0) {
       commandNotes.unshift(...preparedRuntimeConfig.notes);
     }
-    const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
+    const renderedPrompt =
+      lifecyclePendingCanary || shouldUseResumeDeltaPrompt
+        ? ""
+        : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-    const prompt = joinPromptSections([
-      promptInstructionsPrefix,
-      renderedBootstrapPrompt,
-      wakePrompt,
-      codexFallbackHandoffNote,
-      sessionHandoffNote,
-      renderedPrompt,
-    ]);
+    const taskContextNote = asString(context.paperclipTaskMarkdown, "").trim();
+    const prompt = lifecyclePendingCanary
+      ? joinPromptSections([
+          taskContextNote,
+          sessionHandoffNote,
+          wakePrompt,
+        ])
+      : joinPromptSections([
+          promptInstructionsPrefix,
+          renderedBootstrapPrompt,
+          wakePrompt,
+          codexFallbackHandoffNote,
+          sessionHandoffNote,
+          taskContextNote,
+          renderedPrompt,
+        ]);
     const promptMetrics = {
       promptChars: prompt.length,
       instructionsChars,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
       wakePromptChars: wakePrompt.length,
       sessionHandoffChars: sessionHandoffNote.length,
+      taskContextChars: taskContextNote.length,
       heartbeatPromptChars: renderedPrompt.length,
     };
 
@@ -801,6 +949,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         {
           resumeSessionId,
           skipGitRepoCheck: executionTargetIsSandbox,
+          managedRuntime: credentialReadiness.managed,
+          lifecyclePendingCanary,
         },
       );
       const args = execArgs.args;
@@ -811,6 +961,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (onMeta) {
         await onMeta({
           adapterType: "codex_local",
+          runtimeSurfacePolicyVersion: credentialReadiness.managed
+            ? CODEX_MANAGED_RUNTIME_POLICY_VERSION
+            : null,
           command: resolvedCommand,
           cwd: effectiveExecutionCwd,
           commandNotes: commandNotesWithFastMode,
@@ -983,6 +1136,37 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           clearSession: clearSessionOnMissingSession,
         };
       }
+      if (lifecyclePendingCanary && attempt.parsed.activityItemTypes.length > 0) {
+        const itemTypes = attempt.parsed.activityItemTypes;
+        const errorMessage =
+          `Lifecycle canary emitted forbidden Codex tool/runtime activity: ${itemTypes.join(", ")}`;
+        return {
+          exitCode: attempt.proc.exitCode,
+          signal: attempt.proc.signal,
+          timedOut: false,
+          errorMessage,
+          errorCode: "codex_lifecycle_canary_tool_activity",
+          errorFamily: null,
+          usage: attempt.parsed.usage,
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          provider: "openai",
+          biller: resolveCodexBiller(effectiveEnv, billingType),
+          model,
+          billingType,
+          costUsd: null,
+          resultJson: {
+            stdout: attempt.proc.stdout,
+            stderr: attempt.proc.stderr,
+            lifecycleCanaryActivityViolation: {
+              itemTypes,
+            },
+          },
+          summary: attempt.parsed.summary,
+          clearSession: true,
+        };
+      }
 
       const canFallbackToRuntimeSession = !isRetry && !forceFreshSession;
       const resolvedSessionId =
@@ -1098,5 +1282,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
     await preparedRuntimeConfig.cleanup();
+    }
+  } finally {
+    await managedHomeLease?.release();
   }
 }

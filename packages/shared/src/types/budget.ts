@@ -5,7 +5,7 @@ import type {
   BudgetScopeType,
   BudgetThresholdType,
   BudgetWindowKind,
-  PauseReason,
+  AgentPauseReason,
 } from "../constants.js";
 
 export interface BudgetPolicy {
@@ -44,7 +44,7 @@ export interface BudgetPolicySummary {
   isActive: boolean;
   status: "ok" | "warning" | "hard_stop";
   paused: boolean;
-  pauseReason: PauseReason | null;
+  pauseReason: AgentPauseReason | null;
   windowStart: Date;
   windowEnd: Date;
 }

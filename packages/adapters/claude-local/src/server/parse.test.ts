@@ -77,6 +77,40 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(true);
   });
 
+  it("does not classify an allowed rate_limit_event as transient", () => {
+    const allowedEvent = JSON.stringify({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "allowed",
+        rateLimitType: "five_hour",
+      },
+    });
+    const successResult = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Completed normally.",
+    });
+
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "Completed normally.",
+        },
+        stdout: `${allowedEvent}\n${successResult}\n`,
+      }),
+    ).toBe(false);
+    expect(
+      isClaudeTransientUpstreamError({
+        stdout: allowedEvent,
+        stderr: "HTTP 429: Too Many Requests",
+      }),
+    ).toBe(true);
+  });
+
   it("classifies the subscription 5-hour / weekly limit wording", () => {
     expect(
       isClaudeTransientUpstreamError({

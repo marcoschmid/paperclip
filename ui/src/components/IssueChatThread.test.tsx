@@ -2103,6 +2103,47 @@ describe("IssueChatThread", () => {
     });
   });
 
+  it.each([
+    ["maintenance", "It was paused for portfolio maintenance."],
+    [null, "Its pause reason is unavailable."],
+    ["future_reason", "Its pause reason is unavailable."],
+  ])("renders the %s pause reason without mislabelling it", (pauseReason, expectedCopy) => {
+    const root = createRoot(container);
+    const pausedAgent = {
+      id: "agent-1",
+      companyId: "company-1",
+      name: "CodexCoder",
+      status: "paused",
+      pauseReason,
+    } as unknown as Agent;
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <IssueChatThread
+            comments={[]}
+            linkedRuns={[]}
+            timelineEvents={[]}
+            liveRuns={[]}
+            agentMap={new Map([["agent-1", pausedAgent]])}
+            currentAssigneeValue="agent:agent-1"
+            onAdd={async () => {}}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.textContent).toContain(expectedCopy);
+    if (pauseReason !== "maintenance") {
+      expect(container.textContent).not.toContain("portfolio maintenance");
+    }
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("supports the embedded read-only variant without the jump control", () => {
     const root = createRoot(container);
 

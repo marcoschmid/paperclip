@@ -75,24 +75,21 @@ export function CodexLocalConfigFields({
           </div>
         </Field>
       )}
-      <ToggleField
-        label="Bypass sandbox"
-        hint={help.dangerouslyBypassSandbox}
-        checked={
-          isCreate
-            ? values!.dangerouslyBypassSandbox
-            : eff(
-                "adapterConfig",
-                "dangerouslyBypassApprovalsAndSandbox",
-                bypassEnabled,
-              )
-        }
-        onChange={(v) =>
-          isCreate
-            ? set!({ dangerouslyBypassSandbox: v })
-            : mark("adapterConfig", "dangerouslyBypassApprovalsAndSandbox", v)
-        }
-      />
+      {!isCreate && bypassEnabled && (
+        <ToggleField
+          label="Legacy global sandbox bypass (blocked)"
+          hint="Paperclip no longer executes Codex with the global approvals/sandbox bypass. Turn this legacy value off."
+          checked={eff(
+            "adapterConfig",
+            "dangerouslyBypassApprovalsAndSandbox",
+            true,
+          )}
+          onChange={(v) => {
+            mark("adapterConfig", "dangerouslyBypassApprovalsAndSandbox", v);
+            if (!v) mark("adapterConfig", "dangerouslyBypassSandbox", false);
+          }}
+        />
+      )}
       <ToggleField
         label="Enable search"
         hint={help.search}

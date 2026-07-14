@@ -7,6 +7,8 @@ import {
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  approvalExecutionClaims,
+  approvals,
   budgetPolicies,
   companySecretBindings,
   companySecrets,
@@ -43,6 +45,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
+import { inspectLocalProcessIdentity } from "../services/local-process-identity.js";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
@@ -129,15 +132,6 @@ function isPidAlive(pid: number | null | undefined) {
   }
 }
 
-async function waitForPidExit(pid: number, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isPidAlive(pid)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return !isPidAlive(pid);
-}
-
 async function waitForRunToSettle(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
@@ -193,6 +187,7 @@ async function cancelActiveRunsForCleanup(
     const activeRuns = await db
       .select({
         id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
         wakeupRequestId: heartbeatRuns.wakeupRequestId,
       })
       .from(heartbeatRuns)
@@ -207,33 +202,46 @@ async function cancelActiveRunsForCleanup(
 
     const now = new Date();
     const runIds = activeRuns.map((run) => run.id);
+    const agentIds = [...new Set(activeRuns.map((run) => run.agentId))].sort();
     const wakeupRequestIds = activeRuns
       .map((run) => run.wakeupRequestId)
       .filter((value): value is string => typeof value === "string" && value.length > 0);
 
-    await db
-      .update(heartbeatRuns)
-      .set({
-        status: "cancelled",
-        finishedAt: now,
-        updatedAt: now,
-        errorCode: "test_cleanup",
-        error: "Cancelled by heartbeat-process-recovery test cleanup",
-        processPid: null,
-        processGroupId: null,
-      })
-      .where(inArray(heartbeatRuns.id, runIds));
+    await db.transaction(async (tx) => {
+      // Maintenance-gate triggers lock the owning agent for every active Run
+      // or Wake mutation. Prelock all owners in canonical order so this
+      // multi-agent cleanup cannot invert Agent→Run against a live executor.
+      await tx
+        .select({ id: agents.id })
+        .from(agents)
+        .where(inArray(agents.id, agentIds))
+        .orderBy(agents.id)
+        .for("update");
 
-    if (wakeupRequestIds.length > 0) {
-      await db
-        .update(agentWakeupRequests)
+      await tx
+        .update(heartbeatRuns)
         .set({
           status: "cancelled",
           finishedAt: now,
+          updatedAt: now,
+          errorCode: "test_cleanup",
           error: "Cancelled by heartbeat-process-recovery test cleanup",
+          processPid: null,
+          processGroupId: null,
         })
-        .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
-    }
+        .where(inArray(heartbeatRuns.id, runIds));
+
+      if (wakeupRequestIds.length > 0) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: "Cancelled by heartbeat-process-recovery test cleanup",
+          })
+          .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+      }
+    });
 
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -318,6 +326,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
     }
     cleanupPids.clear();
+    await db.delete(approvalExecutionClaims);
     await cancelActiveRunsForCleanup(db, 5_000);
     let idlePolls = 0;
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -346,6 +355,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await waitForHeartbeatIdle(db, 5_000);
     await new Promise((resolve) => setTimeout(resolve, 100));
     await db.delete(activityLog);
+    await db.delete(approvals);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
     await db.delete(costEvents);
@@ -391,6 +401,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(budgetPolicies);
     for (let attempt = 0; attempt < 5; attempt += 1) {
+      // A late heartbeat finalizer may enqueue a follow-up wake between the
+      // initial cleanup and this FK-sensitive agent deletion. Re-clear the
+      // dependent rows on every retry so the fixture teardown converges.
+      await db.delete(agentWakeupRequests);
       await db.delete(agentRuntimeState);
       try {
         await db.delete(agents);
@@ -449,6 +463,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
+    processStartedAt?: Date | null;
+    processExecutable?: string | null;
+    processCommandSha256?: string | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -509,6 +526,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
+      processStartedAt: input?.processStartedAt ?? null,
+      processExecutable: input?.processExecutable ?? null,
+      processCommandSha256: input?.processCommandSha256 ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
@@ -1317,7 +1337,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(lease?.releasedAt).toBeTruthy();
   });
 
-  it.skipIf(process.platform === "win32")("reaps orphaned descendant process groups when the parent pid is already gone", async () => {
+  it.skipIf(process.platform === "win32")("fails closed without signalling an orphaned process group whose owner identity cannot be re-proven", async () => {
     const orphan = await spawnOrphanedProcessGroup();
     cleanupPids.add(orphan.descendantPid);
     expect(isPidAlive(orphan.descendantPid)).toBe(true);
@@ -1333,28 +1353,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.reaped).toBe(1);
     expect(result.runIds).toEqual([runId]);
 
-    expect(await waitForPidExit(orphan.descendantPid, 2_000)).toBe(true);
+    expect(isPidAlive(orphan.descendantPid)).toBe(true);
 
     const runs = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toHaveLength(2);
+    expect(runs).toHaveLength(1);
 
     const failedRun = runs.find((row) => row.id === runId);
     expect(failedRun?.status).toBe("failed");
-    expect(failedRun?.errorCode).toBe("process_lost");
-    expect(failedRun?.error).toContain("descendant process group");
-
-    const retryRun = runs.find((row) => row.id !== runId);
-    expect(["queued", "running"]).toContain(retryRun?.status);
+    expect(failedRun?.errorCode).toBe("process_identity_unproven");
+    expect(failedRun?.error).toContain("was not signalled");
+    expect(failedRun?.error).toContain("manual intervention is required");
+    expect(runs.some((row) => row.retryOfRunId === runId)).toBe(false);
 
     const issue = await db
       .select()
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect(issue?.executionRunId).toBeNull();
   });
 
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {
@@ -2446,33 +2465,261 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
-  it("terminates the in-memory process before persisting cancellation status", async () => {
+  it("terminates an exact in-memory process and terminalizes it inside the signal fence", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    const identity = inspection.identity;
+
     const { runId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: false,
+      processPid: identity.pid,
+      processGroupId: identity.processGroupId,
+      processStartedAt: new Date(identity.processStartedAt),
+      processExecutable: identity.processExecutable,
+      processCommandSha256: identity.processCommandSha256,
     });
     const heartbeat = heartbeatService(db);
     runningProcesses.set(runId, {
-      child: { pid: 12345 } as ChildProcess,
+      child,
       graceSec: 1,
-      processGroupId: null,
+      processGroupId: identity.processGroupId,
     });
-    mockTerminateLocalService.mockResolvedValueOnce(undefined);
-    const updateSpy = vi.spyOn(db, "update");
-    updateSpy.mockImplementationOnce((() => {
-      throw new Error("db update unavailable");
-    }) as typeof db.update);
+    const cancelled = await heartbeat.cancelRun(runId);
+    expect(cancelled?.status).toBe("cancelled");
+    expect(mockTerminateLocalService).toHaveBeenCalledWith(
+      expect.objectContaining({ pid: identity.pid, processGroupId: identity.processGroupId }),
+      expect.objectContaining({ forceAfterMs: 0, signalWithinFence: expect.any(Function) }),
+    );
+    expect(runningProcesses.has(runId)).toBe(false);
+    expect(isPidAlive(identity.pid)).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("rechecks an absent target before a queued cancellation can overwrite a newly started child", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    const identity = inspection.identity;
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      runStatus: "queued",
+      includeIssue: false,
+    });
+
+    const originalTransaction = db.transaction.bind(db);
+    const transactionSpy = vi.spyOn(db, "transaction");
+    transactionSpy.mockImplementationOnce((async (...args: Parameters<typeof db.transaction>) => {
+      await db.update(heartbeatRuns).set({
+        status: "running",
+        processPid: identity.pid,
+        processGroupId: identity.processGroupId,
+        processStartedAt: new Date(identity.processStartedAt),
+        processExecutable: identity.processExecutable,
+        processCommandSha256: identity.processCommandSha256,
+        updatedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, runId));
+      return originalTransaction(...args);
+    }) as typeof db.transaction);
 
     try {
-      await expect(heartbeat.cancelRun(runId)).rejects.toThrow("db update unavailable");
-      expect(mockTerminateLocalService).toHaveBeenCalledWith(
-        expect.objectContaining({ pid: 12345, processGroupId: null }),
-        { forceAfterMs: 1000 },
-      );
-      expect(runningProcesses.has(runId)).toBe(false);
+      await expect(heartbeatService(db).cancelRun(runId)).rejects.toThrow(/changed|fence|drift/i);
     } finally {
-      updateSpy.mockRestore();
+      transactionSpy.mockRestore();
     }
+
+    expect(mockTerminateLocalService).not.toHaveBeenCalled();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run).toMatchObject({
+      status: "running",
+      processPid: identity.pid,
+      processGroupId: identity.processGroupId,
+    });
+    expect(isPidAlive(identity.pid)).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("rechecks the locked run before signalling when cancellation races a terminal run", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    const identity = inspection.identity;
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+      processPid: identity.pid,
+      processGroupId: identity.processGroupId,
+      processStartedAt: new Date(identity.processStartedAt),
+      processExecutable: identity.processExecutable,
+      processCommandSha256: identity.processCommandSha256,
+    });
+
+    let signalCount = 0;
+    let fenceObserved = false;
+    mockTerminateLocalService.mockImplementationOnce(async (_record, opts) => {
+      await db.update(heartbeatRuns).set({
+        status: "succeeded",
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, runId));
+      fenceObserved = typeof opts?.signalWithinFence === "function";
+      if (!opts?.signalWithinFence) throw new Error("missing database signal fence");
+      await opts.signalWithinFence("SIGTERM", () => {
+        signalCount += 1;
+      });
+    });
+
+    await expect(heartbeatService(db).cancelRun(runId)).rejects.toThrow(/changed|fence|terminal/i);
+
+    expect(fenceObserved).toBe(true);
+    expect(signalCount).toBe(0);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("rechecks the database fence before escalating from SIGTERM to SIGKILL", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    const identity = inspection.identity;
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+      processPid: identity.pid,
+      processGroupId: identity.processGroupId,
+      processStartedAt: new Date(identity.processStartedAt),
+      processExecutable: identity.processExecutable,
+      processCommandSha256: identity.processCommandSha256,
+    });
+    runningProcesses.set(runId, {
+      child,
+      graceSec: 1,
+      processGroupId: identity.processGroupId,
+    });
+
+    let termSignals = 0;
+    let killSignals = 0;
+    mockTerminateLocalService.mockImplementationOnce(async (_record, opts) => {
+      if (!opts?.signalWithinFence) throw new Error("missing database signal fence");
+      await opts.signalWithinFence("SIGTERM", () => {
+        termSignals += 1;
+      });
+      await db.update(heartbeatRuns).set({
+        status: "succeeded",
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, runId));
+      await opts.signalWithinFence("SIGKILL", () => {
+        killSignals += 1;
+      });
+    });
+
+    await expect(heartbeatService(db).cancelRun(runId)).rejects.toThrow(/changed|fence|terminal/i);
+
+    expect(termSignals).toBe(1);
+    expect(killSignals).toBe(0);
+    expect(isPidAlive(identity.pid)).toBe(true);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("succeeded");
+  });
+
+  it.skipIf(process.platform === "win32")("does not signal a run while its approval execution claim is executing", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    const identity = inspection.identity;
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: true,
+      processPid: identity.pid,
+      processGroupId: identity.processGroupId,
+      processStartedAt: new Date(identity.processStartedAt),
+      processExecutable: identity.processExecutable,
+      processCommandSha256: identity.processCommandSha256,
+    });
+    const approvalId = randomUUID();
+    const now = new Date();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "external_action",
+      requestedByAgentId: agentId,
+      status: "approved",
+      payload: {},
+      decidedByUserId: "responsible-user",
+      decidedAt: now,
+    });
+    await db.insert(approvalExecutionClaims).values({
+      id: randomUUID(),
+      approvalId,
+      companyId,
+      agentId,
+      issueId,
+      originRunId: runId,
+      executorRunId: runId,
+      executionRunId: `execution-${randomUUID()}`,
+      approvalPayloadSha256: "a".repeat(64),
+      callFingerprintSha256: "b".repeat(64),
+      receiptSha256: "c".repeat(64),
+      status: "executing",
+      claimedAt: now,
+      expiresAt: new Date(now.getTime() + 120_000),
+      executionStartedAt: now,
+      executionExpiresAt: new Date(now.getTime() + 60_000),
+      executionReceiptSha256: "d".repeat(64),
+    });
+
+    await expect(heartbeatService(db).cancelRun(runId)).rejects.toThrow(/approval claim|executing/i);
+
+    expect(isPidAlive(identity.pid)).toBe(true);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(run?.finishedAt).toBeNull();
   });
 
   it("records manual cancellation stop metadata", async () => {

@@ -17,6 +17,7 @@ import {
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import { isHistoricalAgentTombstoneId } from "./agent-retirement-historical-tombstones.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -148,6 +149,7 @@ export function activityService(db: Db) {
     const runs = await db
       .select({
         id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
         companyId: heartbeatRuns.companyId,
         status: heartbeatRuns.status,
         contextSnapshot: heartbeatRuns.contextSnapshot,
@@ -192,6 +194,7 @@ export function activityService(db: Db) {
       .then((rows) => rows[0] ?? null);
 
     for (const run of runs) {
+      if (isHistoricalAgentTombstoneId(run.agentId)) continue;
       const context = asRecord(run.contextSnapshot);
       const continuationAttempt =
         readNumber(context?.continuationAttempt) ??

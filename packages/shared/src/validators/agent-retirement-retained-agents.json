@@ -1,0 +1,167 @@
+[
+  {
+    "agentId": "39b309e9-2ae8-47ce-974a-8f95113e2cc3",
+    "companyId": "0a7df9a5-299e-4d64-a4d4-0c4c63784425",
+    "name": "Toolforge Orchestrator"
+  },
+  {
+    "agentId": "e274b636-6754-40ca-8b6c-fe312c8a627d",
+    "companyId": "0a7df9a5-299e-4d64-a4d4-0c4c63784425",
+    "name": "Claude Tooling Reviewer"
+  },
+  {
+    "agentId": "6b647702-ada4-4a59-8746-2be6a32ce2a6",
+    "companyId": "0a7df9a5-299e-4d64-a4d4-0c4c63784425",
+    "name": "Compliance Auditor"
+  },
+  {
+    "agentId": "caf44c1d-ab4f-41fd-aaef-db5d1a97ffa0",
+    "companyId": "0a7df9a5-299e-4d64-a4d4-0c4c63784425",
+    "name": "Paperclip Builder"
+  },
+  {
+    "agentId": "af5fb376-42ea-47fb-a526-dd0dcdfc73ef",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "CEO"
+  },
+  {
+    "agentId": "47c90cc5-9c4b-41fe-ad1c-476cbde07146",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "CMO"
+  },
+  {
+    "agentId": "8ae06e12-42bf-4c86-86af-24c628512568",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "CTO"
+  },
+  {
+    "agentId": "083666e1-0839-4959-8d4b-95abae7fb0ed",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Creative Director"
+  },
+  {
+    "agentId": "3f6988bb-049c-439c-9304-846f87224e9c",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Bildkuenstler"
+  },
+  {
+    "agentId": "f2d13771-5596-4419-a81d-5a86113bc0a7",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Figma Production Planner and QA"
+  },
+  {
+    "agentId": "6708faa8-0783-4972-8104-0960e7b5ec69",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Senior Designer"
+  },
+  {
+    "agentId": "e694ae21-9ff9-40cd-a42a-07dc4b2cfff0",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Motion Designer"
+  },
+  {
+    "agentId": "a59d7246-d6db-420c-b9c9-c96827ca0e49",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Senior Copywriter"
+  },
+  {
+    "agentId": "70fb1a71-cbc0-49f2-a63f-3c3a43701a84",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Projektmanager"
+  },
+  {
+    "agentId": "76ef255c-fc24-49a3-ab97-b4328fbbbd71",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Researcher"
+  },
+  {
+    "agentId": "c1eeff0b-e655-488b-8902-9fe25e2b74e7",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Codex Engineer"
+  },
+  {
+    "agentId": "78936621-89fc-4981-bd32-7ac21ef42c52",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Codex Intake Runner"
+  },
+  {
+    "agentId": "f1b618e7-7724-4107-928d-6d35d52ccaa8",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "Fullstack Developer"
+  },
+  {
+    "agentId": "f923bc63-a703-43b1-9af9-c38d7ca9a508",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "OpenClaw Gateway"
+  },
+  {
+    "agentId": "2f430983-3c02-4e58-90e3-821ae00f80c2",
+    "companyId": "51eb52b7-49ed-461a-bd67-7384158374e6",
+    "name": "Chief of Home Ops"
+  },
+  {
+    "agentId": "6a465d33-346d-417a-a6f0-15946f283d1c",
+    "companyId": "51eb52b7-49ed-461a-bd67-7384158374e6",
+    "name": "Casa Product Owner Webapps"
+  },
+  {
+    "agentId": "8a8e52c9-62d5-4168-b267-30e97e3c67f2",
+    "companyId": "51eb52b7-49ed-461a-bd67-7384158374e6",
+    "name": "Casa Fullstack Developer"
+  },
+  {
+    "agentId": "c41d7f42-d424-4615-ad71-0f4c5b9762fa",
+    "companyId": "51eb52b7-49ed-461a-bd67-7384158374e6",
+    "name": "Casa Routine Runner"
+  },
+  {
+    "agentId": "efc379ce-dac9-432a-9787-7768060652a1",
+    "companyId": "51eb52b7-49ed-461a-bd67-7384158374e6",
+    "name": "Travel Planner"
+  },
+  {
+    "agentId": "96c36604-fa6b-4a15-9027-2f0b50e32cea",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "Platform SRE Lead"
+  },
+  {
+    "agentId": "3bd9d164-93be-4d8f-a5d7-f1da9719a9b8",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "TechOps Security Hardening Lead"
+  },
+  {
+    "agentId": "04c5ffc3-7eb8-428f-8225-0c50063667e9",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "Authentik IAM Admin"
+  },
+  {
+    "agentId": "065b5034-3acc-49a9-b728-857673111bde",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "Backup und Disaster Recovery"
+  },
+  {
+    "agentId": "f62a426d-ff14-4fd1-91ec-9ae5c8927a53",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "Home Assistant Engineer"
+  },
+  {
+    "agentId": "873c1703-dcd2-4abf-8771-2f89c2d3fd4d",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "Docker und Container Ops"
+  },
+  {
+    "agentId": "7f84a9d1-5751-4427-853f-b85851f945d1",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "Hermes OpenClaw Maintainer"
+  },
+  {
+    "agentId": "3f169b0b-f743-4ce1-9127-b6c8de214fd4",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "Monitoring und Alerting Ops"
+  },
+  {
+    "agentId": "271a40cc-fdfa-4aeb-a25e-61bd61467071",
+    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+    "name": "TechOps Service Integration Engineer"
+  }
+]

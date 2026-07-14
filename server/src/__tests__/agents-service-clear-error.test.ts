@@ -228,7 +228,8 @@ describeEmbeddedPostgres("agent service clearError", () => {
 
     await expect(agentService(db).clearError(terminatedAgentId)).rejects.toMatchObject({
       status: 409,
-      message: "Cannot clear error on terminated agent",
+      message: "Terminated agents are immutable",
+      details: { code: "agent_terminated_immutable" },
     });
     await expect(agentService(db).clearError(pendingAgentId)).rejects.toMatchObject({
       status: 409,

@@ -359,6 +359,23 @@ export interface PluginWorkerManager {
   ): Promise<HostToWorkerMethods[M][1]>;
 }
 
+const pluginWorkerStartupReadiness = new WeakMap<PluginWorkerManager, Promise<void>>();
+
+export function registerPluginWorkerStartupReadiness(
+  manager: PluginWorkerManager,
+  readiness: Promise<unknown>,
+): void {
+  const current = pluginWorkerStartupReadiness.get(manager);
+  const next = current
+    ? Promise.all([current, readiness]).then(() => undefined)
+    : readiness.then(() => undefined);
+  pluginWorkerStartupReadiness.set(manager, next);
+}
+
+export async function waitForPluginWorkerStartup(manager: PluginWorkerManager): Promise<void> {
+  await pluginWorkerStartupReadiness.get(manager);
+}
+
 // ---------------------------------------------------------------------------
 // Implementation: createPluginWorkerHandle
 // ---------------------------------------------------------------------------

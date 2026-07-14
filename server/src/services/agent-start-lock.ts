@@ -6,26 +6,23 @@ const startLocksByAgent = new Map<string, { promise: Promise<void>; startedAtMs:
 async function waitForAgentStartLock(agentId: string, lock: { promise: Promise<void>; startedAtMs: number }) {
   const elapsedMs = Date.now() - lock.startedAtMs;
   const remainingMs = AGENT_START_LOCK_STALE_MS - elapsedMs;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
   if (remainingMs <= 0) {
-    logger.warn({ agentId, staleMs: elapsedMs }, "agent start lock stale; continuing queued-run start");
-    return;
+    logger.warn({ agentId, staleMs: elapsedMs }, "agent start lock stale; preserving FIFO start fence");
+  } else {
+    timeout = setTimeout(() => {
+      logger.warn(
+        { agentId, staleMs: AGENT_START_LOCK_STALE_MS },
+        "agent start lock still active; preserving FIFO start fence",
+      );
+    }, remainingMs);
+    timeout.unref?.();
   }
 
-  let timedOut = false;
-  let timeout: ReturnType<typeof setTimeout> | null = null;
-  await Promise.race([
-    lock.promise,
-    new Promise<void>((resolve) => {
-      timeout = setTimeout(() => {
-        timedOut = true;
-        resolve();
-      }, remainingMs);
-    }),
-  ]);
-  if (timeout) clearTimeout(timeout);
-
-  if (timedOut) {
-    logger.warn({ agentId, staleMs: AGENT_START_LOCK_STALE_MS }, "agent start lock timed out; continuing queued-run start");
+  try {
+    await lock.promise;
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 

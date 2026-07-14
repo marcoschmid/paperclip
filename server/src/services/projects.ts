@@ -32,6 +32,11 @@ import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runt
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
@@ -548,6 +553,12 @@ export function projectService(db: Db) {
     const { goalIds: inputGoalIds, ...projectData } = data;
     const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
 
+    const resultingArchivedAt = projectData.archivedAt ?? null;
+    const resultingLeadAgentId = projectData.leadAgentId ?? null;
+    if (resultingArchivedAt === null && resultingLeadAgentId !== null) {
+      await assertAssignableAgent(db, companyId, resultingLeadAgentId, { kind: "work" });
+    }
+
     // Note: color is intentionally NOT auto-assigned. New projects default to
     // `color = null` (neutral gray) unless an explicit color is supplied. See PAP-68.
 
@@ -560,15 +571,25 @@ export function projectService(db: Db) {
     // Also write goalId to the legacy column (first goal or null)
     const legacyGoalId = ids && ids.length > 0 ? ids[0] : projectData.goalId ?? null;
 
-    const row = await db
-      .insert(projects)
-      .values({ ...projectData, goalId: legacyGoalId, companyId })
-      .returning()
-      .then((rows) => rows[0]);
+    const row = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      if (resultingArchivedAt === null && resultingLeadAgentId) {
+        await lockAgentLifecycleReference(txDb, {
+          companyId,
+          agentId: resultingLeadAgentId,
+        });
+        projectData.leadAgentId = canonicalizeAgentReferenceId(resultingLeadAgentId);
+      }
+      const [created] = await txDb
+        .insert(projects)
+        .values({ ...projectData, goalId: legacyGoalId, companyId })
+        .returning();
 
-    if (ids && ids.length > 0) {
-      await syncGoalLinks(db, row.id, companyId, ids);
-    }
+      if (ids && ids.length > 0) {
+        await syncGoalLinks(txDb, created.id, companyId, ids);
+      }
+      return created;
+    });
 
     const [withGoals] = await attachGoals(db, [row]);
     const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];
@@ -780,11 +801,28 @@ export function projectService(db: Db) {
       const { goalIds: inputGoalIds, ...projectData } = data;
       const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
       const existingProject = await db
-        .select({ id: projects.id, companyId: projects.companyId, name: projects.name })
+        .select({
+          id: projects.id,
+          companyId: projects.companyId,
+          name: projects.name,
+          archivedAt: projects.archivedAt,
+          leadAgentId: projects.leadAgentId,
+        })
         .from(projects)
         .where(eq(projects.id, id))
         .then((rows) => rows[0] ?? null);
       if (!existingProject) return null;
+
+      const resultingCompanyId = projectData.companyId ?? existingProject.companyId;
+      const resultingArchivedAt = projectData.archivedAt === undefined
+        ? existingProject.archivedAt
+        : projectData.archivedAt;
+      const resultingLeadAgentId = projectData.leadAgentId === undefined
+        ? existingProject.leadAgentId
+        : projectData.leadAgentId;
+      if (resultingArchivedAt === null && resultingLeadAgentId !== null) {
+        await assertAssignableAgent(db, resultingCompanyId, resultingLeadAgentId, { kind: "work" });
+      }
 
       if (projectData.name !== undefined) {
         const existingShortname = normalizeProjectUrlKey(existingProject.name);
@@ -809,17 +847,30 @@ export function projectService(db: Db) {
         updates.goalId = ids.length > 0 ? ids[0] : null;
       }
 
-      const row = await db
-        .update(projects)
-        .set(updates)
-        .where(eq(projects.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!row) return null;
+      const row = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        if (resultingArchivedAt === null && resultingLeadAgentId) {
+          await lockAgentLifecycleReference(txDb, {
+            companyId: resultingCompanyId,
+            agentId: resultingLeadAgentId,
+          });
+          if (projectData.leadAgentId !== undefined) {
+            updates.leadAgentId = canonicalizeAgentReferenceId(resultingLeadAgentId);
+          }
+        }
+        const [updated] = await txDb
+          .update(projects)
+          .set(updates)
+          .where(eq(projects.id, id))
+          .returning();
+        if (!updated) return null;
 
-      if (ids !== undefined) {
-        await syncGoalLinks(db, id, row.companyId, ids);
-      }
+        if (ids !== undefined) {
+          await syncGoalLinks(txDb, id, updated.companyId, ids);
+        }
+        return updated;
+      });
+      if (!row) return null;
 
       const [withGoals] = await attachGoals(db, [row]);
       const [enriched] = withGoals ? await attachWorkspaces(db, [withGoals]) : [];

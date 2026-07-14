@@ -11,6 +11,7 @@ import {
   stopSshEnvLabFixture,
 } from "@paperclipai/adapter-utils/ssh";
 import {
+  activityLog,
   agents,
   companies,
   companySecretVersions,
@@ -27,7 +28,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
+import {
+  environmentRuntimeService,
+  findReusableSandboxLeaseId,
+  type EnvironmentRuntimeDriver,
+} from "../services/environment-runtime.ts";
+import { agentService } from "../services/agents.ts";
 import { environmentService } from "../services/environments.ts";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
@@ -148,6 +154,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
     await db.delete(environmentLeases);
     await db.delete(heartbeatRuns);
+    await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(executionWorkspaces);
@@ -393,6 +400,36 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
 
     return { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease };
+  }
+
+  async function seedHistoricalHeartbeatRun(
+    companyId: string,
+    agentId = "8d403783-c4e2-4746-adad-7689cd95ae33",
+  ) {
+    const runId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: `Historical environment owner ${randomUUID()}`,
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "failed",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return { agentId, runId };
   }
 
   it("acquires and releases a local run lease through the runtime seam", async () => {
@@ -1805,7 +1842,1054 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  it("retries reusable plugin-backed sandbox destroy when the worker is unavailable", async () => {
+  it("reconciles only the exact built-in lease linked to a terminated agent run", async () => {
+    const { companyId, environment, runId: liveRunId } = await seedEnvironment({
+      driver: "sandbox",
+      name: `Historical lease sandbox ${randomUUID()}`,
+      config: { provider: "fake", image: "ubuntu:24.04", reuseLease: true },
+    });
+    const { agentId: historicalAgentId, runId: historicalRunId } =
+      await seedHistoricalHeartbeatRun(companyId, randomUUID());
+    const leases = environmentService(db);
+    const sharedMetadata = {
+      driver: "sandbox",
+      provider: "fake",
+      image: "ubuntu:24.04",
+      reuseLease: true,
+    };
+    const historicalLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: historicalRunId,
+      leasePolicy: "reuse_by_environment",
+      provider: "fake",
+      providerLeaseId: "historical-provider-lease",
+      metadata: { ...sharedMetadata, agentId: historicalAgentId },
+    });
+    const liveLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: liveRunId,
+      leasePolicy: "reuse_by_environment",
+      provider: "fake",
+      providerLeaseId: "live-provider-lease",
+      metadata: sharedMetadata,
+    });
+
+    const result = await runtime.reconcileTerminatedAgentLeasesOnStartup();
+
+    expect(result).toMatchObject({ reconciled: 1, destroyed: 1, failed: 0 });
+    await expect(leases.getLeaseById(historicalLease.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
+    await expect(leases.getLeaseById(liveLease.id)).resolves.toMatchObject({
+      status: "active",
+      cleanupStatus: null,
+      providerLeaseId: "live-provider-lease",
+    });
+  });
+
+  it("quarantines a historical plugin lease when its driver worker cannot destroy it", async () => {
+    const { pluginId, companyId, reusableLease } = await seedReusablePluginSandboxLease();
+    const { runId: historicalRunId } = await seedHistoricalHeartbeatRun(companyId);
+    await db.update(environmentLeases)
+      .set({ heartbeatRunId: historicalRunId })
+      .where(eq(environmentLeases.id, reusableLease.id));
+    const workerManager = {
+      isRunning: vi.fn(() => false),
+      call: vi.fn(),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithOfflinePlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    const result = await runtimeWithOfflinePlugin.reconcileTerminatedAgentLeasesOnStartup();
+
+    expect(result).toMatchObject({ reconciled: 1, destroyed: 0, failed: 1 });
+    expect(result.failures).toEqual([
+      expect.objectContaining({ leaseId: reusableLease.id }),
+    ]);
+    expect(workerManager.isRunning).toHaveBeenCalledWith(pluginId);
+    expect(workerManager.call).not.toHaveBeenCalled();
+    await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "reusable_environment_lease_cleanup_failed",
+    });
+  });
+
+  it("records exact success when a plugin-backed historical lease is destroyed", async () => {
+    const { pluginId, companyId, reusableLease } = await seedReusablePluginSandboxLease();
+    const { runId: historicalRunId } = await seedHistoricalHeartbeatRun(companyId);
+    await db.update(environmentLeases)
+      .set({ heartbeatRunId: historicalRunId })
+      .where(eq(environmentLeases.id, reusableLease.id));
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentDestroyLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    const result = await runtimeWithPlugin.reconcileTerminatedAgentLeasesOnStartup();
+
+    expect(result).toMatchObject({ reconciled: 1, destroyed: 1, failed: 0 });
+    expect(workerManager.call).toHaveBeenCalledWith(
+      pluginId,
+      "environmentDestroyLease",
+      expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
+      31234,
+    );
+    await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
+  });
+
+  it("rejects acquire and resume operations linked to a historical agent run", async () => {
+    const { companyId, environment } = await seedEnvironment({
+      driver: "sandbox",
+      name: `Historical guard sandbox ${randomUUID()}`,
+      config: { provider: "fake", image: "ubuntu:24.04", reuseLease: true },
+    });
+    const { agentId, runId } = await seedHistoricalHeartbeatRun(companyId);
+    const lease = await environmentService(db).acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: runId,
+      leasePolicy: "reuse_by_environment",
+      provider: "fake",
+      providerLeaseId: "guarded-historical-lease",
+      metadata: { driver: "sandbox", provider: "fake", image: "ubuntu:24.04", reuseLease: true },
+    });
+
+    await expect(runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toMatchObject({
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+    await expect(runtime.resumeRunLease({ environment, lease })).rejects.toMatchObject({
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+  });
+
+  it("blocks active operations and quarantines reusable leases with missing, malformed, or absent owners", async () => {
+    const { companyId, agentId, environment } = await seedEnvironment();
+    const leases = environmentService(db);
+    const missingOwnerLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "local",
+      providerLeaseId: "missing-owner",
+      metadata: { driver: "local", agentId: randomUUID() },
+    });
+    const ownerlessLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "local",
+      providerLeaseId: "ownerless",
+      metadata: { driver: "local" },
+    });
+    const malformedOwnerLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "local",
+      providerLeaseId: "malformed-owner",
+      metadata: { driver: "local", agentId: "not-a-uuid" },
+    });
+    const expiredUnprovenLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "local",
+      providerLeaseId: "expired-without-cleanup-proof",
+      metadata: { driver: "local" },
+    });
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "Conflicting reusable lease owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const mismatchedOwnerLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "local",
+      providerLeaseId: "mismatched-owner",
+      metadata: {
+        driver: "local",
+        agentId,
+        reusableSandboxLease: { agentId: otherAgentId },
+      },
+    });
+    const failedSuccessLiveOwnerLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "local",
+      providerLeaseId: "failed-success-live-owner",
+      metadata: { driver: "local", agentId },
+    });
+    await leases.releaseLease(failedSuccessLiveOwnerLease.id, "failed", {
+      failureReason: "released_but_not_destroyed",
+      cleanupStatus: "success",
+    });
+    const unknownStatusLiveOwnerLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "local",
+      providerLeaseId: "unknown-status-live-owner",
+      metadata: { driver: "local", agentId },
+    });
+    await db.update(environmentLeases)
+      .set({ status: "unknown_reusable_state" })
+      .where(eq(environmentLeases.id, unknownStatusLiveOwnerLease.id));
+    await expect(runtime.resumeRunLease({ environment, lease: missingOwnerLease }))
+      .rejects.toMatchObject({ details: { code: "agent_terminated_active_reference_forbidden" } });
+    await expect(runtime.realizeWorkspace({
+      environment,
+      lease: missingOwnerLease,
+      workspace: { localPath: "/tmp/unsafe" },
+    })).rejects.toMatchObject({ details: { code: "agent_terminated_active_reference_forbidden" } });
+    await expect(runtime.execute({
+      environment,
+      lease: missingOwnerLease,
+      command: "echo",
+      args: ["unsafe"],
+    })).rejects.toMatchObject({ details: { code: "agent_terminated_active_reference_forbidden" } });
+    await expect(runtime.execute({
+      environment: { ...environment, id: randomUUID() },
+      lease: missingOwnerLease,
+      command: "echo",
+      args: ["wrong-environment"],
+    })).rejects.toMatchObject({ details: { code: "environment_lease_binding_mismatch" } });
+    await expect(runtime.resumeRunLease({ environment, lease: ownerlessLease }))
+      .rejects.toMatchObject({ details: { code: "agent_environment_lease_owner_invalid" } });
+    await expect(runtime.resumeRunLease({ environment, lease: malformedOwnerLease }))
+      .rejects.toMatchObject({ details: { code: "agent_environment_lease_owner_invalid" } });
+    await expect(runtime.resumeRunLease({ environment, lease: mismatchedOwnerLease }))
+      .rejects.toMatchObject({ details: { code: "agent_environment_lease_owner_invalid" } });
+
+    await leases.releaseLease(malformedOwnerLease.id, "failed", {
+      failureReason: "provider_cleanup_failed",
+      cleanupStatus: "success",
+    });
+    await leases.releaseLease(expiredUnprovenLease.id, "expired", {
+      failureReason: "provider_cleanup_unproven",
+      cleanupStatus: "failed",
+    });
+
+    const result = await runtime.reconcileTerminatedAgentLeasesOnStartup();
+    expect(result).toMatchObject({ reconciled: 7, destroyed: 0, failed: 7 });
+    for (const lease of [
+      missingOwnerLease,
+      ownerlessLease,
+      malformedOwnerLease,
+      expiredUnprovenLease,
+      mismatchedOwnerLease,
+      failedSuccessLiveOwnerLease,
+      unknownStatusLiveOwnerLease,
+    ]) {
+      await expect(leases.getLeaseById(lease.id)).resolves.toMatchObject({
+        status: "pending_cleanup",
+        cleanupStatus: "failed",
+      });
+    }
+  });
+
+  it("reconciles unsafe metadata owners across every lease policy and quarantines cleanup failures", async () => {
+    const { companyId, environment } = await seedEnvironment();
+    const { agentId: historicalAgentId } = await seedHistoricalHeartbeatRun(companyId);
+    const leases = environmentService(db);
+    const missingAgentId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const crossCompanyAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Cross-company lease owner",
+      status: "active",
+      issuePrefix: `X${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(agents).values({
+      id: crossCompanyAgentId,
+      companyId: otherCompanyId,
+      name: "Cross-company environment owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const historicalEphemeral = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "ephemeral",
+      provider: "all-policy-owner-guard",
+      providerLeaseId: "historical-null-run-ephemeral",
+      metadata: { driver: "local", agentId: historicalAgentId },
+    });
+    const missingPending = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_execution_workspace",
+      provider: "all-policy-owner-guard",
+      providerLeaseId: "missing-owner-pending",
+      metadata: { driver: "local", agentId: missingAgentId },
+    });
+    await leases.releaseLease(missingPending.id, "pending_cleanup", {
+      failureReason: "prior_cleanup_failure",
+      cleanupStatus: "failed",
+    });
+    const crossCompanyRetained = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "retain_on_failure",
+      provider: "all-policy-owner-guard",
+      providerLeaseId: "cross-company-owner-active",
+      metadata: { driver: "local", agentId: crossCompanyAgentId },
+    });
+
+    const destroyRunLease = vi.fn(async (
+      input: Parameters<NonNullable<EnvironmentRuntimeDriver["destroyRunLease"]>>[0],
+    ) => {
+      if (input.lease.id === missingPending.id) {
+        throw new Error("synthetic all-policy cleanup failure");
+      }
+      return await leases.releaseLease(input.lease.id, "expired", {
+        failureReason: input.failureReason,
+        cleanupStatus: "success",
+      });
+    });
+    const allPolicyRuntime = environmentRuntimeService(db, {
+      drivers: [{
+        driver: "local",
+        async acquireRunLease() {
+          return historicalEphemeral;
+        },
+        async releaseRunLease(input) {
+          return await leases.releaseLease(input.lease.id, input.status);
+        },
+        destroyRunLease,
+      }],
+    });
+
+    const result = await allPolicyRuntime.reconcileEnvironmentLeasesOnStartup();
+    expect(result).toMatchObject({ reconciled: 3, destroyed: 2, failed: 1 });
+    expect(destroyRunLease).toHaveBeenCalledTimes(3);
+    await expect(leases.getLeaseById(historicalEphemeral.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
+    await expect(leases.getLeaseById(crossCompanyRetained.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
+    await expect(leases.getLeaseById(missingPending.id)).resolves.toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+    });
+  });
+
+  it("quarantines every destroy path when a lying driver reports synthetic success", async () => {
+    const { companyId, agentId, environment } = await seedEnvironment();
+    const leases = environmentService(db);
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Lying destroy driver workspace",
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Lying destroy driver workspace",
+      status: "active",
+      providerType: "local_fs",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const publicLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "ephemeral",
+      provider: "lying-destroy-driver",
+      providerLeaseId: "public-live-resource",
+      metadata: { driver: "local", agentId },
+    });
+    const scopedReusableLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      executionWorkspaceId,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "lying-destroy-driver",
+      providerLeaseId: "scoped-live-resource",
+      metadata: { driver: "local", agentId },
+    });
+    const startupReusableLease = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "lying-destroy-driver",
+      providerLeaseId: "startup-live-resource",
+      metadata: { driver: "local", agentId },
+    });
+    await leases.releaseLease(startupReusableLease.id, "pending_cleanup", {
+      failureReason: "retry_destroy",
+      cleanupStatus: "failed",
+    });
+
+    const destroyRunLease = vi.fn(async (
+      input: Parameters<NonNullable<EnvironmentRuntimeDriver["destroyRunLease"]>>[0],
+    ) => ({
+      ...input.lease,
+      status: "expired" as const,
+      cleanupStatus: "success" as const,
+      releasedAt: new Date(),
+      updatedAt: new Date(),
+    }));
+    const lyingRuntime = environmentRuntimeService(db, {
+      drivers: [{
+        driver: "local",
+        async acquireRunLease() {
+          return publicLease;
+        },
+        async releaseRunLease(input) {
+          return await leases.releaseLease(input.lease.id, input.status);
+        },
+        destroyRunLease,
+      }],
+    });
+
+    await expect(lyingRuntime.destroyRunLease({ environment, lease: publicLease }))
+      .resolves.toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    await expect(lyingRuntime.destroyReusableSandboxLeases({ companyId, executionWorkspaceId }))
+      .resolves.toEqual([
+        expect.objectContaining({
+          lease: expect.objectContaining({ status: "pending_cleanup", cleanupStatus: "failed" }),
+        }),
+      ]);
+    await expect(lyingRuntime.reconcileEnvironmentLeasesOnStartup())
+      .resolves.toMatchObject({ reconciled: 2, destroyed: 0, failed: 2 });
+    for (const lease of [publicLease, scopedReusableLease, startupReusableLease]) {
+      await expect(leases.getLeaseById(lease.id)).resolves.toMatchObject({
+        status: "pending_cleanup",
+        cleanupStatus: "failed",
+        providerLeaseId: lease.providerLeaseId,
+      });
+    }
+  });
+
+  it("quarantines reusable driver output that omits durable owner evidence", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    const leases = environmentService(db);
+    let emittedOwnerId: string | null = null;
+    let acquireCount = 0;
+    const maliciousDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease(input) {
+        acquireCount += 1;
+        return await leases.acquireLease({
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          heartbeatRunId: acquireCount === 3 ? runId : null,
+          leasePolicy: "reuse_by_environment",
+          provider: "malicious-test",
+          providerLeaseId:
+            acquireCount === 1
+              ? "ownerless-driver-output"
+              : acquireCount === 2
+                ? "conflicting-driver-output"
+                : "mismatched-binding-output",
+          metadata: { driver: "local", ...(emittedOwnerId ? { agentId: emittedOwnerId } : {}) },
+        });
+      },
+      async releaseRunLease(input) {
+        return await leases.releaseLease(input.lease.id, input.status);
+      },
+    };
+    const runtimeWithMaliciousDriver = environmentRuntimeService(db, { drivers: [maliciousDriver] });
+
+    await expect(runtimeWithMaliciousDriver.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).rejects.toMatchObject({ details: { code: "agent_environment_lease_owner_invalid" } });
+
+    const persisted = await db.select().from(environmentLeases)
+      .where(eq(environmentLeases.providerLeaseId, "ownerless-driver-output"))
+      .then((rows) => rows[0]);
+    expect(persisted).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+
+    emittedOwnerId = randomUUID();
+    await db.insert(agents).values({
+      id: emittedOwnerId,
+      companyId,
+      name: "Malicious output owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await expect(runtimeWithMaliciousDriver.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).rejects.toMatchObject({ details: { code: "agent_environment_lease_owner_invalid" } });
+    const conflicting = await db.select().from(environmentLeases)
+      .where(eq(environmentLeases.providerLeaseId, "conflicting-driver-output"))
+      .then((rows) => rows[0]);
+    expect(conflicting).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+
+    emittedOwnerId = agentId;
+    await expect(runtimeWithMaliciousDriver.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).rejects.toMatchObject({ details: { code: "environment_lease_binding_mismatch" } });
+    const mismatchedBinding = await db.select().from(environmentLeases)
+      .where(eq(environmentLeases.providerLeaseId, "mismatched-binding-output"))
+      .then((rows) => rows[0]);
+    expect(mismatchedBinding).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+  });
+
+  it("rejects unpersisted and divergent driver leases and returns the persisted snapshot", async () => {
+    const { companyId, agentId, environment } = await seedEnvironment();
+    const leases = environmentService(db);
+    const now = new Date();
+    const destroyGhost = vi.fn(async () => null);
+    const ghostDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease(input) {
+        return {
+          id: randomUUID(),
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          executionWorkspaceId: input.executionWorkspaceId,
+          issueId: input.issueId,
+          heartbeatRunId: input.heartbeatRunId,
+          status: "active",
+          leasePolicy: "reuse_by_environment",
+          provider: "ghost-provider",
+          providerLeaseId: "ghost-provider-lease",
+          acquiredAt: now,
+          lastUsedAt: now,
+          expiresAt: null,
+          releasedAt: null,
+          failureReason: null,
+          cleanupStatus: null,
+          metadata: { driver: "local", agentId },
+          createdAt: now,
+          updatedAt: now,
+        };
+      },
+      async releaseRunLease() {
+        return null;
+      },
+      destroyRunLease: destroyGhost,
+    };
+    const ghostRuntime = environmentRuntimeService(db, { drivers: [ghostDriver] });
+
+    await expect(ghostRuntime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).rejects.toThrow(/not correlated with a persisted row/i);
+    expect(destroyGhost).toHaveBeenCalledTimes(1);
+
+    const destroyDivergent = vi.fn(async (input: Parameters<NonNullable<EnvironmentRuntimeDriver["destroyRunLease"]>>[0]) =>
+      await leases.releaseLease(input.lease.id, "expired", {
+        failureReason: "rejected_driver_output",
+        cleanupStatus: "success",
+      }));
+    const divergentDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease(input) {
+        const persisted = await leases.acquireLease({
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          executionWorkspaceId: input.executionWorkspaceId,
+          issueId: input.issueId,
+          heartbeatRunId: input.heartbeatRunId,
+          leasePolicy: "reuse_by_environment",
+          provider: "divergent-provider",
+          providerLeaseId: "persisted-provider-lease",
+          metadata: { driver: "local", agentId },
+        });
+        return { ...persisted, providerLeaseId: "returned-provider-lease" };
+      },
+      async releaseRunLease() {
+        return null;
+      },
+      destroyRunLease: destroyDivergent,
+    };
+    const divergentRuntime = environmentRuntimeService(db, { drivers: [divergentDriver] });
+
+    await expect(divergentRuntime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).rejects.toMatchObject({
+      details: { code: "environment_lease_persistence_mismatch" },
+    });
+    expect(destroyDivergent).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ providerLeaseId: "returned-provider-lease" }),
+    }));
+    const divergentPersisted = await db.select().from(environmentLeases)
+      .where(eq(environmentLeases.providerLeaseId, "persisted-provider-lease"))
+      .then((rows) => rows[0]);
+    expect(destroyDivergent.mock.calls[0]?.[0].lease.id).not.toBe(divergentPersisted.id);
+    expect(divergentPersisted).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+
+    const unrelated = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "ephemeral",
+      provider: "unrelated-provider",
+      providerLeaseId: "unrelated-provider-lease",
+      metadata: { driver: "local" },
+    });
+    const collisionDestroy = vi.fn(async (input: Parameters<NonNullable<EnvironmentRuntimeDriver["destroyRunLease"]>>[0]) =>
+      await leases.releaseLease(input.lease.id, "expired", { cleanupStatus: "success" }));
+    const collisionDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease(input) {
+        return {
+          ...unrelated,
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          executionWorkspaceId: input.executionWorkspaceId,
+          issueId: input.issueId,
+          heartbeatRunId: input.heartbeatRunId,
+          status: "active",
+          leasePolicy: "reuse_by_environment",
+          provider: "collision-output-provider",
+          providerLeaseId: "collision-output-provider-lease",
+          metadata: { driver: "local", agentId },
+        };
+      },
+      async releaseRunLease() {
+        return null;
+      },
+      destroyRunLease: collisionDestroy,
+    };
+    const collisionRuntime = environmentRuntimeService(db, { drivers: [collisionDriver] });
+    await expect(collisionRuntime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: randomUUID(),
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).rejects.toThrow(/not correlated with a persisted row/i);
+    expect(collisionDestroy).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({
+        providerLeaseId: "collision-output-provider-lease",
+      }),
+    }));
+    const collisionCleanupLeaseId = collisionDestroy.mock.calls[0]?.[0].lease.id;
+    expect(collisionCleanupLeaseId).not.toBe(unrelated.id);
+    await expect(leases.getLeaseById(unrelated.id)).resolves.toMatchObject({
+      status: "active",
+      cleanupStatus: null,
+      provider: "unrelated-provider",
+      providerLeaseId: "unrelated-provider-lease",
+    });
+
+    const snapshotDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease(input) {
+        const persisted = await leases.acquireLease({
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          executionWorkspaceId: input.executionWorkspaceId,
+          issueId: input.issueId,
+          heartbeatRunId: input.heartbeatRunId,
+          leasePolicy: "reuse_by_environment",
+          provider: "snapshot-provider",
+          providerLeaseId: "snapshot-provider-lease",
+          metadata: { driver: "local", agentId },
+        });
+        await leases.updateLeaseMetadata(persisted.id, {
+          ...(persisted.metadata ?? {}),
+          persistedMarker: true,
+        });
+        return persisted;
+      },
+      async releaseRunLease(input) {
+        return await leases.releaseLease(input.lease.id, input.status);
+      },
+    };
+    const snapshotRuntime = environmentRuntimeService(db, { drivers: [snapshotDriver] });
+    const acquired = await snapshotRuntime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    });
+    expect(acquired.lease.metadata).toMatchObject({ persistedMarker: true });
+  });
+
+  it("blocks pending-approval owners before lease acquisition or resume reaches a driver", async () => {
+    const { companyId, agentId, environment } = await seedEnvironment();
+    const leases = environmentService(db);
+    const persisted = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "pending-owner-provider",
+      providerLeaseId: "pending-owner-provider-lease",
+      metadata: { driver: "local", agentId },
+    });
+    const acquireRunLease = vi.fn(async () => persisted);
+    const resumeRunLease = vi.fn(async () => persisted);
+    const guardedDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      acquireRunLease,
+      async releaseRunLease(input) {
+        return await leases.releaseLease(input.lease.id, input.status);
+      },
+      resumeRunLease,
+    };
+    const guardedRuntime = environmentRuntimeService(db, { drivers: [guardedDriver] });
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, agentId));
+
+    await expect(guardedRuntime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).rejects.toMatchObject({
+      details: {
+        code: "agent_lifecycle_active_reference_forbidden",
+        reason: "pending_approval",
+      },
+    });
+    await expect(guardedRuntime.resumeRunLease({ environment, lease: persisted }))
+      .rejects.toMatchObject({
+        details: {
+          code: "agent_lifecycle_active_reference_forbidden",
+          reason: "pending_approval",
+        },
+      });
+    expect(acquireRunLease).not.toHaveBeenCalled();
+    expect(resumeRunLease).not.toHaveBeenCalled();
+  });
+
+  it("reloads and validates persisted leases before resume, realization, or execution", async () => {
+    const { companyId, agentId, environment } = await seedEnvironment();
+    const leases = environmentService(db);
+    const persisted = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: null,
+      leasePolicy: "reuse_by_environment",
+      provider: "guarded-provider",
+      providerLeaseId: "guarded-provider-lease",
+      metadata: { driver: "local", agentId },
+    });
+    const resumeRunLease = vi.fn(async () => persisted);
+    const destroyRunLease = vi.fn(async () => persisted);
+    const realizeWorkspace = vi.fn(async () => ({ cwd: "/tmp", metadata: {} }));
+    const execute = vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }));
+    const guardedDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease() {
+        return persisted;
+      },
+      async releaseRunLease(input) {
+        return await leases.releaseLease(input.lease.id, input.status);
+      },
+      resumeRunLease,
+      destroyRunLease,
+      realizeWorkspace,
+      execute,
+    };
+    const guardedRuntime = environmentRuntimeService(db, { drivers: [guardedDriver] });
+
+    await expect(guardedRuntime.resumeRunLease({
+      environment,
+      lease: { ...persisted, providerLeaseId: "forged-provider-lease" },
+    })).rejects.toMatchObject({
+      details: { code: "environment_lease_persistence_mismatch" },
+    });
+    await expect(guardedRuntime.destroyRunLease({
+      environment,
+      lease: { ...persisted, providerLeaseId: "forged-cleanup-provider-lease" },
+    })).rejects.toMatchObject({
+      details: { code: "environment_lease_persistence_mismatch" },
+    });
+
+    await leases.releaseLease(persisted.id, "pending_cleanup", {
+      failureReason: "cleanup_required",
+      cleanupStatus: "failed",
+    });
+    await expect(guardedRuntime.realizeWorkspace({
+      environment,
+      lease: persisted,
+      workspace: { localPath: "/tmp" },
+    })).rejects.toMatchObject({
+      details: { code: "environment_lease_persistence_mismatch" },
+    });
+
+    await expect(guardedRuntime.execute({
+      environment,
+      lease: { ...persisted, id: randomUUID() },
+      command: "echo",
+    })).rejects.toMatchObject({
+      details: { code: "environment_lease_persistence_mismatch" },
+    });
+    expect(resumeRunLease).not.toHaveBeenCalled();
+    expect(destroyRunLease).not.toHaveBeenCalled();
+    expect(realizeWorkspace).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects and quarantines an acquisition when agent termination wins the row-lock race", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const leases = environmentService(db);
+    let enterAcquire!: () => void;
+    const acquireEntered = new Promise<void>((resolve) => { enterAcquire = resolve; });
+    let releaseAcquire!: () => void;
+    const acquireGate = new Promise<void>((resolve) => { releaseAcquire = resolve; });
+    const gatedDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease(input) {
+        enterAcquire();
+        await acquireGate;
+        return await leases.acquireLease({
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          heartbeatRunId: input.heartbeatRunId,
+          leasePolicy: "reuse_by_environment",
+          provider: "gated-provider",
+          providerLeaseId: "gated-provider-lease",
+          metadata: { driver: "local", agentId },
+        });
+      },
+      async releaseRunLease(input) {
+        return await leases.releaseLease(input.lease.id, input.status);
+      },
+    };
+    const gatedRuntime = environmentRuntimeService(db, { drivers: [gatedDriver] });
+    const acquire = gatedRuntime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    });
+    await acquireEntered;
+
+    await expect(agentService(db).terminate(agentId)).resolves.toMatchObject({ status: "terminated" });
+
+    releaseAcquire();
+    await expect(acquire).rejects.toMatchObject({
+      details: { code: "agent_terminated_active_reference_forbidden" },
+    });
+    await expect(db.select().from(environmentLeases)
+      .where(eq(environmentLeases.providerLeaseId, "gated-provider-lease"))
+      .then((rows) => rows[0])).resolves.toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+    });
+  });
+
+  it("makes a completed acquisition visible before a concurrent termination scan", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const leases = environmentService(db);
+    const driver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease(input) {
+        return await leases.acquireLease({
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          heartbeatRunId: input.heartbeatRunId,
+          leasePolicy: "reuse_by_environment",
+          provider: "acquire-first-provider",
+          providerLeaseId: "acquire-first-provider-lease",
+          metadata: { driver: "local", agentId },
+        });
+      },
+      async releaseRunLease(input) {
+        return await leases.releaseLease(input.lease.id, input.status);
+      },
+    };
+    const acquireFirstRuntime = environmentRuntimeService(db, { drivers: [driver] });
+    await expect(acquireFirstRuntime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      agentId,
+      heartbeatRunId: null,
+      persistedExecutionWorkspace: null,
+    })).resolves.toMatchObject({
+      lease: { providerLeaseId: "acquire-first-provider-lease" },
+    });
+    await expect(agentService(db).terminate(agentId)).rejects.toMatchObject({
+      details: { code: "agent_active_dependencies" },
+    });
+    await expect(agentService(db).getById(agentId)).resolves.toMatchObject({ status: "active" });
+  });
+
+  it("finalizes active leases left behind by terminal heartbeat runs according to policy", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, runId));
+    const leases = environmentService(db);
+    const runStatuses = ["succeeded", "failed", "timed_out"] as const;
+    const extraRunIds = runStatuses.map(() => randomUUID());
+    await db.insert(heartbeatRuns).values(runStatuses.map((status, index) => ({
+      id: extraRunIds[index],
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })));
+    const staleEphemeral = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: runId,
+      leasePolicy: "ephemeral",
+      provider: "startup-finalizer",
+      providerLeaseId: "stale-ephemeral",
+      metadata: { driver: "local", agentId },
+    });
+    const staleReusable = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: extraRunIds[0],
+      leasePolicy: "reuse_by_environment",
+      provider: "startup-finalizer",
+      providerLeaseId: "stale-reusable",
+      metadata: { driver: "local", agentId },
+    });
+    const retainedOnFailure = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: extraRunIds[1],
+      leasePolicy: "retain_on_failure",
+      provider: "startup-finalizer",
+      providerLeaseId: "stale-retain-on-failure",
+      metadata: { driver: "local", agentId },
+    });
+    const failedCleanup = await leases.acquireLease({
+      companyId,
+      environmentId: environment.id,
+      heartbeatRunId: extraRunIds[2],
+      leasePolicy: "reuse_by_execution_workspace",
+      provider: "startup-finalizer",
+      providerLeaseId: "stale-cleanup-failure",
+      metadata: { driver: "local", agentId },
+    });
+    const releaseRunLease = vi.fn(async (input: Parameters<EnvironmentRuntimeDriver["releaseRunLease"]>[0]) => {
+      if (input.lease.id === failedCleanup.id) {
+        throw new Error("synthetic provider cleanup failure");
+      }
+      const status = input.lease.leasePolicy === "retain_on_failure" && input.status === "failed"
+        ? "retained"
+        : input.status;
+      return await leases.releaseLease(input.lease.id, status, { cleanupStatus: "success" });
+    });
+    const finalizerDriver: EnvironmentRuntimeDriver = {
+      driver: "local",
+      async acquireRunLease() {
+        return staleEphemeral;
+      },
+      releaseRunLease,
+    };
+    const finalizerRuntime = environmentRuntimeService(db, { drivers: [finalizerDriver] });
+
+    const result = await finalizerRuntime.reconcileTerminatedAgentLeasesOnStartup();
+    expect(result).toMatchObject({ reconciled: 4, destroyed: 3, failed: 1 });
+    await expect(leases.getLeaseById(staleEphemeral.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
+    await expect(leases.getLeaseById(staleReusable.id)).resolves.toMatchObject({
+      status: "released",
+      cleanupStatus: "success",
+    });
+    await expect(leases.getLeaseById(retainedOnFailure.id)).resolves.toMatchObject({
+      status: "retained",
+      cleanupStatus: "success",
+    });
+    await expect(leases.getLeaseById(failedCleanup.id)).resolves.toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "terminal_run_lease_cleanup_failed",
+    });
+    expect(releaseRunLease).toHaveBeenCalledTimes(4);
+  });
+
+  it("retries pending reusable plugin cleanup on startup after the worker recovers", async () => {
     const { pluginId, companyId, executionWorkspaceId, reusableLease } =
       await seedReusablePluginSandboxLease();
 
@@ -1846,15 +2930,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginWorkerManager: recoveredWorkerManager,
     });
 
-    const retried = await runtimeWithRecoveredPlugin.destroyReusableSandboxLeases({
-      companyId,
-      executionWorkspaceId,
-      failureReason: "cleanup_retry",
-    });
+    const retried = await runtimeWithRecoveredPlugin.reconcileTerminatedAgentLeasesOnStartup();
 
-    expect(retried).toHaveLength(1);
-    expect(retried[0]?.lease.id).toBe(reusableLease.id);
-    expect(retried[0]?.lease.status).toBe("expired");
+    expect(retried).toMatchObject({ reconciled: 1, destroyed: 1, failed: 0 });
     expect(recoveredWorkerManager.call).toHaveBeenCalledWith(
       pluginId,
       "environmentDestroyLease",
@@ -1866,7 +2944,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     );
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "expired",
-      failureReason: "cleanup_retry",
+      failureReason: "reusable_environment_lease_reconciliation",
       cleanupStatus: "success",
     });
   });
@@ -1915,6 +2993,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       },
     });
     const otherAgentId = randomUUID();
+    const otherRunId = randomUUID();
     const executionWorkspaceId = randomUUID();
     const pluginId = randomUUID();
     const projectId = randomUUID();
@@ -1937,6 +3016,25 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       status: "active",
       providerType: "local_fs",
       createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "Other sandbox agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      invocationSource: "manual",
+      status: "running",
       updatedAt: new Date(),
     });
 
@@ -2010,7 +3108,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       environment,
       issueId: null,
       agentId: otherAgentId,
-      heartbeatRunId: runId,
+      heartbeatRunId: otherRunId,
       persistedExecutionWorkspace: {
         id: executionWorkspaceId,
         mode: "shared_workspace",
@@ -2296,7 +3394,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       timedOut: false,
       stdout: "ok\n",
     });
-    expect(destroyed?.status).toBe("failed");
+    expect(destroyed).toMatchObject({ status: "expired", cleanupStatus: "success" });
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentResumeLease", {
       driverKey: "fake-plugin",
       companyId,

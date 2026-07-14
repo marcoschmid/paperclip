@@ -6,6 +6,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
@@ -13,7 +14,9 @@ import {
   createDb,
   executionWorkspaces,
   heartbeatRuns,
+  issueComments,
   issueRelations,
+  issueThreadInteractions,
   issues,
   pluginManagedResources,
   plugins,
@@ -64,8 +67,11 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     tempRoots.length = 0;
     await db.delete(activityLog);
     await db.delete(costEvents);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueThreadInteractions);
+    await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -108,6 +114,174 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     tempRoots.push(root);
     return root;
   }
+
+  it("refuses plugin agent sessions for tombstone, terminated, and cross-company agents without inserts", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const otherCompanyId = randomUUID();
+    const terminatedAgentId = randomUUID();
+    const crossCompanyAgentId = randomUUID();
+    const historicalTombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other company",
+      issuePrefix: issuePrefix(otherCompanyId),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: historicalTombstoneId,
+        companyId,
+        name: "Historical tombstone",
+        role: "engineer",
+        status: "terminated",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: terminatedAgentId,
+        companyId,
+        name: "Terminated agent",
+        role: "engineer",
+        status: "terminated",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: crossCompanyAgentId,
+        companyId: otherCompanyId,
+        name: "Other company agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(services.agentSessions.create({ companyId, agentId: historicalTombstoneId }))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          code: "historical_agent_tombstone_active_reference_forbidden",
+          agentId: historicalTombstoneId,
+        },
+      });
+    await expect(services.agentSessions.create({ companyId, agentId: terminatedAgentId }))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          code: "agent_not_assignable",
+          reason: "assignee_terminated",
+          assigneeAgentId: terminatedAgentId,
+        },
+      });
+    await expect(services.agentSessions.create({ companyId, agentId: crossCompanyAgentId }))
+      .rejects.toMatchObject({ status: 422 });
+
+    await expect(db.select().from(agentTaskSessions)).resolves.toHaveLength(0);
+  });
+
+  it("rejects tombstone and cross-company issue provenance for every plugin write without mutations", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const otherCompanyId = randomUUID();
+    const crossCompanyAgentId = randomUUID();
+    const historicalTombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other company",
+      issuePrefix: issuePrefix(otherCompanyId),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: historicalTombstoneId,
+        companyId,
+        name: "Historical tombstone",
+        role: "engineer",
+        status: "terminated",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: crossCompanyAgentId,
+        companyId: otherCompanyId,
+        name: "Other company agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Immutable issue",
+      status: "todo",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-seed`,
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const invalidAgents = [
+      {
+        id: historicalTombstoneId,
+        expected: {
+          status: 409,
+          details: {
+            code: "historical_agent_tombstone_active_reference_forbidden",
+            agentId: historicalTombstoneId,
+          },
+        },
+      },
+      { id: crossCompanyAgentId, expected: { status: 422 } },
+    ];
+
+    for (const invalidAgent of invalidAgents) {
+      await expect(services.issues.create({
+        companyId,
+        title: `Forged by ${invalidAgent.id}`,
+        actorAgentId: invalidAgent.id,
+      })).rejects.toMatchObject(invalidAgent.expected);
+      await expect(services.issues.update({
+        companyId,
+        issueId,
+        patch: { title: "Must remain unchanged", actorAgentId: invalidAgent.id },
+      })).rejects.toMatchObject(invalidAgent.expected);
+      await expect(services.issues.createComment({
+        companyId,
+        issueId,
+        body: "Must not persist",
+        authorAgentId: invalidAgent.id,
+      })).rejects.toMatchObject(invalidAgent.expected);
+      await expect(services.issues.createInteraction({
+        companyId,
+        issueId,
+        authorAgentId: invalidAgent.id,
+        interaction: {
+          kind: "request_confirmation",
+          continuationPolicy: "none",
+          payload: { version: 1, prompt: "Must not persist" },
+        },
+      })).rejects.toMatchObject(invalidAgent.expected);
+    }
+
+    await expect(db.select().from(issues)).resolves.toMatchObject([
+      expect.objectContaining({ id: issueId, title: "Immutable issue" }),
+    ]);
+    await expect(db.select().from(issueComments)).resolves.toHaveLength(0);
+    await expect(db.select().from(issueThreadInteractions)).resolves.toHaveLength(0);
+    await expect(db.select().from(activityLog)).resolves.toHaveLength(0);
+  });
 
   it("returns plugin-safe execution workspace metadata scoped to the company", async () => {
     const { companyId } = await seedCompanyAndAgent();

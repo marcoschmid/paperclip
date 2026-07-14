@@ -21,6 +21,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
 
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -159,6 +161,75 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     });
     return { service, wakes };
   }
+
+  it("rejects historical tombstones on watchdog create and update without changing rows", async () => {
+    const companyId = await seedCompany();
+    const firstIssueId = await seedIssue(companyId, { status: "todo" });
+    const secondIssueId = await seedIssue(companyId, { status: "todo" });
+    const validAgentId = await seedAgent(companyId);
+    await seedAgent(companyId, { id: HISTORICAL_TOMBSTONE_ID, status: "active" });
+    const existing = await seedWatchdog(companyId, secondIssueId, validAgentId);
+    const { service } = createService();
+
+    await expect(service.upsertForIssue(companyId, firstIssueId, {
+      agentId: HISTORICAL_TOMBSTONE_ID.toUpperCase(),
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID.toUpperCase(),
+      },
+    });
+    await expect(db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, firstIssueId)))
+      .resolves.toHaveLength(0);
+
+    await expect(service.upsertForIssue(companyId, secondIssueId, {
+      agentId: HISTORICAL_TOMBSTONE_ID.toUpperCase(),
+      instructions: "Should never persist",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+    const [after] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, existing.id));
+    expect(after).toEqual(existing);
+  });
+
+  it("keeps legacy tombstone watchdogs inert in global and issue-scoped reconciliation", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { status: "done", identifier: "WDOG-LEGACY" });
+    await seedAgent(companyId, { id: HISTORICAL_TOMBSTONE_ID, status: "active" });
+    const fingerprint = "task_watchdog_stop:abcdef";
+    const watchdogIssueId = await seedIssue(companyId, {
+      status: "done",
+      parentId: sourceId,
+      assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+      originKind: "task_watchdog",
+      originId: sourceId,
+      originFingerprint: fingerprint,
+    });
+    const watchdog = await seedWatchdog(companyId, sourceId, HISTORICAL_TOMBSTONE_ID);
+    await db.update(issueWatchdogs).set({
+      watchdogIssueId,
+      lastObservedFingerprint: fingerprint,
+    }).where(eq(issueWatchdogs.id, watchdog.id));
+    const [beforeWatchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog.id));
+    const beforeIssues = await db.select().from(issues).where(eq(issues.companyId, companyId));
+    const beforeActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    const beforeComments = await db.select().from(issueComments).where(eq(issueComments.companyId, companyId));
+    const { service, wakes } = createService();
+
+    await expect(service.reconcileTaskWatchdogs({ companyId }))
+      .resolves.toMatchObject({ checked: 1, triggered: 0, skipped: 1 });
+    await expect(service.reconcileForIssueAndAncestors(companyId, sourceId))
+      .resolves.toMatchObject({ checked: 1, triggered: 0, skipped: 1 });
+
+    expect(wakes).toHaveLength(0);
+    expect((await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog.id)))[0])
+      .toEqual(beforeWatchdog);
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toEqual(beforeIssues);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).toEqual(beforeActivity);
+    expect(await db.select().from(issueComments).where(eq(issueComments.companyId, companyId))).toEqual(beforeComments);
+  });
 
   it("creates one reusable watchdog issue and wakes the watchdog on the initial stopped state", async () => {
     const companyId = await seedCompany();

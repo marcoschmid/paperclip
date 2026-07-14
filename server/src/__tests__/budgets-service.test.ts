@@ -16,6 +16,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
+
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/activity-log.js", () => ({
@@ -350,6 +352,67 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("rejects historical tombstone budget writes and evaluation before changing policy, incident, or agent state", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [historical] = await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      budgetMonthlyCents: 23,
+    }).returning();
+    const service = budgetService(db);
+    const denied = {
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_immutable",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    };
+
+    await expect(service.upsertPolicy(companyId, {
+      scopeType: "agent",
+      scopeId: HISTORICAL_TOMBSTONE_ID,
+      amount: 500,
+      windowKind: "calendar_month_utc",
+    }, "board-user")).rejects.toMatchObject(denied);
+
+    const [event] = await db.insert(costEvents).values({
+      companyId,
+      agentId: HISTORICAL_TOMBSTONE_ID,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5",
+      inputTokens: 10,
+      cachedInputTokens: 0,
+      outputTokens: 2,
+      costCents: 5,
+      occurredAt: new Date(),
+    }).returning();
+    await expect(service.evaluateCostEvent(event!)).rejects.toMatchObject(denied);
+
+    await expect(db.select().from(budgetPolicies)).resolves.toHaveLength(0);
+    await expect(db.select().from(budgetIncidents)).resolves.toHaveLength(0);
+    const persisted = (await db.select().from(agents))[0];
+    expect(persisted).toMatchObject({
+      status: "terminated",
+      budgetMonthlyCents: 23,
+      updatedAt: historical!.updatedAt,
+    });
   });
 
   async function createBudgetFixture() {

@@ -75,6 +75,12 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { sanitizeRecord } from "../redaction.js";
+import { assertHistoricalAgentTombstoneAccessMutable } from "./agent-retirement-historical-tombstones.js";
+import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 // ---------------------------------------------------------------------------
 // SSRF protection for plugin HTTP fetch
@@ -652,6 +658,15 @@ export function buildHostServices(
       throw new Error(`${entityName} not found`);
     }
     return record;
+  };
+
+  const validatePluginIssueAgentProvenance = async (
+    companyId: string,
+    agentId: string | null | undefined,
+  ): Promise<string | null> => {
+    if (!agentId) return null;
+    await assertAssignableAgent(db, companyId, agentId, { kind: "work" });
+    return agentId;
   };
 
   const pluginActivityDetails = (
@@ -1545,6 +1560,7 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
+        const validatedActorAgentId = await validatePluginIssueAgentProvenance(companyId, actorAgentId);
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
             ? pluginOperationIssueOriginKind(pluginKey)
@@ -1555,7 +1571,7 @@ export function buildHostServices(
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
-          createdByAgentId: actorAgentId ?? null,
+          createdByAgentId: validatedActorAgentId,
           createdByUserId: actorUserId ?? null,
           actorResponsibleUserId: actorUserId ?? null,
           trustExplicitResponsibleUserId: true,
@@ -1565,7 +1581,7 @@ export function buildHostServices(
           action: "issue.created",
           entityType: "issue",
           entityId: issue.id,
-          actor: { actorAgentId, actorUserId, actorRunId },
+          actor: { actorAgentId: validatedActorAgentId, actorUserId, actorRunId },
           details: {
             title: issue.title,
             identifier: issue.identifier,
@@ -1582,7 +1598,10 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const patch = { ...(params.patch as Record<string, unknown>) };
-        const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
+        const actorAgentId = await validatePluginIssueAgentProvenance(
+          companyId,
+          typeof patch.actorAgentId === "string" ? patch.actorAgentId : null,
+        );
         const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;
         const actorRunId = typeof patch.actorRunId === "string" ? patch.actorRunId : null;
         delete patch.actorAgentId;
@@ -2011,17 +2030,18 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        const authorAgentId = await validatePluginIssueAgentProvenance(companyId, params.authorAgentId);
         const comment = (await issues.addComment(
           params.issueId,
           params.body,
-          { agentId: params.authorAgentId },
+          { agentId: authorAgentId ?? undefined },
         )) as IssueComment;
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
-          actor: { actorAgentId: params.authorAgentId ?? null },
+          actor: { actorAgentId: authorAgentId },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
@@ -2034,15 +2054,16 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        const authorAgentId = await validatePluginIssueAgentProvenance(companyId, params.authorAgentId);
         const interaction = await issueThreadInteractionService(db).create(issue, params.interaction as CreateIssueThreadInteraction, {
-          agentId: params.authorAgentId ?? null,
+          agentId: authorAgentId,
         });
         await logPluginActivity({
           companyId,
           action: "issue.thread_interaction_created",
           entityType: "issue",
           entityId: issue.id,
-          actor: { actorAgentId: params.authorAgentId ?? null },
+          actor: { actorAgentId: authorAgentId },
           details: {
             identifier: issue.identifier,
             interactionId: interaction.id,
@@ -2434,6 +2455,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const policy = params.policy ? sanitizeRecord(params.policy) : null;
         if (params.resourceType === "agent") {
+          assertHistoricalAgentTombstoneAccessMutable(params.resourceId);
           const agent = requireInCompany("Agent", await agents.getById(params.resourceId), companyId);
           const permissions = agent.permissions && typeof agent.permissions === "object"
             ? { ...(agent.permissions as Record<string, unknown>) }
@@ -2551,28 +2573,42 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        await assertAssignableAgent(db, companyId, params.agentId, { kind: "work" });
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         const taskKey = params.taskKey ?? `plugin:${pluginKey}:session:${randomUUID()}`;
 
-        const row = await db
-          .insert(agentTaskSessionsTable)
-          .values({
+        const row = await db.transaction(async (tx) => {
+          const agentId = canonicalizeAgentReferenceId(params.agentId);
+          await lockAgentLifecycleReference(tx as unknown as Db, {
             companyId,
-            agentId: params.agentId,
-            adapterType: agent!.adapterType,
-            taskKey,
-            sessionParamsJson: null,
-            sessionDisplayId: null,
-            lastRunId: null,
-            lastError: null,
-          })
-          .returning()
-          .then((rows) => rows[0]);
+            agentId,
+          });
+          const lockedAgent = await tx
+            .select({ adapterType: agentsTable.adapterType })
+            .from(agentsTable)
+            .where(and(eq(agentsTable.id, agentId), eq(agentsTable.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (!lockedAgent) throw new Error("Agent disappeared while creating plugin session");
+          return tx
+            .insert(agentTaskSessionsTable)
+            .values({
+              companyId,
+              agentId,
+              adapterType: lockedAgent.adapterType,
+              taskKey,
+              sessionParamsJson: null,
+              sessionDisplayId: null,
+              lastRunId: null,
+              lastError: null,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+        });
 
         return {
           sessionId: row!.id,
-          agentId: params.agentId,
+          agentId: canonicalizeAgentReferenceId(params.agentId),
           companyId,
           status: "active" as const,
           createdAt: row!.createdAt.toISOString(),

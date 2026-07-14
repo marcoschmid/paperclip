@@ -24,6 +24,10 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import {
+  assertHistoricalAgentTombstoneMutable,
+  isHistoricalAgentTombstoneId,
+} from "./agent-retirement-historical-tombstones.js";
 
 type ScopeRecord = {
   companyId: string;
@@ -214,6 +218,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   async function pauseScopeForBudget(policy: PolicyRow) {
     const now = new Date();
     if (policy.scopeType === "agent") {
+      if (isHistoricalAgentTombstoneId(policy.scopeId)) return;
       await db
         .update(agents)
         .set({
@@ -261,6 +266,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   async function resumeScopeFromBudget(policy: PolicyRow) {
     const now = new Date();
     if (policy.scopeType === "agent") {
+      if (isHistoricalAgentTombstoneId(policy.scopeId)) return;
       await db
         .update(agents)
         .set({
@@ -510,6 +516,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       input: BudgetPolicyUpsertInput,
       actorUserId: string | null,
     ): Promise<BudgetPolicySummary> => {
+      if (input.scopeType === "agent") {
+        assertHistoricalAgentTombstoneMutable(input.scopeId);
+      }
       const scope = await resolveScopeRecord(db, input.scopeType, input.scopeId);
       if (scope.companyId !== companyId) {
         throw unprocessable("Budget scope does not belong to company");
@@ -647,6 +656,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     },
 
     evaluateCostEvent: async (event: typeof costEvents.$inferSelect) => {
+      assertHistoricalAgentTombstoneMutable(event.agentId);
       const candidatePolicies = await db
         .select()
         .from(budgetPolicies)
@@ -878,6 +888,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       if (incident.companyId !== companyId) throw notFound("Budget incident not found");
 
       const policy = await getPolicyRow(incident.policyId);
+      if (policy.scopeType === "agent") {
+        assertHistoricalAgentTombstoneMutable(policy.scopeId);
+      }
       if (input.action === "raise_budget_and_resume") {
         const nextAmount = Math.max(0, Math.floor(input.amount ?? 0));
         const currentObserved = await computeObservedAmount(db, policy);

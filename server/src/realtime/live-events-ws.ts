@@ -4,11 +4,12 @@ import { createRequire } from "node:module";
 import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, agents, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { isHistoricalAgentTombstoneId } from "../services/agent-retirement-historical-tombstones.js";
 
 interface WsSocket {
   readyState: number;
@@ -114,7 +115,7 @@ function headersFromIncomingMessage(req: IncomingMessage): Headers {
   return headers;
 }
 
-async function authorizeUpgrade(
+export async function authorizeLiveEventsUpgrade(
   db: Db,
   req: IncomingMessage,
   companyId: string,
@@ -185,10 +186,27 @@ async function authorizeUpgrade(
     return null;
   }
 
-  await db
+  const agent = await db
+    .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+    .from(agents)
+    .where(eq(agents.id, key.agentId))
+    .then((rows) => rows[0] ?? null);
+  if (
+    !agent ||
+    agent.companyId !== companyId ||
+    agent.status === "terminated" ||
+    agent.status === "pending_approval" ||
+    isHistoricalAgentTombstoneId(agent.id)
+  ) {
+    return null;
+  }
+
+  const touched = await db
     .update(agentApiKeys)
     .set({ lastUsedAt: new Date() })
-    .where(eq(agentApiKeys.id, key.id));
+    .where(and(eq(agentApiKeys.id, key.id), isNull(agentApiKeys.revokedAt)))
+    .returning({ id: agentApiKeys.id });
+  if (touched.length !== 1) return null;
 
   return {
     companyId,
@@ -283,7 +301,7 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
-    void authorizeUpgrade(db, req, companyId, url, {
+    void authorizeLiveEventsUpgrade(db, req, companyId, url, {
       deploymentMode: opts.deploymentMode,
       resolveSessionFromHeaders: opts.resolveSessionFromHeaders,
     })

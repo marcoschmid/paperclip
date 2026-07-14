@@ -59,6 +59,7 @@ export const logger = pino({
     "req.headers['x-api-key']",
     "req.headers['x-paperclip-token']",
     "req.headers['x-paperclip-api-key']",
+    "req.headers['x-paperclip-maintenance-lease']",
     "req.headers['x-board-api-key']",
     "req.headers['x-agent-token']",
     "req.headers['x-openclaw-token']",

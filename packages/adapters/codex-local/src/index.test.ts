@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentConfigurationDoc,
+  DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
   DEFAULT_CODEX_LOCAL_MODEL,
   isCodexLocalFastModeSupported,
   modelProfiles,
@@ -31,5 +33,13 @@ describe("codex local adapter metadata", () => {
         },
       }),
     );
+  });
+
+  it("defaults the global approvals and sandbox bypass to false", () => {
+    expect(DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX).toBe(false);
+    expect(agentConfigurationDoc).toContain(
+      "dangerouslyBypassApprovalsAndSandbox (boolean, optional, default false)",
+    );
+    expect(agentConfigurationDoc).toContain("Paperclip rejects true");
   });
 });

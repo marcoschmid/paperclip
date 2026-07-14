@@ -87,6 +87,7 @@ export type AuthorizationDecision = {
     | "allow_local_board"
     | "allow_instance_admin"
     | "allow_explicit_grant"
+    | "allow_permission_manifest"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
     | "allow_self"
@@ -1361,14 +1362,6 @@ export function authorizationService(db: Db) {
         taskAssignmentPolicyEffect = policyEffect;
         const policyDeny = await denyForAssignmentPolicyIfNeeded(policyEffect);
         if (policyDeny) return policyDeny;
-        const membership = await getActiveMembership(companyId, "user", input.actor.userId);
-        if (policyEffect.kind === "none" && membership && membership.membershipRole !== "viewer") {
-          return allow({
-            action: input.action,
-            reason: "allow_simple_company_member",
-            explanation: "Allowed by simple mode company-wide task assignment default.",
-          });
-        }
       }
       if (!permissionKey) {
         if (
@@ -1539,16 +1532,29 @@ export function authorizationService(db: Db) {
       const policyEffect = await assignmentPolicyEffect(input.resource);
       const policyDeny = await denyForAssignmentPolicyIfNeeded(policyEffect);
       if (policyDeny) return policyDeny;
-      if (policyEffect.kind === "restricted") {
-        const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
-        if (grantDecision.allowed) return grantDecision;
-        return denyRestrictedAssignmentPolicy(policyEffect);
+      if (actorAgent.role === "ceo") {
+        return allow({
+          action: input.action,
+          reason: "allow_legacy_agent_creator",
+          explanation: "Allowed by CEO task-assignment authority.",
+        });
       }
-      return allow({
-        action: input.action,
-        reason: "allow_simple_company_member",
-        explanation: "Allowed by simple mode company-wide task assignment default.",
-      });
+      if (
+        policyEffect.kind === "none"
+        && actorAgent.permissions
+        && typeof actorAgent.permissions === "object"
+        && (actorAgent.permissions as Record<string, unknown>).canAssignTasks === true
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_permission_manifest",
+          explanation: "Allowed by the agent's explicit canAssignTasks permission manifest.",
+        });
+      }
+      const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
+      if (grantDecision.allowed) return grantDecision;
+      if (policyEffect.kind === "restricted") return denyRestrictedAssignmentPolicy(policyEffect);
+      return grantDecision;
     }
 
     if (input.action === "issue:comment" || input.action === "issue:mutate") {

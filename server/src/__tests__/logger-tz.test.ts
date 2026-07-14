@@ -78,7 +78,9 @@ describe("logger translateTime respects TZ environment variable", () => {
     expect(mockChmodSync).toHaveBeenCalledWith("/tmp/paperclip-test-logs/server.log", 0o600);
     const loggerOptions = mockPino.mock.calls[0][0] as {
       hooks?: { logMethod?: (args: unknown[], method: (...values: unknown[]) => unknown) => unknown };
+      redact?: string[];
     };
+    expect(loggerOptions.redact).toContain("req.headers['x-paperclip-maintenance-lease']");
     const method = vi.fn();
     const token = "pcp_logger_hook_secret";
     loggerOptions.hooks?.logMethod?.([{ output: token }, token], method);

@@ -18,6 +18,7 @@ import { companyService } from "../services/companies.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -61,6 +62,41 @@ describeEmbeddedPostgres("companyService", () => {
 
     const rows = await db.select({ issuePrefix: companies.issuePrefix }).from(companies);
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
+  });
+
+  it("rejects physical company deletion when it would delete a historical tombstone", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Historical Tombstone Co",
+      issuePrefix: `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [historical] = await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+
+    await expect(companyService(db).remove(companyId)).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_immutable",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    await expect(db.select().from(companies).where(eq(companies.id, companyId)))
+      .resolves.toHaveLength(1);
+    const persisted = await db.select().from(agents).where(eq(agents.id, HISTORICAL_TOMBSTONE_ID));
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]?.updatedAt).toEqual(historical!.updatedAt);
   });
 
   it("archives companies by pausing runnable agents and cancelling active runs", async () => {

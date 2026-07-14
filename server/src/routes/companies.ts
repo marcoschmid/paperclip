@@ -20,6 +20,12 @@ import {
 import { badRequest, forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import {
+  AGENT_MAINTENANCE_LEASE_HEADER,
+  AGENT_MAINTENANCE_LEASE_SCOPE,
+  agentMaintenanceLeaseService,
+} from "../services/agent-maintenance-leases.js";
+import { portfolioMaintenanceService } from "../services/portfolio-maintenance.js";
+import {
   accessService,
   agentService,
   budgetService,
@@ -43,6 +49,8 @@ export function companyRoutes(db: Db, storage?: StorageService) {
   const budgets = budgetService(db);
   const artifacts = companyArtifactsService(db, storage);
   const feedback = feedbackService(db);
+  const maintenanceLeases = agentMaintenanceLeaseService(db);
+  const portfolioMaintenance = portfolioMaintenanceService(db);
   const importJobs = new Map<string, ImportJobRecord>();
   const importJobTerminalRetentionMs = 5 * 60 * 1000;
 
@@ -78,6 +86,57 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     limit: z.string().optional(),
     offset: z.string().optional(),
   }).passthrough();
+
+  const acquireMaintenanceLeaseSchema = z.object({
+    scope: z.literal(AGENT_MAINTENANCE_LEASE_SCOPE),
+    agentIds: z.array(z.string().uuid()).min(1).max(100),
+  }).strict().superRefine((body, ctx) => {
+    if (new Set(body.agentIds).size !== body.agentIds.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["agentIds"], message: "agentIds must be unique" });
+    }
+  });
+  const maintenanceLeaseIdSchema = z.string().uuid();
+  const maintenanceLeaseTokenSchema = z.string().min(1).max(256);
+  const portfolioAgentIdsSchema = z.array(z.string().uuid()).min(1).max(100).superRefine((agentIds, ctx) => {
+    if (new Set(agentIds).size !== agentIds.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "agentIds must be unique" });
+    }
+    if (agentIds.some((agentId, index) => index > 0 && agentIds[index - 1]! >= agentId)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "agentIds must be sorted" });
+    }
+  });
+  const portfolioQuiesceSchema = z.object({
+    agentIds: portfolioAgentIdsSchema,
+    operationId: z.string().uuid(),
+    expectedSnapshotFingerprint: z.string().regex(/^v1:sha256:[a-f0-9]{64}$/),
+  }).strict();
+  const portfolioGateReleaseSchema = z.object({
+    agentIds: portfolioAgentIdsSchema,
+    receiptIds: z.array(z.string().regex(/^v1:sha256:[a-f0-9]{64}$/)).min(1).max(100),
+    expectedSnapshotFingerprint: z.string().regex(/^v1:sha256:[a-f0-9]{64}$/),
+  }).strict().superRefine((body, ctx) => {
+    if (new Set(body.receiptIds).size !== body.receiptIds.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["receiptIds"], message: "receiptIds must be unique" });
+    }
+    if (body.receiptIds.some((receiptId, index) => index > 0 && body.receiptIds[index - 1]! >= receiptId)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["receiptIds"], message: "receiptIds must be sorted" });
+    }
+  });
+
+  function parsePortfolioAgentIdsQuery(value: unknown) {
+    if (typeof value !== "string" || value.length === 0) {
+      throw badRequest("agentIds query parameter is required");
+    }
+    return portfolioAgentIdsSchema.parse(value.split(","));
+  }
+
+  function readMaintenanceLeaseToken(req: Request) {
+    const token = req.get(AGENT_MAINTENANCE_LEASE_HEADER);
+    if (!token) throw forbidden("Maintenance lease token required");
+    const parsed = maintenanceLeaseTokenSchema.safeParse(token);
+    if (!parsed.success) throw forbidden("Invalid maintenance lease token");
+    return parsed.data;
+  }
 
   function assertImportTargetAccess(
     req: Request,
@@ -136,6 +195,81 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     res.status(400).json({
       error: "Missing companyId in path. Use /api/companies/{companyId}/issues.",
     });
+  });
+
+  router.post(
+    "/:companyId/maintenance-leases/acquire",
+    async (req, res) => {
+      assertBoard(req);
+      const companyId = z.string().uuid().parse(req.params.companyId);
+      assertCompanyAccess(req, companyId);
+      const body = acquireMaintenanceLeaseSchema.parse(req.body);
+      const targetAgents = await Promise.all(body.agentIds.map((agentId) => agents.getById(agentId)));
+      if (targetAgents.some((agent) => !agent || agent.companyId !== companyId || agent.adapterType !== "codex_local")) {
+        throw badRequest("All maintenance lease agents must be codex_local agents in the target company");
+      }
+      const actor = getActorInfo(req);
+      res.json(await maintenanceLeases.acquire({
+        companyId,
+        agentIds: body.agentIds,
+        scope: body.scope,
+        ownerUserId: actor.actorId,
+      }));
+    },
+  );
+
+  router.get("/:companyId/portfolio-maintenance-preflight", async (req, res) => {
+    assertBoard(req);
+    const companyId = z.string().uuid().parse(req.params.companyId);
+    assertCompanyAccess(req, companyId);
+    const agentIds = parsePortfolioAgentIdsQuery(req.query.agentIds);
+    res.json(await portfolioMaintenance.preflight({ companyId, agentIds }));
+  });
+
+  router.post("/:companyId/portfolio-maintenance-wakes/quiesce", async (req, res) => {
+    assertBoard(req);
+    const companyId = z.string().uuid().parse(req.params.companyId);
+    assertCompanyAccess(req, companyId);
+    const body = portfolioQuiesceSchema.parse(req.body);
+    res.json(await portfolioMaintenance.quiesce({
+      companyId,
+      agentIds: body.agentIds,
+      operationId: body.operationId,
+      expectedSnapshotFingerprint: body.expectedSnapshotFingerprint,
+      actorUserId: req.actor.type === "board" ? req.actor.userId ?? "board" : "board",
+    }));
+  });
+
+  router.post("/:companyId/portfolio-maintenance-gates/release", async (req, res) => {
+    assertBoard(req);
+    const companyId = z.string().uuid().parse(req.params.companyId);
+    assertCompanyAccess(req, companyId);
+    const body = portfolioGateReleaseSchema.parse(req.body);
+    res.json(await portfolioMaintenance.releaseGate({
+      companyId,
+      agentIds: body.agentIds,
+      receiptIds: body.receiptIds,
+      expectedSnapshotFingerprint: body.expectedSnapshotFingerprint,
+      actorUserId: req.actor.type === "board" ? req.actor.userId ?? "board" : "board",
+    }));
+  });
+
+  router.get("/:companyId/maintenance-leases/:leaseId/drain-receipt", async (req, res) => {
+    assertBoard(req);
+    const companyId = z.string().uuid().parse(req.params.companyId);
+    const leaseId = maintenanceLeaseIdSchema.parse(req.params.leaseId);
+    assertCompanyAccess(req, companyId);
+    const leaseToken = readMaintenanceLeaseToken(req);
+    res.json(await maintenanceLeases.drainReceipt(companyId, leaseId, leaseToken));
+  });
+
+  router.post("/:companyId/maintenance-leases/:leaseId/release", async (req, res) => {
+    assertBoard(req);
+    const companyId = z.string().uuid().parse(req.params.companyId);
+    const leaseId = maintenanceLeaseIdSchema.parse(req.params.leaseId);
+    assertCompanyAccess(req, companyId);
+    const leaseToken = readMaintenanceLeaseToken(req);
+    res.json(await maintenanceLeases.release(companyId, leaseId, leaseToken));
   });
 
   router.get("/:companyId/artifacts", async (req, res) => {

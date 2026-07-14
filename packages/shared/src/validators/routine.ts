@@ -145,6 +145,7 @@ export const createRoutineTriggerSchema = z.discriminatedUnion("kind", [
 export type CreateRoutineTrigger = z.infer<typeof createRoutineTriggerSchema>;
 
 export const updateRoutineTriggerSchema = z.object({
+  baseRevisionId: z.string().uuid().optional().nullable(),
   label: z.string().trim().max(120).optional().nullable(),
   enabled: z.boolean().optional(),
   cronExpression: z.string().trim().min(1).optional().nullable(),

@@ -76,6 +76,29 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+function errorHasPostgresCode(error: unknown, code: string): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object") return false;
+    const record = current as { code?: unknown; cause?: unknown };
+    if (record.code === code) return true;
+    current = record.cause;
+  }
+  return false;
+}
+
+async function truncateCompaniesWithDeadlockRetry(db: ReturnType<typeof createDb>) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+      return;
+    } catch (error) {
+      if (!errorHasPostgresCode(error, "40P01") || attempt === 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
+}
+
 describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -103,7 +126,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    await truncateCompaniesWithDeadlockRetry(db);
     await instanceSettingsService(db).updateExperimental({
       enableIssueGraphLivenessAutoRecovery: false,
       enableIsolatedWorkspaces: false,

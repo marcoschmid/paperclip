@@ -6,6 +6,8 @@ import {
   companySkillInstallCatalogResultSchema,
   companySkillInstallCatalogSchema,
   companySkillInstallUpdateSchema,
+  companySkillResyncPreflightSchema,
+  companySkillResyncRequestSchema,
   companySkillResetSchema,
   companySkillUpdateStatusSchema,
 } from "./company-skill.js";
@@ -179,5 +181,105 @@ describe("company skill catalog validators", () => {
     expect(companySkillInstallUpdateSchema.parse({ force: true })).toEqual({ force: true });
     expect(companySkillResetSchema.parse(undefined)).toEqual({});
     expect(companySkillResetSchema.parse({ force: true })).toEqual({ force: true });
+  });
+});
+
+describe("company skill resync validators", () => {
+  const agentIds = Array.from({ length: 101 }, (_, index) =>
+    `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`);
+  const inventorySha256 = `v1:sha256:${"a".repeat(64)}`;
+  const otherInventorySha256 = `v1:sha256:${"b".repeat(64)}`;
+  const fingerprint = `v1:sha256:${"c".repeat(64)}`;
+  const request = {
+    schemaVersion: "1.0.0",
+    approvalIssue: "TEC-355",
+    maintenanceOperationId: "10000000-0000-4000-8000-000000000001",
+    maintenanceAgentIds: [agentIds[0]],
+    maintenanceReceiptId: fingerprint,
+    maintenanceExpectedSnapshotFingerprint: fingerprint,
+    label: "TEC-355 skill-resync test",
+    expectedSkillKey: "local/example/review",
+    expectedSourceType: "local_path",
+    expectedSourceInventoryMode: "full",
+    expectedSourceLocatorSha256: fingerprint,
+    expectedSkillUpdatedAt: "2026-07-13T08:00:00.000Z",
+    expectedCurrentVersionId: "20000000-0000-4000-8000-000000000001",
+    expectedBaseMarkdownSha256: fingerprint,
+    expectedCurrentVersionInventorySha256: inventorySha256,
+    expectedSourceSkillMarkdownSha256: fingerprint,
+    expectedSourceInventorySha256: otherInventorySha256,
+    expectedBaseFileInventorySha256: fingerprint,
+    expectedSourceFileInventorySha256: fingerprint,
+    expectedBaseTrustLevel: "markdown_only",
+    expectedSourceTrustLevel: "markdown_only",
+  } as const;
+
+  it("allows an exact sorted unique 0..100 GET scope", () => {
+    expect(companySkillResyncPreflightSchema.shape.affectedAgentIds.parse([])).toEqual([]);
+    expect(companySkillResyncPreflightSchema.shape.affectedAgentIds.parse(agentIds.slice(0, 100)))
+      .toEqual(agentIds.slice(0, 100));
+    expect(companySkillResyncPreflightSchema.shape.affectedAgentIds.safeParse(agentIds).success).toBe(false);
+    expect(companySkillResyncPreflightSchema.shape.affectedAgentIds.safeParse([agentIds[1], agentIds[0]]).success)
+      .toBe(false);
+    expect(companySkillResyncPreflightSchema.shape.affectedAgentIds.safeParse([agentIds[0], agentIds[0]]).success)
+      .toBe(false);
+  });
+
+  it("accepts an empty maintenance scope only for an exact base-only inventory claim", () => {
+    expect(companySkillResyncRequestSchema.parse({
+      ...request,
+      maintenanceAgentIds: [],
+      maintenanceReceiptId: null,
+      maintenanceExpectedSnapshotFingerprint: null,
+      expectedSourceInventorySha256: inventorySha256,
+    })).toMatchObject({
+      maintenanceAgentIds: [],
+      maintenanceReceiptId: null,
+      maintenanceExpectedSnapshotFingerprint: null,
+      expectedCurrentVersionInventorySha256: inventorySha256,
+      expectedSourceInventorySha256: inventorySha256,
+    });
+  });
+
+  it("rejects forged empty-scope inventory drift and receipt/fingerprint hybrids", () => {
+    expect(companySkillResyncRequestSchema.safeParse({
+      ...request,
+      maintenanceAgentIds: [],
+      maintenanceReceiptId: null,
+      maintenanceExpectedSnapshotFingerprint: null,
+    }).success).toBe(false);
+    expect(companySkillResyncRequestSchema.safeParse({
+      ...request,
+      maintenanceAgentIds: [],
+      maintenanceExpectedSnapshotFingerprint: null,
+      expectedSourceInventorySha256: inventorySha256,
+    }).success).toBe(false);
+    expect(companySkillResyncRequestSchema.safeParse({
+      ...request,
+      maintenanceAgentIds: [],
+      maintenanceReceiptId: null,
+      expectedSourceInventorySha256: inventorySha256,
+    }).success).toBe(false);
+    expect(companySkillResyncRequestSchema.safeParse({
+      ...request,
+      maintenanceAgentIds: [],
+      maintenanceReceiptId: null,
+      maintenanceExpectedSnapshotFingerprint: null,
+      expectedSourceInventoryMode: "project_root",
+      expectedSourceInventorySha256: inventorySha256,
+    }).success).toBe(false);
+  });
+
+  it("keeps the non-empty maintenance request contract and exact gate evidence unchanged", () => {
+    expect(companySkillResyncRequestSchema.parse(request)).toEqual(request);
+    expect(companySkillResyncRequestSchema.safeParse({
+      ...request,
+      maintenanceReceiptId: null,
+      maintenanceExpectedSnapshotFingerprint: null,
+    }).success).toBe(false);
+    expect(companySkillResyncRequestSchema.safeParse({
+      ...request,
+      maintenanceAgentIds: [agentIds[1], agentIds[0]],
+    }).success).toBe(false);
   });
 });

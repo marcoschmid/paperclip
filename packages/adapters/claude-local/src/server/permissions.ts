@@ -1,43 +1,69 @@
-// Explicit allowlist of Claude Code tools we permit when running on a remote
-// target. We use this instead of `--dangerously-skip-permissions` for remote
-// targets because the permission-approval prompts can't be answered by a
-// human inside a non-interactive run, but blanket-allowing every tool would
-// defeat the point of having a separate hosted/sandbox code path.
-//
-// Maintenance: this list must be reviewed when Claude Code releases a new
-// tool. The canonical list of built-in tools is documented at
-// https://docs.claude.com/en/docs/claude-code/built-in-tools — when a tool
-// is added there, decide whether it should be allowed in remote runs and
-// either add it here or document the deliberate exclusion. Omitting a tool
-// silently disables it inside remote targets, which can look like the tool is
-// "broken" rather than intentionally gated.
+const GLOBAL_CLAUDE_PERMISSION_BYPASS_FLAG = "--dangerously-skip-permissions";
+const ALLOWED_CLAUDE_EXTRA_ARGS = new Set(["--no-session-persistence"]);
+// Remote sandbox runs are non-interactive, so the runtime owns one immutable
+// tool scope. Agent configuration may not replace or extend this list.
 const SANDBOX_ALLOWED_TOOLS =
   "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit " +
   "EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor " +
   "NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill " +
   "TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write";
 
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
+}
+
+function containsGlobalClaudePermissionBypass(args: string[]) {
+  return args.some(
+    (arg) => arg === GLOBAL_CLAUDE_PERMISSION_BYPASS_FLAG
+      || arg.startsWith(`${GLOBAL_CLAUDE_PERMISSION_BYPASS_FLAG}=`),
+  );
+}
+
+function assertClaudeExtraArgsAreAllowlisted(args: string[]) {
+  const unsupported = args.find((arg) => !ALLOWED_CLAUDE_EXTRA_ARGS.has(arg));
+  if (unsupported) {
+    throw new Error(
+      `Claude extraArgs/args contains unsupported security-sensitive token ${JSON.stringify(unsupported)}; only --no-session-persistence is allowed.`,
+    );
+  }
+}
+
+export function assertClaudePermissionConfigIsFailClosed(config: unknown) {
+  const record = typeof config === "object" && config !== null && !Array.isArray(config)
+    ? config as Record<string, unknown>
+    : {};
+  const extraArgs = readStringArray(record.extraArgs);
+  const legacyArgs = readStringArray(record.args);
+  if (
+    record.dangerouslySkipPermissions === true
+    || containsGlobalClaudePermissionBypass(extraArgs)
+    || containsGlobalClaudePermissionBypass(legacyArgs)
+  ) {
+    throw new Error("The global Claude permission bypass is disabled; only Board-managed permission scopes may authorize tools.");
+  }
+  if (readStringArray(record.allowedTools).length > 0) {
+    throw new Error("Claude allowedTools requires a Board-managed tool scope and cannot be configured free-form.");
+  }
+  assertClaudeExtraArgsAreAllowlisted(extraArgs);
+  assertClaudeExtraArgsAreAllowlisted(legacyArgs);
+}
+
 export function buildClaudeProbePermissionArgs(input: {
-  dangerouslySkipPermissions: boolean;
+  dangerouslySkipPermissions?: boolean;
+  allowedTools?: string[];
   targetIsRemote: boolean;
 }): string[] {
-  if (!input.dangerouslySkipPermissions) return [];
-  // For remote targets, mirror the execution path: pass `--allowedTools`
-  // with the curated allowlist instead of dropping the flag entirely. The
-  // hello probe is a one-shot prompt that should never trigger a tool, but
-  // if a future probe prompt does, we don't want Claude CLI to stall on an
-  // interactive permission prompt that no human can answer.
-  if (input.targetIsRemote) return ["--allowedTools", SANDBOX_ALLOWED_TOOLS];
-  return ["--dangerously-skip-permissions"];
+  assertClaudePermissionConfigIsFailClosed(input);
+  return input.targetIsRemote ? ["--allowedTools", SANDBOX_ALLOWED_TOOLS] : [];
 }
 
 export function buildClaudeExecutionPermissionArgs(input: {
-  dangerouslySkipPermissions: boolean;
+  dangerouslySkipPermissions?: boolean;
+  allowedTools?: string[];
   targetIsRemote: boolean;
 }): string[] {
-  if (!input.dangerouslySkipPermissions) return [];
-  if (input.targetIsRemote) {
-    return ["--allowedTools", SANDBOX_ALLOWED_TOOLS];
-  }
-  return ["--dangerously-skip-permissions"];
+  assertClaudePermissionConfigIsFailClosed(input);
+  return input.targetIsRemote ? ["--allowedTools", SANDBOX_ALLOWED_TOOLS] : [];
 }

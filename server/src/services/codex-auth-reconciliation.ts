@@ -103,6 +103,7 @@ export async function reconcileCodexLocalManagedHomesOnStartup(
     try {
       const result = await reconcileManagedCodexHome({
         companyId: row.companyId,
+        agentId: row.id,
         configuredCodexHome,
         apiKey: apiKeyBinding.kind === "plain" ? apiKeyBinding.value : null,
         apiKeySecretBound: apiKeyBinding.kind === "secret",

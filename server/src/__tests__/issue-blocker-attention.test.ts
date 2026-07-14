@@ -10,6 +10,7 @@ import {
   createDb,
   heartbeatRuns,
   issueApprovals,
+  issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -42,6 +43,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(issueRecoveryActions);
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -399,6 +401,49 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBV-2",
       sampleStalledBlockerIdentifier: "PBV-2",
+    });
+  });
+
+  it("does not let a tombstone-owned recovery action mask a stalled review graph as waiting", async () => {
+    const { companyId, agentId } = await createCompany("PBT");
+    const tombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    await db.insert(agents).values({
+      id: tombstoneId,
+      companyId,
+      name: "Historical recovery owner",
+      role: "engineer",
+      status: "terminated",
+    });
+    const parentId = await insertIssue({ companyId, identifier: "PBT-1", title: "Parent", status: "blocked" });
+    const reviewLeafId = await insertIssue({
+      companyId,
+      identifier: "PBT-2",
+      title: "Stalled legacy recovery leaf",
+      status: "in_review",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: reviewLeafId, blockedIssueId: parentId });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: reviewLeafId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: tombstoneId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `legacy-tombstone:${reviewLeafId}`,
+      evidence: { legacy: true },
+      nextAction: "Board cleanup required.",
+      attemptCount: 1,
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "stalled",
+      reason: "stalled_review",
+      stalledBlockerCount: 1,
+      sampleStalledBlockerIdentifier: "PBT-2",
     });
   });
 

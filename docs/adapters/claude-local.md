@@ -21,7 +21,9 @@ The `claude_local` adapter runs Anthropic's Claude Code CLI locally. It supports
 | `timeoutSec` | number | No | Process timeout (0 = no timeout) |
 | `graceSec` | number | No | Grace period before force-kill |
 | `maxTurnsPerRun` | number | No | Max agentic turns per heartbeat (defaults to `300`) |
-| `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); required for headless runs where interactive approval is impossible |
+| `dangerouslySkipPermissions` | boolean | No | Legacy global bypass (default: `false`). Paperclip rejects `true` and the equivalent flag in `extraArgs`/`args`. |
+| `allowedTools` | string[] | No | Legacy input. Free-form values are rejected. Only a trusted remote execution target receives Paperclip's immutable runtime-owned tool list; agent config cannot replace or extend it. |
+| `extraArgs` / `args` | string[] | No | Fail-closed allowlist; only `--no-session-persistence` is accepted. Permission/tool flags are rejected. |
 
 ## Prompt Templates
 

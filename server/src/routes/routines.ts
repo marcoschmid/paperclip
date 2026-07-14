@@ -535,7 +535,10 @@ export function routineRoutes(
         triggerCount: updated.revision.snapshot.triggers.length,
       });
     }
-    res.json(updated?.trigger ?? null);
+    res.json(updated ? {
+      ...updated.trigger,
+      routineRevisionId: updated.revision.id,
+    } : null);
   });
 
   router.delete("/routine-triggers/:id", async (req, res) => {

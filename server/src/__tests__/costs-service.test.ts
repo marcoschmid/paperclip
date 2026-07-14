@@ -21,6 +21,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
+
 function makeDb(overrides: Record<string, unknown> = {}) {
   const selectChain = {
     from: vi.fn().mockReturnThis(),
@@ -430,6 +432,85 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("rejects new cost events for historical tombstones before changing ledger or agent spend", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [historical] = await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      spentMonthlyCents: 17,
+    }).returning();
+
+    await expect(costs.createEvent(companyId, {
+      agentId: HISTORICAL_TOMBSTONE_ID,
+      provider: "openai",
+      model: "gpt-5",
+      inputTokens: 10,
+      cachedInputTokens: 0,
+      outputTokens: 2,
+      costCents: 5,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_immutable",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    await expect(db.select().from(costEvents)).resolves.toHaveLength(0);
+    const persisted = (await db.select().from(agents))[0];
+    expect(persisted).toMatchObject({ spentMonthlyCents: 17, updatedAt: historical!.updatedAt });
+  });
+
+  it("rejects new finance attribution for a historical tombstone before inserting an event", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await expect(finance.createEvent(companyId, {
+      agentId: HISTORICAL_TOMBSTONE_ID,
+      eventKind: "manual_adjustment",
+      biller: "internal",
+      amountCents: 25,
+      occurredAt: new Date("2026-07-14T00:00:00.000Z"),
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_immutable",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    await expect(db.select().from(financeEvents)).resolves.toHaveLength(0);
   });
 
   it("aggregates cost event sums above int32 without raising Postgres integer overflow", async () => {

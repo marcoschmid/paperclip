@@ -24,6 +24,7 @@ describe("parseCodexJsonl", () => {
     expect(parseCodexJsonl(stdout)).toEqual({
       sessionId: "thread_123",
       summary: "Recovered response",
+      activityItemTypes: [],
       usage: {
         inputTokens: 10,
         cachedInputTokens: 2,
@@ -57,6 +58,7 @@ describe("parseCodexJsonl", () => {
     expect(parseCodexJsonl(stdout)).toEqual({
       sessionId: "thread_123",
       summary: "Fixed the issue and verified the targeted tests pass.",
+      activityItemTypes: [],
       usage: {
         inputTokens: 10,
         cachedInputTokens: 2,
@@ -64,6 +66,41 @@ describe("parseCodexJsonl", () => {
       },
       errorMessage: null,
     });
+  });
+
+  it("records every distinct non-message, non-reasoning item type as runtime activity", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "item.started",
+        item: { id: "cmd-1", type: "command_execution", command: "pwd" },
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "cmd-1", type: "command_execution", command: "pwd" },
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "mcp-1", type: "mcp_tool_call", server: "filesystem" },
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "mystery-1", type: "future_unknown_tool" },
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "reasoning", text: "Checking the fixture" },
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: "done" },
+      }),
+    ].join("\n");
+
+    expect(parseCodexJsonl(stdout).activityItemTypes).toEqual([
+      "command_execution",
+      "mcp_tool_call",
+      "future_unknown_tool",
+    ]);
   });
 });
 

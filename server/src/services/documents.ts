@@ -3,6 +3,10 @@ import type { Db } from "@paperclipai/db";
 import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
 import { isSystemIssueDocumentKey, issueDocumentKeySchema } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 function normalizeDocumentKey(key: string) {
   const normalized = key.trim().toLowerCase();
@@ -636,12 +640,21 @@ export function documentService(db: Db) {
           };
         }
 
+        const lockedByAgentId = input.lockedByAgentId
+          ? canonicalizeAgentReferenceId(input.lockedByAgentId)
+          : null;
+        if (lockedByAgentId) {
+          await lockAgentLifecycleReference(tx as unknown as Db, {
+            companyId: existing.companyId,
+            agentId: lockedByAgentId,
+          });
+        }
         const now = new Date();
         await tx
           .update(documents)
           .set({
             lockedAt: now,
-            lockedByAgentId: input.lockedByAgentId ?? null,
+            lockedByAgentId,
             lockedByUserId: input.lockedByUserId ?? null,
             updatedAt: now,
           })
@@ -657,7 +670,7 @@ export function documentService(db: Db) {
           document: {
             ...mapIssueDocumentRow(existing, true),
             lockedAt: now,
-            lockedByAgentId: input.lockedByAgentId ?? null,
+            lockedByAgentId,
             lockedByUserId: input.lockedByUserId ?? null,
             updatedAt: now,
           },

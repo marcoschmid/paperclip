@@ -70,9 +70,14 @@ export function decisionRoutes(db: Db) {
       assertCompanyAccess(req, companyId);
       await assertProjectInCompany(companyId, projectId);
 
-      const { created, decision } = await svc.upsert(companyId, { projectId, ...req.body });
-
       const actor = getActorInfo(req);
+      const { created, decision } = await svc.upsert(companyId, {
+        projectId,
+        ...req.body,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,

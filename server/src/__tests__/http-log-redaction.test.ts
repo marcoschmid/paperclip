@@ -49,6 +49,7 @@ describe("HTTP log redaction", () => {
       "x-openclaw-auth": "opaque-openclaw-auth",
       "x-paperclip-cloud-tenant-token": "opaque-cloud-token",
       "x-paperclip-dev-server-status-token": "opaque-dev-status-token",
+      "x-paperclip-maintenance-lease": "opaque-maintenance-lease",
       "x-hermes-session-key": "opaque-hermes-session-key",
       referer: `http://localhost:3347/invite/${SECRET}`,
       "user-agent": "paperclip-test",
@@ -73,6 +74,7 @@ describe("HTTP log redaction", () => {
       "x-openclaw-auth",
       "x-paperclip-cloud-tenant-token",
       "x-paperclip-dev-server-status-token",
+      "x-paperclip-maintenance-lease",
       "x-hermes-session-key",
     ]) {
       expect(headers[key]).toBe("[REDACTED]");

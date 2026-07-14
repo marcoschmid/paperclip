@@ -30,6 +30,8 @@ type StartupBannerOptions = {
   migrationSummary: string;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  routineDeliveryWorkerEnabled: boolean;
+  routineDeliveryWorkerIntervalMs: number;
   databaseBackupEnabled: boolean;
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
@@ -130,6 +132,9 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const heartbeat = opts.heartbeatSchedulerEnabled
     ? `enabled ${color(`(${opts.heartbeatSchedulerIntervalMs}ms)`, "dim")}`
     : color("disabled", "yellow");
+  const routineDeliveryWorker = opts.routineDeliveryWorkerEnabled
+    ? `enabled ${color(`(${opts.routineDeliveryWorkerIntervalMs}ms)`, "dim")}`
+    : color("disabled", "yellow");
   const dbBackup = opts.databaseBackupEnabled
     ? `enabled ${color(`(every ${opts.databaseBackupIntervalMinutes}m, keep ${opts.databaseBackupRetentionDays}d)`, "dim")}`
     : color("disabled", "yellow");
@@ -163,6 +168,7 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
         : color(agentJwtSecret.message, "yellow"),
     ),
     row("Heartbeat", heartbeat),
+    row("Routine Outbox", routineDeliveryWorker),
     row("DB Backup", dbBackup),
     row("Backup Dir", opts.databaseBackupDir),
     row("Config", configPath),

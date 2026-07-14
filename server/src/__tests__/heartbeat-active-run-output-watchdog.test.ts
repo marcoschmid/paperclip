@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -26,6 +27,8 @@ import {
 } from "../services/heartbeat.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
+import { inspectLocalProcessIdentity } from "../services/local-process-identity.ts";
+import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -38,6 +41,18 @@ const mockAdapterExecute = vi.hoisted(() =>
     model: "test-model",
   })),
 );
+const mockTerminateLocalService = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/local-service-supervisor.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/local-service-supervisor.js")>(
+    "../services/local-service-supervisor.js",
+  );
+  mockTerminateLocalService.mockImplementation(actual.terminateLocalService);
+  return {
+    ...actual,
+    terminateLocalService: mockTerminateLocalService,
+  };
+});
 
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
@@ -101,6 +116,7 @@ async function truncateCompaniesWithDeadlockRetry(db: ReturnType<typeof createDb
 describeEmbeddedPostgres("active-run output watchdog", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
+  const childProcesses = new Set<ChildProcess>();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-active-run-output-watchdog-");
@@ -108,6 +124,16 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
   }, 30_000);
 
   afterEach(async () => {
+    for (const child of childProcesses) {
+      if (!child.pid) continue;
+      try {
+        process.kill(child.pid, "SIGKILL");
+      } catch {
+        // The recovery path may already have terminated the test child.
+      }
+    }
+    childProcesses.clear();
+    runningProcesses.clear();
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const activeRuns = await db
         .select({ id: heartbeatRuns.id })
@@ -503,6 +529,142 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runId));
     expect(event?.message).toContain("Source-resolved watchdog fold");
+  });
+
+  it.skipIf(process.platform === "win32")("fails closed when an in-memory child has no persisted process identity", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "done",
+      sameRunTerminalEvidence: "activity",
+    });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    runningProcesses.set(runId, {
+      child,
+      graceSec: 1,
+      processGroupId: inspection.identity.processGroupId,
+    });
+
+    const result = await heartbeatService(db).scanSilentActiveRuns({ now, companyId });
+
+    expect(result).toMatchObject({ created: 0, folded: 0, skipped: 1 });
+    expect(() => process.kill(inspection.identity.pid, 0)).not.toThrow();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(run?.finishedAt).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("does not signal or fold a restarted no-handle run when process identity drifts inside the signal fence", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "done",
+      sameRunTerminalEvidence: "activity",
+    });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    await db.update(heartbeatRuns).set({
+      processPid: inspection.identity.pid,
+      processGroupId: inspection.identity.processGroupId,
+      processStartedAt: new Date(inspection.identity.processStartedAt),
+      processExecutable: inspection.identity.processExecutable,
+      processCommandSha256: inspection.identity.processCommandSha256,
+      lastOutputAt: new Date(now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 60_000),
+    }).where(eq(heartbeatRuns.id, runId));
+
+    let signalCount = 0;
+    const driftedCommandSha256 = `v1:sha256:${"f".repeat(64)}`;
+    mockTerminateLocalService.mockImplementationOnce(async (_record, opts) => {
+      await db.update(heartbeatRuns).set({
+        processCommandSha256: driftedCommandSha256,
+        updatedAt: new Date(now.getTime() + 1),
+      }).where(eq(heartbeatRuns.id, runId));
+      expect(opts?.signalWithinFence).toBeTypeOf("function");
+      await opts!.signalWithinFence!("SIGTERM", () => {
+        signalCount += 1;
+      });
+    });
+
+    const result = await heartbeatService(db).scanSilentActiveRuns({ now, companyId });
+
+    expect(signalCount).toBe(0);
+    expect(result).toMatchObject({ created: 0, folded: 0, skipped: 1 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(run?.finishedAt).toBeNull();
+    expect(run?.processCommandSha256).toBe(driftedCommandSha256);
+  });
+
+  it.skipIf(process.platform === "win32")("terminates and folds a restarted no-handle run with exact process identity", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "done",
+      sameRunTerminalEvidence: "activity",
+    });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    childProcesses.add(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const inspection = await inspectLocalProcessIdentity(child.pid!);
+    expect(inspection.kind).toBe("running");
+    if (inspection.kind !== "running") throw new Error("Test child identity was not readable");
+    await db.update(heartbeatRuns).set({
+      processPid: inspection.identity.pid,
+      processGroupId: inspection.identity.processGroupId,
+      processStartedAt: new Date(inspection.identity.processStartedAt),
+      processExecutable: inspection.identity.processExecutable,
+      processCommandSha256: inspection.identity.processCommandSha256,
+      lastOutputAt: new Date(now.getTime() - ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS - 60_000),
+    }).where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeatService(db).scanSilentActiveRuns({ now, companyId });
+
+    expect(result).toMatchObject({ created: 0, folded: 1, skipped: 0 });
+    expect(mockTerminateLocalService).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pid: inspection.identity.pid,
+        processGroupId: inspection.identity.processGroupId,
+      }),
+      expect.objectContaining({ forceAfterMs: 0, signalWithinFence: expect.any(Function) }),
+    );
+    expect(() => process.kill(inspection.identity.pid, 0)).toThrow();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("succeeded");
+    expect(run?.resultJson).toMatchObject({
+      sourceResolvedWatchdogFold: {
+        cleanup: { attempted: true, outcome: "terminated" },
+      },
+    });
   });
 
   it("still escalates terminal source issues without same-run terminal evidence", async () => {

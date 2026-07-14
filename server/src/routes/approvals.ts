@@ -21,6 +21,8 @@ import {
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { assertAssignableAgent } from "../services/agent-assignability.js";
+import { forbidden } from "../errors.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -136,6 +138,22 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    const actor = getActorInfo(req);
+    let requestedByAgentId: string | null;
+    if (actor.actorType === "agent") {
+      if (!actor.agentId) {
+        throw forbidden("Authenticated agent identity required to create an approval");
+      }
+      if (approvalInput.requestedByAgentId && approvalInput.requestedByAgentId !== actor.agentId) {
+        throw forbidden("Agents cannot create approvals on behalf of another agent");
+      }
+      requestedByAgentId = actor.agentId;
+    } else {
+      requestedByAgentId = approvalInput.requestedByAgentId ?? null;
+      if (requestedByAgentId) {
+        await assertAssignableAgent(db, companyId, requestedByAgentId, { kind: "work" });
+      }
+    }
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -145,13 +163,11 @@ export function approvalRoutes(
           )
         : approvalInput.payload;
 
-    const actor = getActorInfo(req);
     const approval = await svc.create(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
       requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
-      requestedByAgentId:
-        approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
+      requestedByAgentId,
       status: "pending",
       decisionNote: null,
       decidedByUserId: null,

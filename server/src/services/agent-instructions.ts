@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
 import path from "node:path";
 import { notFound, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
+import {
+  assertHistoricalAgentTombstoneMutable,
+  isHistoricalAgentTombstoneId,
+} from "./agent-retirement-historical-tombstones.js";
 
 const ENTRY_FILE_DEFAULT = "AGENTS.md";
 const MODE_KEY = "instructionsBundleMode";
@@ -25,6 +30,42 @@ const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
   "venv",
 ]);
 
+const READ_ONLY_EXPORT_DEFAULT_LIMITS = {
+  maxFiles: 256,
+  maxDirectories: 128,
+  maxDepth: 16,
+  maxFileBytes: 1024 * 1024,
+  maxTotalBytes: 4 * 1024 * 1024,
+} as const;
+
+type ReadOnlyExportOptions = {
+  signal?: AbortSignal;
+  maxFiles?: number;
+  maxDirectories?: number;
+  maxDepth?: number;
+  maxFileBytes?: number;
+  maxTotalBytes?: number;
+};
+
+type ResolvedReadOnlyExportOptions = Required<Omit<ReadOnlyExportOptions, "signal">> & {
+  signal?: AbortSignal;
+};
+
+type ReadOnlyDirectoryIdentity = {
+  absolutePath: string;
+  canonicalPath: string;
+  relativePath: string;
+  dev: bigint;
+  ino: bigint;
+};
+
+type ReadOnlyBundleScan = {
+  absoluteRoot: string;
+  canonicalRoot: string;
+  directories: ReadOnlyDirectoryIdentity[];
+  relativePaths: string[];
+};
+
 type BundleMode = "managed" | "external";
 
 type AgentLike = {
@@ -32,6 +73,11 @@ type AgentLike = {
   companyId: string;
   name: string;
   adapterConfig: unknown;
+};
+
+type AgentInstructionsServiceOptions = {
+  /** Deterministic race injection for filesystem boundary tests. */
+  beforeReadOnlyFileOpen?: (absolutePath: string) => Promise<void>;
 };
 
 type AgentInstructionsFileSummary = {
@@ -156,6 +202,21 @@ async function statIfExists(targetPath: string) {
   return fs.stat(targetPath).catch(() => null);
 }
 
+function filesystemErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+async function lstatIfExistsStrict(targetPath: string): Promise<BigIntStats | null> {
+  try {
+    return await fs.lstat(targetPath, { bigint: true });
+  } catch (error) {
+    if (filesystemErrorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+}
+
 function shouldIgnoreInstructionsEntry(entry: { name: string; isDirectory(): boolean; isFile(): boolean }) {
   if (entry.name === "." || entry.name === "..") return true;
   if (entry.isDirectory()) {
@@ -192,6 +253,241 @@ async function listFilesRecursive(rootPath: string): Promise<string[]> {
 
   await walk(rootPath, "");
   return output.sort((left, right) => left.localeCompare(right));
+}
+
+function resolveReadOnlyExportOptions(options: ReadOnlyExportOptions = {}): ResolvedReadOnlyExportOptions {
+  const positiveBound = (value: number | undefined, fallback: number) =>
+    Number.isFinite(value) ? Math.max(1, Math.floor(value!)) : fallback;
+  return {
+    signal: options.signal,
+    maxFiles: positiveBound(options.maxFiles, READ_ONLY_EXPORT_DEFAULT_LIMITS.maxFiles),
+    maxDirectories: positiveBound(options.maxDirectories, READ_ONLY_EXPORT_DEFAULT_LIMITS.maxDirectories),
+    maxDepth: positiveBound(options.maxDepth, READ_ONLY_EXPORT_DEFAULT_LIMITS.maxDepth),
+    maxFileBytes: positiveBound(options.maxFileBytes, READ_ONLY_EXPORT_DEFAULT_LIMITS.maxFileBytes),
+    maxTotalBytes: positiveBound(options.maxTotalBytes, READ_ONLY_EXPORT_DEFAULT_LIMITS.maxTotalBytes),
+  };
+}
+
+function assertReadOnlyExportNotAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw new Error("agent_instructions_read_aborted");
+}
+
+async function listFilesRecursiveBounded(
+  rootPath: string,
+  options: ResolvedReadOnlyExportOptions,
+): Promise<string[]> {
+  return (await scanReadOnlyBundleRoot(rootPath, options)).relativePaths;
+}
+
+function sameFilesystemObject(
+  left: Pick<BigIntStats, "dev" | "ino">,
+  right: Pick<BigIntStats, "dev" | "ino">,
+) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameStableFile(
+  left: Pick<BigIntStats, "dev" | "ino" | "size" | "mtimeNs" | "ctimeNs">,
+  right: Pick<BigIntStats, "dev" | "ino" | "size" | "mtimeNs" | "ctimeNs">,
+) {
+  return sameFilesystemObject(left, right)
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function assertCanonicalPath(rootPath: string, expectedPath: string, actualPath: string) {
+  const relativeToRoot = path.relative(rootPath, actualPath);
+  if (
+    path.isAbsolute(relativeToRoot)
+    || relativeToRoot === ".."
+    || relativeToRoot.startsWith(`..${path.sep}`)
+    || path.resolve(actualPath) !== path.resolve(expectedPath)
+  ) {
+    throw new Error("agent_instructions_path_boundary_changed");
+  }
+}
+
+async function assertReadOnlyDirectoryIdentity(
+  rootCanonicalPath: string,
+  identity: ReadOnlyDirectoryIdentity,
+) {
+  const current = await lstatIfExistsStrict(identity.absolutePath);
+  if (!current || current.isSymbolicLink() || !current.isDirectory()) {
+    throw new Error("agent_instructions_directory_changed");
+  }
+  if (current.dev !== identity.dev || current.ino !== identity.ino) {
+    throw new Error("agent_instructions_directory_changed");
+  }
+  const canonicalPath = await fs.realpath(identity.absolutePath);
+  assertCanonicalPath(rootCanonicalPath, identity.canonicalPath, canonicalPath);
+}
+
+async function scanReadOnlyBundleRoot(
+  rootPath: string,
+  options: ResolvedReadOnlyExportOptions,
+): Promise<ReadOnlyBundleScan> {
+  assertReadOnlyExportNotAborted(options.signal);
+  const absoluteRoot = path.resolve(rootPath);
+  const rootStat = await lstatIfExistsStrict(absoluteRoot);
+  if (!rootStat) throw new Error("agent_instructions_root_missing");
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error("agent_instructions_root_not_directory");
+  }
+  const canonicalRoot = await fs.realpath(absoluteRoot);
+  const output: string[] = [];
+  const directories: ReadOnlyDirectoryIdentity[] = [];
+
+  async function walk(currentPath: string, relativeDir: string, depth: number) {
+    assertReadOnlyExportNotAborted(options.signal);
+    if (depth > options.maxDepth) throw new Error("agent_instructions_max_depth_exceeded");
+    if (directories.length >= options.maxDirectories) {
+      throw new Error("agent_instructions_max_directories_exceeded");
+    }
+    const currentStat = await lstatIfExistsStrict(currentPath);
+    if (!currentStat || currentStat.isSymbolicLink() || !currentStat.isDirectory()) {
+      throw new Error("agent_instructions_directory_changed");
+    }
+    const canonicalPath = await fs.realpath(currentPath);
+    const expectedCanonicalPath = relativeDir
+      ? path.join(canonicalRoot, ...relativeDir.split("/"))
+      : canonicalRoot;
+    assertCanonicalPath(canonicalRoot, expectedCanonicalPath, canonicalPath);
+    const identity: ReadOnlyDirectoryIdentity = {
+      absolutePath: currentPath,
+      canonicalPath,
+      relativePath: relativeDir,
+      dev: currentStat.dev,
+      ino: currentStat.ino,
+    };
+    directories.push(identity);
+
+    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+    assertReadOnlyExportNotAborted(options.signal);
+    await assertReadOnlyDirectoryIdentity(canonicalRoot, identity);
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      assertReadOnlyExportNotAborted(options.signal);
+      if (shouldIgnoreInstructionsEntry(entry)) continue;
+      const absolutePath = path.join(currentPath, entry.name);
+      const relativePath = normalizeRelativeFilePath(
+        relativeDir ? path.posix.join(relativeDir, entry.name) : entry.name,
+      );
+      if (entry.isDirectory()) {
+        await walk(absolutePath, relativePath, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) {
+        throw new Error("agent_instructions_unsupported_filesystem_entry");
+      }
+      output.push(relativePath);
+      if (output.length > options.maxFiles) throw new Error("agent_instructions_max_files_exceeded");
+    }
+    await assertReadOnlyDirectoryIdentity(canonicalRoot, identity);
+  }
+
+  await walk(absoluteRoot, "", 0);
+  for (const identity of directories) {
+    await assertReadOnlyDirectoryIdentity(canonicalRoot, identity);
+  }
+  return {
+    absoluteRoot,
+    canonicalRoot,
+    directories,
+    relativePaths: output.sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+async function readFileHandleBounded(
+  handle: Awaited<ReturnType<typeof fs.open>>,
+  limit: number,
+  limitError: string,
+  signal?: AbortSignal,
+) {
+  const chunks: Buffer[] = [];
+  let position = 0;
+  for (;;) {
+    assertReadOnlyExportNotAborted(signal);
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, limit - position + 1)));
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+    if (bytesRead === 0) break;
+    position += bytesRead;
+    if (position > limit) throw new Error(limitError);
+    chunks.push(chunk.subarray(0, bytesRead));
+  }
+  return Buffer.concat(chunks, position);
+}
+
+async function secureReadBundleFile(
+  scan: ReadOnlyBundleScan,
+  relativePath: string,
+  options: ResolvedReadOnlyExportOptions,
+  remainingTotalBytes: number,
+  beforeOpen?: (absolutePath: string) => Promise<void>,
+) {
+  assertReadOnlyExportNotAborted(options.signal);
+  const parentDirectory = path.posix.dirname(relativePath) === "." ? "" : path.posix.dirname(relativePath);
+  const ancestorDirectories = scan.directories.filter((identity) =>
+    identity.relativePath === ""
+    || parentDirectory === identity.relativePath
+    || parentDirectory.startsWith(`${identity.relativePath}/`));
+  for (const identity of ancestorDirectories) {
+    await assertReadOnlyDirectoryIdentity(scan.canonicalRoot, identity);
+  }
+  const absolutePath = resolvePathWithinRoot(scan.absoluteRoot, relativePath);
+  const expectedCanonicalPath = path.join(scan.canonicalRoot, ...relativePath.split("/"));
+  const pathBefore = await lstatIfExistsStrict(absolutePath);
+  if (!pathBefore || pathBefore.isSymbolicLink() || !pathBefore.isFile()) {
+    throw new Error("agent_instructions_file_changed");
+  }
+  const canonicalBefore = await fs.realpath(absolutePath);
+  assertCanonicalPath(scan.canonicalRoot, expectedCanonicalPath, canonicalBefore);
+  if (pathBefore.size > BigInt(options.maxFileBytes)) {
+    throw new Error("agent_instructions_max_file_bytes_exceeded");
+  }
+  if (pathBefore.size > BigInt(remainingTotalBytes)) {
+    throw new Error("agent_instructions_max_total_bytes_exceeded");
+  }
+
+  await beforeOpen?.(absolutePath);
+  assertReadOnlyExportNotAborted(options.signal);
+  const openFlags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+  const handle = await fs.open(absolutePath, openFlags);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || !sameStableFile(pathBefore, opened)) {
+      throw new Error("agent_instructions_file_changed");
+    }
+    const canonicalOpened = await fs.realpath(absolutePath);
+    assertCanonicalPath(scan.canonicalRoot, expectedCanonicalPath, canonicalOpened);
+    const pathOpened = await lstatIfExistsStrict(absolutePath);
+    if (!pathOpened || pathOpened.isSymbolicLink() || !sameStableFile(opened, pathOpened)) {
+      throw new Error("agent_instructions_file_changed");
+    }
+
+    const byteLimit = Math.min(options.maxFileBytes, remainingTotalBytes);
+    const limitError = remainingTotalBytes < options.maxFileBytes
+      ? "agent_instructions_max_total_bytes_exceeded"
+      : "agent_instructions_max_file_bytes_exceeded";
+    const body = await readFileHandleBounded(handle, byteLimit, limitError, options.signal);
+    const openedAfterRead = await handle.stat({ bigint: true });
+    const pathAfterRead = await lstatIfExistsStrict(absolutePath);
+    if (
+      !sameStableFile(opened, openedAfterRead)
+      || !pathAfterRead
+      || pathAfterRead.isSymbolicLink()
+      || !sameStableFile(openedAfterRead, pathAfterRead)
+    ) {
+      throw new Error("agent_instructions_file_changed");
+    }
+    const canonicalAfterRead = await fs.realpath(absolutePath);
+    assertCanonicalPath(scan.canonicalRoot, expectedCanonicalPath, canonicalAfterRead);
+    for (const identity of ancestorDirectories) {
+      await assertReadOnlyDirectoryIdentity(scan.canonicalRoot, identity);
+    }
+    return { content: body.toString("utf8"), bytes: body.byteLength };
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readFileSummary(rootPath: string, relativePath: string, entryFile: string): Promise<AgentInstructionsFileSummary> {
@@ -273,10 +569,20 @@ function deriveBundleState(agent: AgentLike): BundleState {
   };
 }
 
-async function recoverManagedBundleState(agent: AgentLike, state: BundleState): Promise<BundleState> {
+async function recoverManagedBundleState(
+  agent: AgentLike,
+  state: BundleState,
+  listBundleFiles: (rootPath: string) => Promise<string[]> = listFilesRecursive,
+  strictReadOnlyFilesystem = false,
+): Promise<BundleState> {
   const managedRootPath = resolveManagedInstructionsRoot(agent);
-  const stat = await statIfExists(managedRootPath);
-  const files = stat?.isDirectory() ? await listFilesRecursive(managedRootPath) : [];
+  const stat = strictReadOnlyFilesystem
+    ? await lstatIfExistsStrict(managedRootPath)
+    : await statIfExists(managedRootPath);
+  if (strictReadOnlyFilesystem && stat?.isSymbolicLink()) {
+    throw new Error("agent_instructions_root_not_directory");
+  }
+  const files = stat?.isDirectory() ? await listBundleFiles(managedRootPath) : [];
   const configuredManagedRootMismatch = state.mode === "managed"
     && state.rootPath !== null
     && path.resolve(state.rootPath) !== managedRootPath;
@@ -496,7 +802,7 @@ export function syncInstructionsBundleConfigFromFilePath(
   return applyBundleConfig(next, { mode, rootPath, entryFile });
 }
 
-export function agentInstructionsService() {
+export function agentInstructionsService(serviceOptions: AgentInstructionsServiceOptions = {}) {
   async function getBundle(agent: AgentLike): Promise<AgentInstructionsBundle> {
     const state = await recoverManagedBundleState(agent, deriveBundleState(agent));
     if (!state.rootPath) return toBundle(agent, state, []);
@@ -507,7 +813,9 @@ export function agentInstructionsService() {
         warnings: [...state.warnings, `Instructions root does not exist: ${state.rootPath}`],
       }, []);
     }
-    if (state.mode === "managed") await hardenManagedBundlePermissions(agent, state.rootPath);
+    if (state.mode === "managed" && !isHistoricalAgentTombstoneId(agent.id)) {
+      await hardenManagedBundlePermissions(agent, state.rootPath);
+    }
     const files = await listFilesRecursive(state.rootPath);
     const summaries = await Promise.all(files.map((relativePath) => readFileSummary(state.rootPath!, relativePath, state.entryFile)));
     return toBundle(agent, state, summaries);
@@ -555,6 +863,7 @@ export function agentInstructionsService() {
     agent: AgentLike,
     options?: { clearLegacyPromptTemplate?: boolean },
   ): Promise<{ adapterConfig: Record<string, unknown>; state: BundleState }> {
+    assertHistoricalAgentTombstoneMutable(agent.id);
     const derived = deriveBundleState(agent);
     const current = await recoverManagedBundleState(agent, derived);
     if (current.rootPath && current.mode) {
@@ -613,6 +922,7 @@ export function agentInstructionsService() {
       clearLegacyPromptTemplate?: boolean;
     },
   ): Promise<{ bundle: AgentInstructionsBundle; adapterConfig: Record<string, unknown> }> {
+    assertHistoricalAgentTombstoneMutable(agent.id);
     const state = await recoverManagedBundleState(agent, deriveBundleState(agent));
     const nextMode = input.mode ?? state.mode ?? "managed";
     const nextEntryFile = input.entryFile ? normalizeRelativeFilePath(input.entryFile) : state.entryFile;
@@ -668,6 +978,7 @@ export function agentInstructionsService() {
     file: AgentInstructionsFileDetail;
     adapterConfig: Record<string, unknown>;
   }> {
+    assertHistoricalAgentTombstoneMutable(agent.id);
     const current = deriveBundleState(agent);
     if (relativePath === LEGACY_PROMPT_TEMPLATE_PATH) {
       const adapterConfig: Record<string, unknown> = {
@@ -704,6 +1015,7 @@ export function agentInstructionsService() {
     bundle: AgentInstructionsBundle;
     adapterConfig: Record<string, unknown>;
   }> {
+    assertHistoricalAgentTombstoneMutable(agent.id);
     if (relativePath === LEGACY_PROMPT_TEMPLATE_PATH) {
       throw unprocessable("Cannot delete the legacy promptTemplate pseudo-file");
     }
@@ -721,34 +1033,118 @@ export function agentInstructionsService() {
     return { bundle, adapterConfig };
   }
 
-  async function exportFiles(agent: AgentLike): Promise<{
+  async function exportFilesInternal(
+    agent: AgentLike,
+    hardenPermissions: boolean,
+    readOnlyOptions?: ResolvedReadOnlyExportOptions,
+  ): Promise<{
     files: Record<string, string>;
     entryFile: string;
     warnings: string[];
   }> {
-    const state = await recoverManagedBundleState(agent, deriveBundleState(agent));
+    const listBundleFiles = readOnlyOptions
+      ? (rootPath: string) => listFilesRecursiveBounded(rootPath, readOnlyOptions)
+      : listFilesRecursive;
+    const derivedState = deriveBundleState(agent);
+    const state = readOnlyOptions && derivedState.mode === "external"
+      ? derivedState
+      : await recoverManagedBundleState(
+        agent,
+        derivedState,
+        listBundleFiles,
+        Boolean(readOnlyOptions),
+      );
     if (state.rootPath) {
+      assertReadOnlyExportNotAborted(readOnlyOptions?.signal);
+      if (readOnlyOptions) {
+        const scan = await scanReadOnlyBundleRoot(state.rootPath, readOnlyOptions);
+        if (scan.relativePaths.length === 0) {
+          throw new Error("agent_instructions_root_empty");
+        }
+        const files: Record<string, string> = {};
+        let totalBytes = 0;
+        for (const relativePath of scan.relativePaths) {
+          const read = await secureReadBundleFile(
+            scan,
+            relativePath,
+            readOnlyOptions,
+            readOnlyOptions.maxTotalBytes - totalBytes,
+            serviceOptions.beforeReadOnlyFileOpen,
+          );
+          totalBytes += read.bytes;
+          files[relativePath] = read.content;
+        }
+        for (const identity of scan.directories) {
+          await assertReadOnlyDirectoryIdentity(scan.canonicalRoot, identity);
+        }
+        return { files, entryFile: state.entryFile, warnings: state.warnings };
+      }
       const stat = await statIfExists(state.rootPath);
       if (stat?.isDirectory()) {
-        if (state.mode === "managed") await hardenManagedBundlePermissions(agent, state.rootPath);
-        const relativePaths = await listFilesRecursive(state.rootPath);
-        const files = Object.fromEntries(await Promise.all(relativePaths.map(async (relativePath) => {
+        if (hardenPermissions && state.mode === "managed") {
+          await hardenManagedBundlePermissions(agent, state.rootPath);
+        }
+        const relativePaths = await listBundleFiles(state.rootPath);
+        const files: Record<string, string> = {};
+        for (const relativePath of relativePaths) {
           const absolutePath = resolvePathWithinRoot(state.rootPath!, relativePath);
-          const content = await fs.readFile(absolutePath, "utf8");
-          return [relativePath, content] as const;
-        })));
+          files[relativePath] = await fs.readFile(absolutePath, {
+            encoding: "utf8",
+          });
+        }
         if (Object.keys(files).length > 0) {
           return { files, entryFile: state.entryFile, warnings: state.warnings };
         }
       }
     }
 
-    const legacyBody = await readLegacyInstructions(agent, state.config);
+    let legacyBody: string;
+    if (readOnlyOptions) {
+      assertReadOnlyExportNotAborted(readOnlyOptions.signal);
+      const instructionsFilePath = asString(state.config[FILE_KEY]);
+      if (instructionsFilePath) {
+        // A declared file path is authoritative.  Resolution/read failures do
+        // not silently downgrade maintenance evidence to promptTemplate.
+        const resolvedPath = resolveLegacyInstructionsPath(instructionsFilePath, state.config);
+        const legacyRoot = path.dirname(resolvedPath);
+        const scan = await scanReadOnlyBundleRoot(legacyRoot, {
+          ...readOnlyOptions,
+          maxFiles: Math.max(readOnlyOptions.maxFiles, 1),
+        });
+        const relativePath = normalizeRelativeFilePath(path.basename(resolvedPath));
+        if (!scan.relativePaths.includes(relativePath)) {
+          throw new Error("agent_instructions_legacy_file_missing");
+        }
+        legacyBody = (await secureReadBundleFile(
+          scan,
+          relativePath,
+          readOnlyOptions,
+          readOnlyOptions.maxTotalBytes,
+          serviceOptions.beforeReadOnlyFileOpen,
+        )).content;
+      } else {
+        legacyBody = asString(state.config[PROMPT_KEY]) ?? "";
+      }
+      if (Buffer.byteLength(legacyBody, "utf8") > readOnlyOptions.maxTotalBytes) {
+        throw new Error("agent_instructions_max_total_bytes_exceeded");
+      }
+    } else {
+      legacyBody = await readLegacyInstructions(agent, state.config);
+    }
     return {
       files: { [state.entryFile]: legacyBody || "_No AGENTS instructions were resolved from current agent config._" },
       entryFile: state.entryFile,
       warnings: state.warnings,
     };
+  }
+
+  async function exportFiles(agent: AgentLike) {
+    if (isHistoricalAgentTombstoneId(agent.id)) return exportFilesReadOnly(agent);
+    return exportFilesInternal(agent, true);
+  }
+
+  async function exportFilesReadOnly(agent: AgentLike, options: ReadOnlyExportOptions = {}) {
+    return exportFilesInternal(agent, false, resolveReadOnlyExportOptions(options));
   }
 
   async function materializeManagedBundle(
@@ -760,6 +1156,7 @@ export function agentInstructionsService() {
       entryFile?: string;
     },
   ): Promise<{ bundle: AgentInstructionsBundle; adapterConfig: Record<string, unknown> }> {
+    assertHistoricalAgentTombstoneMutable(agent.id);
     const rootPath = resolveManagedInstructionsRoot(agent);
     const entryFile = options?.entryFile ? normalizeRelativeFilePath(options.entryFile) : ENTRY_FILE_DEFAULT;
 
@@ -802,6 +1199,7 @@ export function agentInstructionsService() {
     writeFile,
     deleteFile,
     exportFiles,
+    exportFilesReadOnly,
     ensureManagedBundle: ensureWritableBundle,
     materializeManagedBundle,
   };

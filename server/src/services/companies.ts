@@ -29,10 +29,15 @@ import {
   companySkills,
   documents,
 } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { isAgentRetirementSource } from "@paperclipai/shared";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
+import {
+  assertHistoricalAgentTombstoneMutable,
+  isHistoricalAgentTombstoneId,
+} from "./agent-retirement-historical-tombstones.js";
 
 export interface CompanyActivityActor {
   actorType: "user" | "agent" | "system" | "plugin";
@@ -424,6 +429,24 @@ export function companyService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        const companyAgentIds = (await tx
+          .select({ id: agents.id })
+          .from(agents)
+          .where(eq(agents.companyId, id)))
+          .map((row) => row.id);
+        const historicalTombstoneId = companyAgentIds
+          .filter(isHistoricalAgentTombstoneId)
+          .sort((left, right) => left.localeCompare(right))[0];
+        assertHistoricalAgentTombstoneMutable(historicalTombstoneId);
+        const protectedSourceIds = companyAgentIds
+          .filter((agentId) => isAgentRetirementSource(agentId))
+          .sort((left, right) => left.localeCompare(right));
+        if (protectedSourceIds.length > 0) {
+          throw conflict("Companies containing protected retirement sources cannot be physically deleted", {
+            code: "retirement_company_delete_forbidden",
+            protectedSourceIds,
+          });
+        }
         // Delete from child tables in dependency order
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })

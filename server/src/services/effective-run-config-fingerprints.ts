@@ -56,6 +56,20 @@ export interface EffectiveRunConfigFingerprints {
   leaseFingerprint: EffectiveRunConfigFingerprint;
 }
 
+export function createAgentConfigurationFingerprint(input: {
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+  runtimeConfig: Record<string, unknown>;
+}) {
+  return createEffectiveRunConfigFingerprints({
+    session: {
+      adapterType: input.adapterType,
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+    },
+  }).sessionFingerprint.fingerprint;
+}
+
 export interface EffectiveRunConfigFingerprintDiff {
   version: typeof EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION;
   hasChanges: boolean;

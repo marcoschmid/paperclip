@@ -15,6 +15,7 @@ export function parseCodexJsonl(stdout: string) {
   let sessionId: string | null = null;
   let finalMessage: string | null = null;
   let errorMessage: string | null = null;
+  const activityItemTypes = new Set<string>();
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -40,9 +41,13 @@ export function parseCodexJsonl(stdout: string) {
       continue;
     }
 
-    if (type === "item.completed") {
+    if (type === "item.started" || type === "item.updated" || type === "item.completed") {
       const item = parseObject(event.item);
-      if (asString(item.type, "") === "agent_message") {
+      const itemType = asString(item.type, "").trim();
+      if (itemType !== "agent_message" && itemType !== "reasoning") {
+        activityItemTypes.add(itemType || "unknown");
+      }
+      if (type === "item.completed" && itemType === "agent_message") {
         const text = asString(item.text, "");
         if (text) finalMessage = text;
       }
@@ -67,6 +72,7 @@ export function parseCodexJsonl(stdout: string) {
   return {
     sessionId,
     summary: finalMessage?.trim() ?? "",
+    activityItemTypes: Array.from(activityItemTypes),
     usage,
     errorMessage,
   };

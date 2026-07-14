@@ -36,6 +36,15 @@ function makeValues(overrides: Partial<CreateConfigValues> = {}): CreateConfigVa
 }
 
 describe("buildCodexLocalConfig", () => {
+  it("persists fail-closed when bypass approvals and sandbox is omitted", () => {
+    const values = makeValues();
+    delete (values as Partial<CreateConfigValues>).dangerouslyBypassSandbox;
+
+    const config = buildCodexLocalConfig(values);
+
+    expect(config.dangerouslyBypassApprovalsAndSandbox).toBe(false);
+  });
+
   it("persists the fastMode toggle into adapter config", () => {
     const config = buildCodexLocalConfig(
       makeValues({
@@ -48,8 +57,14 @@ describe("buildCodexLocalConfig", () => {
       model: "gpt-5.4",
       search: true,
       fastMode: true,
-      dangerouslyBypassApprovalsAndSandbox: true,
+      dangerouslyBypassApprovalsAndSandbox: false,
     });
+  });
+
+  it("cannot enable the blocked global bypass through create values", () => {
+    const config = buildCodexLocalConfig(makeValues({ dangerouslyBypassSandbox: true }));
+
+    expect(config.dangerouslyBypassApprovalsAndSandbox).toBe(false);
   });
 
   it("omits model when the operator leaves it blank", () => {

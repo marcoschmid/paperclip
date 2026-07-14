@@ -8,7 +8,7 @@ export const defaultCreateValues: CreateConfigValues = {
   model: "",
   thinkingEffort: "",
   chrome: false,
-  dangerouslySkipPermissions: true,
+  dangerouslySkipPermissions: false,
   search: false,
   fastMode: false,
   dangerouslyBypassSandbox: false,

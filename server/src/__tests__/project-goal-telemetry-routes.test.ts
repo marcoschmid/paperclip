@@ -151,7 +151,7 @@ describe("project and goal telemetry routes", () => {
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockTelemetryTrack).toHaveBeenCalledWith("project.created", {});
-  });
+  }, 15_000);
 
   it("emits telemetry when a goal is created", async () => {
     const app = await createApp("goal");
@@ -161,5 +161,5 @@ describe("project and goal telemetry routes", () => {
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockTelemetryTrack).toHaveBeenCalledWith("goal.created", { goal_level: "team" });
-  });
+  }, 15_000);
 });

@@ -8,6 +8,7 @@ const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
+const CANONICAL_NUMERIC_SCHEMA_VERSION_RE = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const PAPERCLIP_TOKEN_TEXT_RE = /pcp_[A-Za-z0-9_-]+/gi;
 const PRIVATE_KEY_BLOCK_RE = /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/g;
 const URI_USERINFO_PASSWORD_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s/:@]+):([^\s/@]+)@/gi;
@@ -96,6 +97,12 @@ function isNumericTokenTelemetry(key: string, value: unknown) {
   const normalized = normalizedCredentialKey(key);
   return /^(?:raw)?(?:input|output|cachedinput|totalinput|totaloutput|totalcachedinput)tokens$/.test(normalized)
     || normalized === "tokencount";
+}
+
+function isHarmlessSchemaVersion(key: string, value: unknown): value is string {
+  return key === "schemaVersion"
+    && typeof value === "string"
+    && CANONICAL_NUMERIC_SCHEMA_VERSION_RE.test(value);
 }
 
 function isSensitivePayloadKey(key: string, value: unknown) {
@@ -243,6 +250,13 @@ function sanitizeRecordInternal(
     }
     if (COMMAND_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
       redacted[key] = redactSensitiveText(value);
+      continue;
+    }
+    // Numeric schema identifiers such as `1.0.0` collide with the broad JWT
+    // shape below. Preserve only this exact, non-credential field and the
+    // canonical numeric form; aliases and token-shaped values stay redacted.
+    if (isHarmlessSchemaVersion(key, value)) {
+      redacted[key] = value;
       continue;
     }
     if (isSensitivePayloadKey(key, value)) {

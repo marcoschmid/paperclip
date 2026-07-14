@@ -28,6 +28,7 @@ import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
   const now = new Date("2026-05-09T19:30:00.000Z");
@@ -217,6 +218,34 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   }
 
+  async function seedLegacyTombstoneAction(companyId: string, sourceIssueId: string) {
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "Historical recovery owner",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).onConflictDoNothing();
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: HISTORICAL_TOMBSTONE_ID,
+      cause: "stranded_assigned_issue",
+      fingerprint: `legacy-tombstone:${sourceIssueId}`,
+      evidence: { legacy: true },
+      nextAction: "Legacy action must remain inert until board repair.",
+      attemptCount: 1,
+    }).returning();
+    return action!;
+  }
+
   function createApp(actor: any = { type: "board", source: "local_implicit" }) {
     const app = express();
     app.use(express.json());
@@ -263,6 +292,142 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(second.evidence).toMatchObject({ latestRunId: "run-2" });
     expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: first.id });
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
+  });
+
+  it("rejects tombstone recovery owners on create and legacy update without changing rows", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "Historical recovery owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const otherIssueId = await db.insert(issues).values({
+      companyId,
+      title: "Other recovery source",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `RA-${randomUUID().slice(0, 8)}`,
+    }).returning({ id: issues.id }).then((rows) => rows[0]!.id);
+    const svc = issueRecoveryActionService(db);
+
+    await expect(svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: otherIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: HISTORICAL_TOMBSTONE_ID.toUpperCase(),
+      cause: "stranded_assigned_issue",
+      fingerprint: "new-tombstone-owner",
+      nextAction: "Do not create",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+    await expect(db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, otherIssueId)))
+      .resolves.toHaveLength(0);
+
+    const legacy = await seedLegacyTombstoneAction(companyId, sourceIssueId);
+    await expect(svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "attempted-repair-through-runtime",
+      nextAction: "Must fail closed",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, legacy.id)))[0])
+      .toEqual(legacy);
+  });
+
+  it("allows terminal cleanup of a legacy tombstone-owned action and changes only that action", async () => {
+    const { companyId, sourceIssue } = await seedCompany();
+    const legacy = await seedLegacyTombstoneAction(companyId, sourceIssue.id);
+    const svc = issueRecoveryActionService(db);
+    const sourceBefore = (await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0];
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId: sourceIssue.id,
+      actionId: legacy.id,
+      status: "resolved",
+      outcome: "restored",
+    });
+    expect(resolved).toMatchObject({
+      id: legacy.id,
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: HISTORICAL_TOMBSTONE_ID,
+    });
+    const after = (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, legacy.id)))[0]!;
+    const {
+      status: _beforeStatus,
+      outcome: _beforeOutcome,
+      resolutionNote: _beforeNote,
+      resolvedAt: _beforeResolvedAt,
+      updatedAt: _beforeUpdatedAt,
+      ...beforeStable
+    } = legacy;
+    const {
+      status: _afterStatus,
+      outcome: _afterOutcome,
+      resolutionNote: _afterNote,
+      resolvedAt: _afterResolvedAt,
+      updatedAt: _afterUpdatedAt,
+      ...afterStable
+    } = after;
+    expect(afterStable).toEqual(beforeStable);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0]).toEqual(sourceBefore);
+    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id)))
+      .resolves.toHaveLength(0);
+    await expect(db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssue.id)))
+      .resolves.toHaveLength(0);
+  });
+
+  it("does not mutate or wake through the reconciler for a legacy tombstone-owned action", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const legacy = await seedLegacyTombstoneAction(companyId, sourceIssue.id);
+    const sourceBefore = (await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0];
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    await expect(recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      },
+      comment: "Must not mutate a tombstone-owned action.",
+    })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+    });
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, legacy.id)))[0])
+      .toEqual(legacy);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0]).toEqual(sourceBefore);
+    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id)))
+      .resolves.toHaveLength(0);
+    await expect(db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssue.id)))
+      .resolves.toHaveLength(0);
   });
 
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {

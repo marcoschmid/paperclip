@@ -13,6 +13,8 @@ import {
   companySkillListQuerySchema,
   companySkillProjectScanRequestSchema,
   companySkillResetSchema,
+  companySkillResyncPreflightSchema,
+  companySkillResyncRequestSchema,
   companySkillUpdateSchema,
   companySkillVersionCreateSchema,
 } from "@paperclipai/shared";
@@ -178,6 +180,64 @@ export function companySkillRoutes(db: Db) {
     }
     res.json(result);
   });
+
+  router.get("/companies/:companyId/skills/:skillId/resync-preflight", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const skillId = req.params.skillId as string;
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type !== "board") {
+      throw forbidden("Company-skill resync is restricted to board operators");
+    }
+    res.json(companySkillResyncPreflightSchema.parse(await svc.resyncPreflight(companyId, skillId)));
+  });
+
+  router.post(
+    "/companies/:companyId/skills/:skillId/resync",
+    validate(companySkillResyncRequestSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const skillId = req.params.skillId as string;
+      if (req.actor.type !== "board") {
+        throw forbidden("Company-skill resync is restricted to board operators");
+      }
+      await assertCanMutateCompanySkills(req, companyId);
+      const result = await svc.resyncFromSource(companyId, skillId, req.body, skillActor(req));
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "company.skill_source_resynced",
+        entityType: "company_skill",
+        entityId: skillId,
+        details: {
+          approvalIssue: req.body.approvalIssue,
+          maintenanceOperationId: req.body.maintenanceOperationId,
+          maintenanceAgentIds: req.body.maintenanceAgentIds,
+          maintenanceReceiptId: req.body.maintenanceReceiptId,
+          maintenanceExpectedSnapshotFingerprint: req.body.maintenanceExpectedSnapshotFingerprint,
+          previousVersionId: result.previousVersionId,
+          currentVersionId: result.currentVersionId,
+          auditReceiptId: result.auditReceiptId,
+          previousBaseMarkdownSha256: result.previousBaseMarkdownSha256,
+          baseMarkdownSha256: result.baseMarkdownSha256,
+          previousBaseFileInventorySha256: result.previousBaseFileInventorySha256,
+          baseFileInventorySha256: result.baseFileInventorySha256,
+          previousTrustLevel: result.previousTrustLevel,
+          trustLevel: result.trustLevel,
+          baseMarkdownChanged: result.baseMarkdownChanged,
+          baseFileInventoryChanged: result.baseFileInventoryChanged,
+          trustLevelChanged: result.trustLevelChanged,
+          versionCreated: result.versionCreated,
+          idempotentReplay: result.idempotentReplay,
+          sourceInventorySha256: result.sourceInventorySha256,
+        },
+      });
+      res.json(result);
+    },
+  );
 
   router.get("/companies/:companyId/skills/:skillId/versions", async (req, res) => {
     const companyId = req.params.companyId as string;

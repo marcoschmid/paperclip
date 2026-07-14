@@ -10,7 +10,10 @@ import {
   buildRuntimeMountedSkillSnapshot,
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  extractPaperclipLifecycleCanaryResultFromFinalSummary,
   materializePaperclipSkillCopy,
+  PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+  parsePaperclipLifecycleCanaryResult,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   runningProcesses,
@@ -403,6 +406,7 @@ describe("runChildProcess", () => {
     expect(result.exitCode).toBe(0);
     expect(result.timedOut).toBe(false);
     expect(result.stdout).toBe("done");
+    expect(result.terminalResultCleanupTriggered).toBe(false);
   });
 
   it("waits for onSpawn before sending stdin to the child", async () => {
@@ -500,6 +504,7 @@ describe("runChildProcess", () => {
     const descendantPid = Number.parseInt(result.stdout.match(/descendant:(\d+)/)?.[1] ?? "", 10);
     expect(result.timedOut).toBe(false);
     expect(result.exitCode).toBe(0);
+    expect(result.terminalResultCleanupTriggered).toBe(true);
     expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
     expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
   });
@@ -530,6 +535,7 @@ describe("runChildProcess", () => {
 
     expect(result.timedOut).toBe(false);
     expect(result.signal).toBe("SIGTERM");
+    expect(result.terminalResultCleanupTriggered).toBe(true);
     expect(result.stdout).toContain('"type":"result"');
   });
 
@@ -641,6 +647,122 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain("evidence, not valid liveness paths by themselves");
     expect(prompt).toContain("Use child issues for long or parallel delegated work instead of polling");
     expect(prompt).toContain("named unblock owner/action");
+  });
+
+  it("renders the exact server-mediated completion contract for lifecycle canaries", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "lifecycle_pending_canary",
+      checkedOutByHarness: true,
+      issue: {
+        id: "issue-canary-1",
+        identifier: "TEC-375",
+        title: "Monitoring lifecycle canary",
+        status: "todo",
+      },
+      commentWindow: {
+        requestedCount: 0,
+        includedCount: 0,
+        missingCount: 0,
+      },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("## Lifecycle Canary Completion Contract");
+    expect(prompt).toContain("Do not call the Paperclip API");
+    expect(prompt).toContain("Your entire final answer must consist of exactly the two-line envelope");
+    expect(prompt).toContain("Do not include a work note, findings, explanation, or any other prose");
+    expect(prompt).toContain("The final two lines below must be the last two lines of your answer");
+    expect(prompt).toContain("PAPERCLIP_LIFECYCLE_CANARY_RESULT_V1");
+    expect(prompt).toContain('{"outcome":"passed","evidence":"single-line factual evidence"}');
+    expect(prompt).toContain("Any other final-answer shape fails closed");
+    expect(prompt.endsWith([
+      "## Lifecycle Canary Final Output Override",
+      "",
+      "Your entire final answer must consist of exactly the two-line envelope below.",
+      "Do not include a work note, findings, explanation, or any other prose; put the bounded factual result only in the evidence string.",
+      "The final two lines below must be the last two lines of your answer, with no text or blank line after them:",
+      PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+      '{"outcome":"passed","evidence":"single-line factual evidence"}',
+    ].join("\n"))).toBe(true);
+    expect(prompt.match(new RegExp(PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER, "g"))).toHaveLength(1);
+  });
+
+  it("does not add the lifecycle completion contract to ordinary wakes", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_assigned",
+      issue: { id: "issue-ordinary", identifier: "TEC-1", title: "Ordinary task", status: "todo" },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).not.toContain(PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER);
+    expect(prompt).not.toContain("Lifecycle Canary Completion Contract");
+  });
+
+  it("parses only the exact bounded two-line lifecycle result envelope", () => {
+    const valid = [
+      PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+      JSON.stringify({ outcome: "passed", evidence: "Validated the bounded local fixture." }),
+    ].join("\n");
+    expect(parsePaperclipLifecycleCanaryResult(valid)).toEqual({
+      outcome: "passed",
+      evidence: "Validated the bounded local fixture.",
+    });
+
+    const invalid = [
+      `Done\n${valid}`,
+      `\`\`\`json\n${valid}\n\`\`\``,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "Valid evidence.", extra: true })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "failed", evidence: "Valid evidence." })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "short" })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "Line one\nline two" })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "Line one\u2028line two" })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "Hidden\u202eright-to-left" })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "Hidden\u061carabic-letter-mark" })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "Hidden\u200eleft-to-right-mark" })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: `Repeated ${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER} marker` })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n{"outcome":"failed","outcome":"passed","evidence":"Valid evidence."}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n{ "outcome": "passed", "evidence": "Valid evidence." }`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\n${JSON.stringify({ outcome: "passed", evidence: "x".repeat(321) })}`,
+      `${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}\nnot-json`,
+      null,
+    ];
+    for (const value of invalid) {
+      expect(parsePaperclipLifecycleCanaryResult(value)).toBeNull();
+    }
+  });
+
+  it("extracts one exact final lifecycle envelope after a bounded factual work note", () => {
+    const envelope = [
+      PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+      JSON.stringify({ outcome: "passed", evidence: "Validated the bounded local fixture." }),
+    ].join("\n");
+    expect(extractPaperclipLifecycleCanaryResultFromFinalSummary(envelope)).toEqual({
+      outcome: "passed",
+      evidence: "Validated the bounded local fixture.",
+    });
+    expect(extractPaperclipLifecycleCanaryResultFromFinalSummary(
+      `Read-only classification task, no code needed.\n\n${envelope}`,
+    )).toEqual({
+      outcome: "passed",
+      evidence: "Validated the bounded local fixture.",
+    });
+
+    const invalid = [
+      `No blank separator.\n${envelope}`,
+      `Duplicate ${PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER}.\n\n${envelope}`,
+      `${envelope}\nTrailing text`,
+      `Unsafe\u202eprefix.\n\n${envelope}`,
+      `Unsafe\u061cprefix.\n\n${envelope}`,
+      `Unsafe\u200fprefix.\n\n${envelope}`,
+      `${"x".repeat(1025)}\n\n${envelope}`,
+      `\`\`\`text\n${envelope}\n\`\`\``,
+    ];
+    for (const value of invalid) {
+      expect(extractPaperclipLifecycleCanaryResultFromFinalSummary(value)).toBeNull();
+    }
   });
 
   it("renders resolved checkbox selections in scoped wake prompts", () => {

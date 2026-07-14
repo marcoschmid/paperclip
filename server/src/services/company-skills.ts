@@ -1,10 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companies, companySkillComments, companySkillStars, companySkillVersions, companySkills } from "@paperclipai/db";
+import {
+  activityLog,
+  agentPortfolioMaintenanceGates,
+  agents as agentRows,
+  companies,
+  companySkillComments,
+  companySkillStars,
+  companySkillVersions,
+  companySkills,
+} from "@paperclipai/db";
 import { readPaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import type { PaperclipDesiredSkillEntry, PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
 import type {
@@ -33,6 +42,8 @@ import type {
   CompanySkillProjectScanRequest,
   CompanySkillProjectScanResult,
   CompanySkillProjectScanSkipped,
+  CompanySkillResyncPreflight,
+  CompanySkillResyncRequest,
   CompanySkillSharingScope,
   CompanySkillSourceBadge,
   CompanySkillSourceType,
@@ -45,7 +56,11 @@ import type {
   CompanySkillVersionCreateRequest,
   CompanySkillVersionFileInventoryEntry,
 } from "@paperclipai/shared";
-import { normalizeAgentUrlKey, parseFrontmatterMarkdown } from "@paperclipai/shared";
+import {
+  AGENT_RETIREMENT_HISTORICAL_TOMBSTONE_IDS,
+  normalizeAgentUrlKey,
+  parseFrontmatterMarkdown,
+} from "@paperclipai/shared";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
@@ -63,8 +78,14 @@ import {
   readCatalogStringList,
   readPortableCatalogProvenance,
 } from "./catalog-provenance.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 type CompanySkillRow = typeof companySkills.$inferSelect;
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type CompanySkillMutationDb = Pick<Db | DbTransaction, "select" | "update" | "insert" | "delete">;
 type CompanySkillVersionRow = typeof companySkillVersions.$inferSelect;
 type CompanySkillCommentRow = typeof companySkillComments.$inferSelect;
 type CompanySkillListDbRow = Pick<
@@ -370,6 +391,59 @@ const PROJECT_ROOT_SKILL_SUBDIRECTORIES = [
 
 const SKILL_AUDIT_SCAN_VERSION = "skills-audit-v1";
 const MAX_CATALOG_FILE_BYTES = 1024 * 1024;
+const SKILL_RESYNC_SCHEMA_VERSION = "1.0.0";
+const SKILL_RESYNC_APPROVAL_ISSUE = "TEC-355";
+const MAX_RESYNC_FILE_COUNT = 512;
+const MAX_RESYNC_FILE_BYTES = 1024 * 1024;
+const MAX_RESYNC_TOTAL_BYTES = 16 * 1024 * 1024;
+const MAX_RESYNC_DEPTH = 16;
+const MAX_RESYNC_PATH_BYTES = 512;
+const MAX_RESYNC_AFFECTED_AGENTS = 100;
+const RESYNC_TRUST_LEVELS = new Set<CompanySkillTrustLevel>([
+  "markdown_only",
+  "assets",
+  "scripts_executables",
+]);
+const RESYNC_FINGERPRINT_PATTERN = /^v1:sha256:[a-f0-9]{64}$/;
+const RESYNC_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RESYNC_IGNORED_DIRECTORIES = new Set([".git", "node_modules", "__pycache__"]);
+const RESYNC_FILE_KINDS = new Set<CompanySkillFileInventoryEntry["kind"]>([
+  "skill",
+  "markdown",
+  "reference",
+  "script",
+  "asset",
+  "other",
+]);
+const RESYNC_EXECUTABLE_SUFFIXES = [".sh", ".js", ".mjs", ".cjs", ".ts", ".py", ".rb", ".bash"] as const;
+
+type CompanySkillResyncResult = {
+  schemaVersion: "1.0.0";
+  companyId: string;
+  skillId: string;
+  skillKey: string;
+  previousVersionId: string;
+  currentVersionId: string;
+  skillUpdatedAt: string;
+  label: string;
+  sourceSkillMarkdownSha256: string;
+  sourceInventorySha256: string;
+  previousBaseMarkdownSha256: string;
+  baseMarkdownSha256: string;
+  previousBaseFileInventorySha256: string;
+  baseFileInventorySha256: string;
+  previousTrustLevel: CompanySkillTrustLevel;
+  trustLevel: CompanySkillTrustLevel;
+  currentVersionInventorySha256: string;
+  baseMarkdownChanged: boolean;
+  baseFileInventoryChanged: boolean;
+  trustLevelChanged: boolean;
+  versionCreated: boolean;
+  idempotentReplay: boolean;
+  auditReceiptId: string;
+};
+
+type CompanySkillResyncResultWithoutReceipt = Omit<CompanySkillResyncResult, "auditReceiptId">;
 
 function asString(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -533,18 +607,7 @@ function classifyInventoryKind(relativePath: string): CompanySkillFileInventoryE
   if (normalized.startsWith("assets/")) return "asset";
   if (normalized.endsWith(".md")) return "markdown";
   const fileName = path.posix.basename(normalized);
-  if (
-    fileName.endsWith(".sh")
-    || fileName.endsWith(".js")
-    || fileName.endsWith(".mjs")
-    || fileName.endsWith(".cjs")
-    || fileName.endsWith(".ts")
-    || fileName.endsWith(".py")
-    || fileName.endsWith(".rb")
-    || fileName.endsWith(".bash")
-  ) {
-    return "script";
-  }
+  if (RESYNC_EXECUTABLE_SUFFIXES.some((suffix) => fileName.endsWith(suffix))) return "script";
   if (
     fileName.endsWith(".png")
     || fileName.endsWith(".jpg")
@@ -559,8 +622,278 @@ function classifyInventoryKind(relativePath: string): CompanySkillFileInventoryE
   return "other";
 }
 
+function hasResyncExecutableSuffix(relativePath: string) {
+  const fileName = path.posix.basename(normalizePortablePath(relativePath).toLowerCase());
+  return RESYNC_EXECUTABLE_SUFFIXES.some((suffix) => fileName.endsWith(suffix));
+}
+
+function compareCodepoints(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function resyncSha256(value: Buffer | string) {
+  return `v1:sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function isIgnoredResyncEntry(name: string, directory: boolean) {
+  if (directory && RESYNC_IGNORED_DIRECTORIES.has(name)) return true;
+  return name === ".DS_Store" || /\.(?:pyc|pyo)$/i.test(name);
+}
+
+function decodeResyncText(bytes: Buffer, relativePath: string) {
+  if (bytes.some((byte) => byte === 0 || byte < 0x09 || (byte > 0x0d && byte < 0x20))) {
+    throw unprocessable(`Skill resync source contains a binary or control-byte file: ${relativePath}`);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw unprocessable(`Skill resync source is not valid UTF-8 text: ${relativePath}`);
+  }
+}
+
+function normalizeResyncInventory(entries: unknown) {
+  if (!Array.isArray(entries) || entries.length === 0 || entries.length > MAX_RESYNC_FILE_COUNT) {
+    throw unprocessable("Skill resync inventory is empty or exceeds the file-count limit.");
+  }
+  const seen = new Set<string>();
+  let totalBytes = 0;
+  const normalized = entries.map((entry) => {
+    if (!isPlainRecord(entry) || typeof entry.path !== "string" ||
+        typeof entry.kind !== "string" || typeof entry.content !== "string") {
+      throw unprocessable("Skill resync inventory contains a malformed entry.");
+    }
+    const relativePath = normalizePortablePath(entry.path);
+    const sizeBytes = Buffer.byteLength(entry.content, "utf8");
+    const kind = entry.kind as CompanySkillFileInventoryEntry["kind"];
+    if (!relativePath || relativePath !== entry.path || path.isAbsolute(relativePath) ||
+        relativePath.split("/").includes("..") || seen.has(relativePath) ||
+        !RESYNC_FILE_KINDS.has(kind) ||
+        Buffer.byteLength(relativePath, "utf8") > MAX_RESYNC_PATH_BYTES ||
+        sizeBytes > MAX_RESYNC_FILE_BYTES) {
+      throw unprocessable("Skill resync inventory contains an invalid, duplicate, or oversized path.");
+    }
+    seen.add(relativePath);
+    totalBytes += sizeBytes;
+    if (totalBytes > MAX_RESYNC_TOTAL_BYTES) {
+      throw unprocessable("Skill resync inventory exceeds the total-byte limit.");
+    }
+    return {
+      path: relativePath,
+      kind,
+      content: entry.content,
+      sizeBytes,
+      sha256: resyncSha256(Buffer.from(entry.content, "utf8")),
+    };
+  }).sort((left, right) => compareCodepoints(left.path, right.path));
+  if (!normalized.some((entry) => entry.path === "SKILL.md" && entry.kind === "skill")) {
+    throw unprocessable("Skill resync inventory must contain SKILL.md.");
+  }
+  return { entries: normalized, totalBytes };
+}
+
+function resyncInventorySha256(entries: unknown) {
+  const normalized = normalizeResyncInventory(entries);
+  return resyncSha256(JSON.stringify(normalized.entries.map((entry) => ({
+    path: entry.path,
+    kind: entry.kind,
+    sizeBytes: entry.sizeBytes,
+    sha256: entry.sha256,
+  }))));
+}
+
+function resyncFileInventorySha256(entries: CompanySkillFileInventoryEntry[]) {
+  return resyncSha256(JSON.stringify(entries
+    .map((entry) => ({ path: normalizePortablePath(entry.path), kind: entry.kind }))
+    .sort((left, right) => compareCodepoints(left.path, right.path) || compareCodepoints(left.kind, right.kind))));
+}
+
+async function collectLocalSkillTextSnapshot(
+  skillDir: string,
+  mode: LocalSkillInventoryMode = "full",
+) {
+  const root = path.resolve(skillDir);
+  const rootStat = await fs.lstat(root).catch(() => null);
+  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
+    throw unprocessable("Skill resync source must be a regular, non-symlink directory.");
+  }
+  const assertDirectoryIdentity = (
+    expected: Awaited<ReturnType<typeof fs.lstat>>,
+    actual: Awaited<ReturnType<typeof fs.lstat>> | null,
+    relativePath: string,
+  ) => {
+    if (!actual?.isDirectory() || actual.isSymbolicLink() ||
+        actual.dev !== expected.dev || actual.ino !== expected.ino) {
+      throw unprocessable(`Skill resync source directory changed during traversal: ${relativePath || "."}`);
+    }
+  };
+  const files = new Map<string, {
+    path: string;
+    kind: CompanySkillFileInventoryEntry["kind"];
+    content: string;
+  }>();
+  let totalBytes = 0;
+
+  const readBoundFile = async (absolutePath: string, relativePath: string, lstat: Awaited<ReturnType<typeof fs.lstat>>) => {
+    if (Buffer.byteLength(relativePath, "utf8") > MAX_RESYNC_PATH_BYTES) {
+      throw unprocessable("Skill resync source contains an oversized relative path.");
+    }
+    if (lstat.size > MAX_RESYNC_FILE_BYTES) {
+      throw unprocessable(`Skill resync source file exceeds the per-file limit: ${relativePath}`);
+    }
+    const handle = await fs.open(absolutePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.dev !== lstat.dev || opened.ino !== lstat.ino || opened.size !== lstat.size) {
+        throw unprocessable(`Skill resync source changed during secure open: ${relativePath}`);
+      }
+      const bytes = await handle.readFile();
+      const after = await handle.stat();
+      if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+        throw unprocessable(`Skill resync source changed during secure read: ${relativePath}`);
+      }
+      totalBytes += bytes.length;
+      if (totalBytes > MAX_RESYNC_TOTAL_BYTES) {
+        throw unprocessable("Skill resync source exceeds the total-byte limit.");
+      }
+      const content = decodeResyncText(bytes, relativePath);
+      files.set(relativePath, {
+        path: relativePath,
+        kind: classifyInventoryKind(relativePath),
+        content,
+      });
+    } finally {
+      await handle.close();
+    }
+  };
+
+  const visit = async (
+    current: string,
+    depth: number,
+    expectedDirectory: Awaited<ReturnType<typeof fs.lstat>>,
+  ): Promise<void> => {
+    if (depth > MAX_RESYNC_DEPTH) throw unprocessable("Skill resync source exceeds the directory-depth limit.");
+    const before = await fs.lstat(current).catch(() => null);
+    const currentRelativePath = normalizePortablePath(path.relative(root, current));
+    assertDirectoryIdentity(expectedDirectory, before, currentRelativePath);
+    const entries = await fs.readdir(current, { withFileTypes: true });
+    for (const entry of entries.sort((left, right) => compareCodepoints(left.name, right.name))) {
+      if (isIgnoredResyncEntry(entry.name, entry.isDirectory())) continue;
+      const absolutePath = path.join(current, entry.name);
+      const relativePath = normalizePortablePath(path.relative(root, absolutePath));
+      if (!relativePath || path.isAbsolute(relativePath) || relativePath.split("/").includes("..")) {
+        throw unprocessable("Skill resync source escaped its bound root.");
+      }
+      const lstat = await fs.lstat(absolutePath);
+      if (lstat.isSymbolicLink()) {
+        throw unprocessable(`Skill resync source contains a symlink: ${relativePath}`);
+      }
+      if (lstat.isDirectory()) {
+        await visit(absolutePath, depth + 1, lstat);
+        continue;
+      }
+      if (!lstat.isFile()) {
+        throw unprocessable(`Skill resync source contains a non-regular entry: ${relativePath}`);
+      }
+      if (files.size >= MAX_RESYNC_FILE_COUNT) {
+        throw unprocessable("Skill resync source exceeds the file-count limit.");
+      }
+      await readBoundFile(absolutePath, relativePath, lstat);
+    }
+    const after = await fs.lstat(current).catch(() => null);
+    assertDirectoryIdentity(before!, after, currentRelativePath);
+  };
+
+  if (mode === "full") {
+    await visit(root, 0, rootStat);
+  } else {
+    const skillPath = path.join(root, "SKILL.md");
+    const skillStat = await fs.lstat(skillPath).catch(() => null);
+    if (!skillStat?.isFile() || skillStat.isSymbolicLink()) {
+      throw unprocessable("Skill resync source must contain a regular non-symlink SKILL.md.");
+    }
+    await readBoundFile(skillPath, "SKILL.md", skillStat);
+    for (const subdirectory of PROJECT_ROOT_SKILL_SUBDIRECTORIES) {
+      const absolutePath = path.join(root, subdirectory);
+      const subStat = await fs.lstat(absolutePath).catch(() => null);
+      if (!subStat) continue;
+      if (subStat.isSymbolicLink() || !subStat.isDirectory()) {
+        throw unprocessable(`Skill resync source contains an invalid ${subdirectory} entry.`);
+      }
+      await visit(absolutePath, 1, subStat);
+    }
+  }
+  const finalRootStat = await fs.lstat(root).catch(() => null);
+  assertDirectoryIdentity(rootStat, finalRootStat, "");
+  const normalized = normalizeResyncInventory([...files.values()]);
+  const skill = normalized.entries.find((entry) => entry.path === "SKILL.md")!;
+  return {
+    files: normalized.entries,
+    fileInventory: normalized.entries.map((entry) => ({ path: entry.path, kind: entry.kind })),
+    versionInventory: normalized.entries.map((entry) => ({
+      path: entry.path,
+      kind: entry.kind,
+      content: entry.content,
+    })),
+    sourceLocatorSha256: resyncSha256(root),
+    skillMarkdownSha256: skill.sha256,
+    inventorySha256: resyncSha256(JSON.stringify(normalized.entries.map((entry) => ({
+      path: entry.path,
+      kind: entry.kind,
+      sizeBytes: entry.sizeBytes,
+      sha256: entry.sha256,
+    })))),
+    fileCount: normalized.entries.length,
+    totalBytes: normalized.totalBytes,
+    skillMarkdown: skill.content,
+  };
+}
+
+function assertCompanySkillResyncRequest(input: CompanySkillResyncRequest) {
+  const baseOnly = Array.isArray(input?.maintenanceAgentIds) && input.maintenanceAgentIds.length === 0;
+  if (!input || input.schemaVersion !== SKILL_RESYNC_SCHEMA_VERSION ||
+      input.approvalIssue !== SKILL_RESYNC_APPROVAL_ISSUE ||
+      input.expectedSourceType !== "local_path" ||
+      !new Set(["full", "project_root"]).has(input.expectedSourceInventoryMode) ||
+      !RESYNC_UUID_PATTERN.test(input.maintenanceOperationId) ||
+      !RESYNC_UUID_PATTERN.test(input.expectedCurrentVersionId) ||
+      !Array.isArray(input.maintenanceAgentIds) || input.maintenanceAgentIds.length > 100 ||
+      input.maintenanceAgentIds.some((agentId, index) => !RESYNC_UUID_PATTERN.test(agentId) ||
+        (index > 0 && input.maintenanceAgentIds[index - 1]! >= agentId)) ||
+      (baseOnly
+        ? input.maintenanceReceiptId !== null ||
+          input.maintenanceExpectedSnapshotFingerprint !== null ||
+          input.expectedSourceInventoryMode !== "full" ||
+          input.expectedCurrentVersionInventorySha256 !== input.expectedSourceInventorySha256
+        : typeof input.maintenanceReceiptId !== "string" ||
+          typeof input.maintenanceExpectedSnapshotFingerprint !== "string") ||
+      !asString(input.expectedSkillKey) ||
+      !RESYNC_TRUST_LEVELS.has(input.expectedBaseTrustLevel) ||
+      !RESYNC_TRUST_LEVELS.has(input.expectedSourceTrustLevel) ||
+      !asString(input.label) || input.label.length > 500 ||
+      !input.label.startsWith(`${SKILL_RESYNC_APPROVAL_ISSUE} skill-resync`) ||
+      !Number.isFinite(Date.parse(input.expectedSkillUpdatedAt))) {
+    throw unprocessable("Invalid company-skill resync CAS request.");
+  }
+  for (const fingerprint of [
+    ...(baseOnly ? [] : [input.maintenanceReceiptId!, input.maintenanceExpectedSnapshotFingerprint!]),
+    input.expectedSourceLocatorSha256,
+    input.expectedBaseMarkdownSha256,
+    input.expectedCurrentVersionInventorySha256,
+    input.expectedSourceSkillMarkdownSha256,
+    input.expectedSourceInventorySha256,
+    input.expectedBaseFileInventorySha256,
+    input.expectedSourceFileInventorySha256,
+  ]) {
+    if (!RESYNC_FINGERPRINT_PATTERN.test(fingerprint)) {
+      throw unprocessable("Invalid company-skill resync fingerprint.");
+    }
+  }
+}
+
 function deriveTrustLevel(fileInventory: CompanySkillFileInventoryEntry[]): CompanySkillTrustLevel {
-  if (fileInventory.some((entry) => entry.kind === "script")) return "scripts_executables";
+  if (fileInventory.some((entry) => entry.kind === "script" || hasResyncExecutableSuffix(entry.path))) {
+    return "scripts_executables";
+  }
   if (fileInventory.some((entry) => entry.kind === "asset" || entry.kind === "other")) return "assets";
   return "markdown_only";
 }
@@ -885,15 +1218,14 @@ function readInlineSkillImports(companyId: string, files: Record<string, string>
 
 async function walkLocalFiles(root: string, current: string, out: string[]) {
   const entries = await fs.readdir(current, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.name === ".git" || entry.name === "node_modules") continue;
+  for (const entry of entries.sort((left, right) => compareCodepoints(left.name, right.name))) {
+    if (isIgnoredResyncEntry(entry.name, entry.isDirectory())) continue;
     const absolutePath = path.join(current, entry.name);
     if (entry.isDirectory()) {
       await walkLocalFiles(root, absolutePath, out);
       continue;
     }
-    if (!entry.isFile()) continue;
-    out.push(normalizePortablePath(path.relative(root, absolutePath)));
+    if (entry.isFile()) out.push(normalizePortablePath(path.relative(root, absolutePath)));
   }
 }
 
@@ -905,38 +1237,7 @@ async function collectLocalSkillInventory(
   skillDir: string,
   mode: LocalSkillInventoryMode = "full",
 ): Promise<CompanySkillFileInventoryEntry[]> {
-  const skillFilePath = path.join(skillDir, "SKILL.md");
-  const skillFileStat = await statPath(skillFilePath);
-  if (!skillFileStat?.isFile()) {
-    throw unprocessable(`No SKILL.md file was found in ${skillDir}.`);
-  }
-
-  const allFiles = new Set<string>(["SKILL.md"]);
-  if (mode === "full") {
-    const discoveredFiles: string[] = [];
-    await walkLocalFiles(skillDir, skillDir, discoveredFiles);
-    for (const relativePath of discoveredFiles) {
-      allFiles.add(relativePath);
-    }
-  } else {
-    for (const relativeDir of PROJECT_ROOT_SKILL_SUBDIRECTORIES) {
-      const absoluteDir = path.join(skillDir, relativeDir);
-      const dirStat = await statPath(absoluteDir);
-      if (!dirStat?.isDirectory()) continue;
-      const discoveredFiles: string[] = [];
-      await walkLocalFiles(skillDir, absoluteDir, discoveredFiles);
-      for (const relativePath of discoveredFiles) {
-        allFiles.add(relativePath);
-      }
-    }
-  }
-
-  return Array.from(allFiles)
-    .map((relativePath) => ({
-      path: normalizePortablePath(relativePath),
-      kind: classifyInventoryKind(relativePath),
-    }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+  return (await collectLocalSkillTextSnapshot(skillDir, mode)).fileInventory;
 }
 
 function inventoryEntriesEqual(
@@ -1407,19 +1708,25 @@ function serializeVersionFileInventory(
 }
 
 function toCompanySkillVersion(row: CompanySkillVersionRow): CompanySkillVersion {
+  if (!Array.isArray(row.fileInventory)) {
+    throw unprocessable("Company skill version inventory is malformed.");
+  }
+  const fileInventory = row.fileInventory.map((entry) => {
+    if (!isPlainRecord(entry) || typeof entry.path !== "string" ||
+        typeof entry.kind !== "string" || typeof entry.content !== "string" ||
+        !RESYNC_FILE_KINDS.has(entry.kind as CompanySkillFileInventoryEntry["kind"])) {
+      throw unprocessable("Company skill version inventory is malformed.");
+    }
+    return {
+      path: entry.path,
+      kind: entry.kind as CompanySkillFileInventoryEntry["kind"],
+      content: entry.content,
+    };
+  });
   return {
     ...row,
     label: row.label ?? null,
-    fileInventory: Array.isArray(row.fileInventory)
-      ? row.fileInventory.flatMap((entry) => {
-        if (!isPlainRecord(entry)) return [];
-        return [{
-          path: String(entry.path ?? ""),
-          kind: (String(entry.kind ?? "other") as CompanySkillFileInventoryEntry["kind"]),
-          content: String(entry.content ?? ""),
-        }];
-      })
-      : [],
+    fileInventory,
     authorAgentId: row.authorAgentId ?? null,
     authorUserId: row.authorUserId ?? null,
   };
@@ -1669,6 +1976,20 @@ function resolveDesiredSkillEntries(
     out.set(key, { key, versionId: entry.versionId ?? null });
   }
   return Array.from(out.values());
+}
+
+function resolveAffectedAgentIds(
+  skills: SkillReferenceTarget[],
+  agents: Array<{ id: string; adapterConfig: unknown }>,
+  skillKey: string,
+) {
+  return agents
+    .filter((agent) => resolveDesiredSkillEntries(
+      skills,
+      agent.adapterConfig as Record<string, unknown>,
+    ).some((entry) => entry.key === skillKey))
+    .map((agent) => agent.id)
+    .sort(compareCodepoints);
 }
 
 function normalizeSkillDirectory(skill: SkillSourceInfoTarget) {
@@ -2409,7 +2730,7 @@ export function companySkillService(db: Db) {
   async function isStarredByActor(companyId: string, skillId: string, actor: SkillActor | null | undefined) {
     if (!actor || actor.type === "system") return false;
     const clause = actor.type === "agent" && actor.agentId
-      ? eq(companySkillStars.agentId, actor.agentId)
+      ? eq(companySkillStars.agentId, canonicalizeAgentReferenceId(actor.agentId))
       : actor.type === "user" && actor.userId
         ? eq(companySkillStars.userId, actor.userId)
         : null;
@@ -2513,6 +2834,12 @@ export function companySkillService(db: Db) {
     companyId: string,
     skill: CompanySkill,
   ): Promise<CompanySkillVersionFileInventoryEntry[]> {
+    if (skill.sourceType === "local_path" && skill.sourceLocator) {
+      return (await collectLocalSkillTextSnapshot(
+        skill.sourceLocator,
+        inferLocalSkillInventoryMode(skill),
+      )).versionInventory;
+    }
     const out: CompanySkillVersionFileInventoryEntry[] = [];
     for (const entry of skill.fileInventory) {
       const detail = await readFile(companyId, skill.id, entry.path);
@@ -2524,6 +2851,472 @@ export function companySkillService(db: Db) {
       });
     }
     return out;
+  }
+
+  async function resyncPreflight(
+    companyId: string,
+    skillId: string,
+  ): Promise<CompanySkillResyncPreflight> {
+    const skillRow = await db
+      .select(selectCompanySkillColumns())
+      .from(companySkills)
+      .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, skillId)))
+      .then((rows) => rows[0] ?? null);
+    if (!skillRow) throw notFound("Skill not found");
+    const skill = toCompanySkill(skillRow);
+    if (skill.sourceType !== "local_path" || !skill.sourceLocator) {
+      throw unprocessable("Company-skill resync is limited to local_path skills.");
+    }
+    if (!skill.currentVersionId) {
+      throw unprocessable("Company-skill resync requires a pinned current version.");
+    }
+    const versionRow = await db
+      .select()
+      .from(companySkillVersions)
+      .where(and(
+        eq(companySkillVersions.companyId, companyId),
+        eq(companySkillVersions.companySkillId, skillId),
+        eq(companySkillVersions.id, skill.currentVersionId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!versionRow) throw conflict("The pinned current skill version is missing.");
+    const [skillReferences, currentAgentRows] = await Promise.all([
+      db
+        .select({
+          id: companySkills.id,
+          key: companySkills.key,
+          slug: companySkills.slug,
+        })
+        .from(companySkills)
+        .where(eq(companySkills.companyId, companyId)),
+      db
+        .select({
+          id: agentRows.id,
+          adapterConfig: agentRows.adapterConfig,
+        })
+        .from(agentRows)
+        .where(and(
+          eq(agentRows.companyId, companyId),
+          ne(agentRows.status, "terminated"),
+          notInArray(agentRows.id, [...AGENT_RETIREMENT_HISTORICAL_TOMBSTONE_IDS]),
+        )),
+    ]);
+    const affectedAgentIds = resolveAffectedAgentIds(
+      skillReferences as SkillReferenceTarget[],
+      currentAgentRows,
+      skill.key,
+    );
+    if (affectedAgentIds.length > MAX_RESYNC_AFFECTED_AGENTS) {
+      throw unprocessable("Company-skill resync preflight supports at most 100 affected agents.", {
+        code: "skill_resync_affected_agent_scope_out_of_bounds",
+        affectedAgentCount: affectedAgentIds.length,
+      });
+    }
+    const sourceInventoryMode = inferLocalSkillInventoryMode(skill);
+    const source = await collectLocalSkillTextSnapshot(skill.sourceLocator, sourceInventoryMode);
+    const sourceTrustLevel = deriveTrustLevel(source.fileInventory);
+    return {
+      schemaVersion: SKILL_RESYNC_SCHEMA_VERSION,
+      companyId,
+      skillId,
+      skillKey: skill.key,
+      sourceType: "local_path",
+      sourceLocator: path.resolve(skill.sourceLocator),
+      sourceLocatorSha256: source.sourceLocatorSha256,
+      sourceInventoryMode,
+      skillUpdatedAt: skill.updatedAt.toISOString(),
+      currentVersionId: versionRow.id,
+      currentVersionLabel: versionRow.label ?? null,
+      baseMarkdownSha256: resyncSha256(skill.markdown),
+      currentVersionInventorySha256: resyncInventorySha256(versionRow.fileInventory),
+      sourceSkillMarkdownSha256: source.skillMarkdownSha256,
+      sourceInventorySha256: source.inventorySha256,
+      baseFileInventorySha256: resyncFileInventorySha256(skill.fileInventory),
+      sourceFileInventorySha256: resyncFileInventorySha256(source.fileInventory),
+      baseTrustLevel: skill.trustLevel,
+      sourceTrustLevel,
+      sourceFileCount: source.fileCount,
+      sourceTotalBytes: source.totalBytes,
+      affectedAgentIds,
+    };
+  }
+
+  async function resyncFromSource(
+    companyId: string,
+    skillId: string,
+    input: CompanySkillResyncRequest,
+    actor: SkillActor | null = null,
+  ): Promise<CompanySkillResyncResult> {
+    assertCompanySkillResyncRequest(input);
+    const baseOnly = input.maintenanceAgentIds.length === 0;
+    if (actor?.type !== "user" || !asString(actor.userId)) {
+      throw unprocessable("Company-skill resync requires an authenticated board user.");
+    }
+    const expectedLabel = `${SKILL_RESYNC_APPROVAL_ISSUE} skill-resync ${input.maintenanceOperationId} ` +
+      `${skillId} ${input.expectedCurrentVersionId} ${input.expectedSourceInventorySha256}`;
+    if (input.label !== expectedLabel) {
+      throw unprocessable("Company-skill resync label does not match the exact operation binding.", {
+        code: "skill_resync_label_mismatch",
+      });
+    }
+
+    return db.transaction(async (tx) => {
+      // Resync coverage is derived from every current agent configuration. A
+      // table lock prevents a concurrent insert from becoming an ungated
+      // phantom consumer between the coverage proof and commit.
+      await tx.execute(sql.raw("SET LOCAL lock_timeout = '5s'"));
+      if (!baseOnly) {
+        await tx.execute(sql.raw("LOCK TABLE agents IN SHARE ROW EXCLUSIVE MODE"));
+      }
+      await tx.execute(sql`
+        select ${companySkills.id}
+        from ${companySkills}
+        where ${companySkills.id} = ${skillId}
+          and ${companySkills.companyId} = ${companyId}
+        for update
+      `);
+      const skillRow = await tx
+        .select(selectCompanySkillColumns())
+        .from(companySkills)
+        .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, skillId)))
+        .then((rows) => rows[0] ?? null);
+      if (!skillRow) throw notFound("Skill not found");
+      const skill = toCompanySkill(skillRow);
+      if (skill.sourceType !== "local_path" || !skill.sourceLocator || !skill.currentVersionId) {
+        throw unprocessable("Company-skill resync requires a local_path skill with a pinned current version.");
+      }
+      if (!baseOnly) {
+        const skillReferences = await tx
+          .select({
+            id: companySkills.id,
+            key: companySkills.key,
+            slug: companySkills.slug,
+          })
+          .from(companySkills)
+          .where(eq(companySkills.companyId, companyId));
+        const lockedAgentRows = await tx
+          .select({
+            id: agentRows.id,
+            adapterConfig: agentRows.adapterConfig,
+          })
+          .from(agentRows)
+          .where(and(
+            eq(agentRows.companyId, companyId),
+            ne(agentRows.status, "terminated"),
+            notInArray(agentRows.id, [...AGENT_RETIREMENT_HISTORICAL_TOMBSTONE_IDS]),
+          ))
+          .orderBy(asc(agentRows.id))
+          .for("update");
+        const affectedAgentIds = resolveAffectedAgentIds(
+          skillReferences as SkillReferenceTarget[],
+          lockedAgentRows,
+          skill.key,
+        );
+        if (affectedAgentIds.length < 1 || affectedAgentIds.length !== input.maintenanceAgentIds.length ||
+            affectedAgentIds.some((agentId, index) => input.maintenanceAgentIds[index] !== agentId)) {
+          throw conflict("Company-skill resync maintenance scope does not match affected agents.", {
+            code: "skill_resync_maintenance_scope_mismatch",
+          });
+        }
+        const maintenanceGateRows = await tx
+          .select({
+            agentId: agentPortfolioMaintenanceGates.agentId,
+            operationId: agentPortfolioMaintenanceGates.operationId,
+            expectedSnapshotFingerprint: agentPortfolioMaintenanceGates.expectedSnapshotFingerprint,
+            receiptId: agentPortfolioMaintenanceGates.receiptId,
+            stage: agentPortfolioMaintenanceGates.stage,
+          })
+          .from(agentPortfolioMaintenanceGates)
+          .where(and(
+            eq(agentPortfolioMaintenanceGates.companyId, companyId),
+            inArray(agentPortfolioMaintenanceGates.agentId, input.maintenanceAgentIds),
+          ))
+          .orderBy(asc(agentPortfolioMaintenanceGates.agentId))
+          .for("update");
+        if (maintenanceGateRows.length !== input.maintenanceAgentIds.length ||
+            maintenanceGateRows.some((gate, index) => gate.agentId !== input.maintenanceAgentIds[index] ||
+              gate.operationId !== input.maintenanceOperationId ||
+              gate.expectedSnapshotFingerprint !== input.maintenanceExpectedSnapshotFingerprint ||
+              gate.receiptId !== input.maintenanceReceiptId || gate.stage !== "quiesced")) {
+          throw conflict("Company-skill resync requires one exact quiesced maintenance gate.", {
+            code: "skill_resync_maintenance_gate_mismatch",
+          });
+        }
+      } else {
+        const maintenanceProofRows = await tx
+          .select({
+            id: agentPortfolioMaintenanceGates.id,
+            agentId: agentPortfolioMaintenanceGates.agentId,
+            operationId: agentPortfolioMaintenanceGates.operationId,
+            stage: agentPortfolioMaintenanceGates.stage,
+          })
+          .from(agentPortfolioMaintenanceGates)
+          .where(and(
+            eq(agentPortfolioMaintenanceGates.companyId, companyId),
+            eq(agentPortfolioMaintenanceGates.operationId, input.maintenanceOperationId),
+            eq(agentPortfolioMaintenanceGates.stage, "quiesced"),
+          ))
+          .orderBy(asc(agentPortfolioMaintenanceGates.agentId))
+          .for("update");
+        if (maintenanceProofRows.length < 1) {
+          throw conflict("Company-skill base-only resync requires a quiesced maintenance proof.", {
+            code: "skill_resync_base_only_maintenance_gate_mismatch",
+          });
+        }
+      }
+      const currentVersionRow = await tx
+        .select()
+        .from(companySkillVersions)
+        .where(and(
+          eq(companySkillVersions.companyId, companyId),
+          eq(companySkillVersions.companySkillId, skillId),
+          eq(companySkillVersions.id, skill.currentVersionId),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!currentVersionRow) throw conflict("The pinned current skill version is missing.");
+
+      const sourceInventoryMode = inferLocalSkillInventoryMode(skill);
+      const source = await collectLocalSkillTextSnapshot(skill.sourceLocator, sourceInventoryMode);
+      const actualUpdatedAt = skill.updatedAt.toISOString();
+      const actualBaseMarkdownSha256 = resyncSha256(skill.markdown);
+      const actualCurrentInventorySha256 = resyncInventorySha256(currentVersionRow.fileInventory);
+      const actualBaseFileInventorySha256 = resyncFileInventorySha256(skill.fileInventory);
+      const sourceFileInventorySha256 = resyncFileInventorySha256(source.fileInventory);
+      const sourceTrustLevel = deriveTrustLevel(source.fileInventory);
+      const persistCommittedReceipt = async (
+        result: CompanySkillResyncResultWithoutReceipt,
+      ): Promise<CompanySkillResyncResult> => {
+        const auditReceiptId = randomUUID();
+        const auditedResult: CompanySkillResyncResult = { ...result, auditReceiptId };
+        const inserted = await tx.insert(activityLog).values({
+          id: auditReceiptId,
+          companyId,
+          actorType: "user",
+          actorId: actor.userId!,
+          action: "company.skill_source_resync_committed",
+          entityType: "company_skill",
+          entityId: skillId,
+          details: {
+            schemaVersion: SKILL_RESYNC_SCHEMA_VERSION,
+            request: {
+              schemaVersion: input.schemaVersion,
+              approvalIssue: input.approvalIssue,
+              maintenanceOperationId: input.maintenanceOperationId,
+              maintenanceAgentIds: input.maintenanceAgentIds,
+              maintenanceReceiptId: input.maintenanceReceiptId,
+              maintenanceExpectedSnapshotFingerprint: input.maintenanceExpectedSnapshotFingerprint,
+              label: input.label,
+              expectedSkillKey: input.expectedSkillKey,
+              expectedSourceType: input.expectedSourceType,
+              expectedSourceInventoryMode: input.expectedSourceInventoryMode,
+              expectedSourceLocatorSha256: input.expectedSourceLocatorSha256,
+              expectedSkillUpdatedAt: input.expectedSkillUpdatedAt,
+              expectedCurrentVersionId: input.expectedCurrentVersionId,
+              expectedBaseMarkdownSha256: input.expectedBaseMarkdownSha256,
+              expectedCurrentVersionInventorySha256: input.expectedCurrentVersionInventorySha256,
+              expectedSourceSkillMarkdownSha256: input.expectedSourceSkillMarkdownSha256,
+              expectedSourceInventorySha256: input.expectedSourceInventorySha256,
+              expectedBaseFileInventorySha256: input.expectedBaseFileInventorySha256,
+              expectedSourceFileInventorySha256: input.expectedSourceFileInventorySha256,
+              expectedBaseTrustLevel: input.expectedBaseTrustLevel,
+              expectedSourceTrustLevel: input.expectedSourceTrustLevel,
+            },
+            result: auditedResult,
+          },
+        }).returning({ id: activityLog.id }).then((rows) => rows[0] ?? null);
+        if (!inserted || inserted.id !== auditReceiptId) {
+          throw conflict("Failed to persist the atomic company-skill resync receipt.", {
+            code: "skill_resync_audit_receipt_missing",
+          });
+        }
+        return auditedResult;
+      };
+
+      const immutableMismatch = skill.key !== input.expectedSkillKey ||
+        skill.sourceType !== input.expectedSourceType ||
+        sourceInventoryMode !== input.expectedSourceInventoryMode ||
+        source.sourceLocatorSha256 !== input.expectedSourceLocatorSha256 ||
+        source.skillMarkdownSha256 !== input.expectedSourceSkillMarkdownSha256 ||
+        source.inventorySha256 !== input.expectedSourceInventorySha256 ||
+        sourceFileInventorySha256 !== input.expectedSourceFileInventorySha256 ||
+        sourceTrustLevel !== input.expectedSourceTrustLevel;
+      if (immutableMismatch) {
+        throw conflict("Company-skill resync source or identity changed after preflight.", {
+          code: "skill_resync_source_cas_mismatch",
+        });
+      }
+
+      if (baseOnly && (
+        sourceInventoryMode !== "full" ||
+        currentVersionRow.id !== input.expectedCurrentVersionId ||
+        actualCurrentInventorySha256 !== input.expectedCurrentVersionInventorySha256 ||
+        actualCurrentInventorySha256 !== source.inventorySha256
+      )) {
+        throw conflict("Company-skill base-only resync requires the exact pinned version inventory to match source.", {
+          code: "skill_resync_base_only_inventory_mismatch",
+        });
+      }
+
+      const exactCasMatch = actualUpdatedAt === input.expectedSkillUpdatedAt &&
+        currentVersionRow.id === input.expectedCurrentVersionId &&
+        actualBaseMarkdownSha256 === input.expectedBaseMarkdownSha256 &&
+        actualCurrentInventorySha256 === input.expectedCurrentVersionInventorySha256 &&
+        actualBaseFileInventorySha256 === input.expectedBaseFileInventorySha256 &&
+        skill.trustLevel === input.expectedBaseTrustLevel;
+
+      if (!exactCasMatch) {
+        if (baseOnly) {
+          throw conflict("Company-skill base-only resync CAS state changed after preflight.", {
+            code: "skill_resync_base_only_cas_mismatch",
+          });
+        }
+        const baseMatchesSource = actualBaseMarkdownSha256 === source.skillMarkdownSha256 &&
+          actualBaseFileInventorySha256 === sourceFileInventorySha256 &&
+          skill.trustLevel === sourceTrustLevel;
+        const currentMatchesSource = actualCurrentInventorySha256 === source.inventorySha256;
+        if (!baseMatchesSource || !currentMatchesSource) {
+          throw conflict("Company-skill resync CAS state changed after preflight.", {
+            code: "skill_resync_state_cas_mismatch",
+          });
+        }
+
+        if (currentVersionRow.id !== input.expectedCurrentVersionId) {
+          const labelRows = await tx
+            .select()
+            .from(companySkillVersions)
+            .where(and(
+              eq(companySkillVersions.companyId, companyId),
+              eq(companySkillVersions.companySkillId, skillId),
+              eq(companySkillVersions.label, input.label),
+            ));
+          const identicalCandidates = labelRows.filter((row) =>
+            resyncInventorySha256(row.fileInventory) === source.inventorySha256
+          );
+          if (identicalCandidates.length !== 1 || identicalCandidates[0]!.id !== currentVersionRow.id) {
+            throw conflict("Company-skill resync retry is missing a unique identical version.", {
+              code: "skill_resync_ambiguous_retry",
+              candidateCount: identicalCandidates.length,
+            });
+          }
+        } else if (input.expectedCurrentVersionInventorySha256 !== source.inventorySha256) {
+          throw conflict("Company-skill resync retry did not create the expected source version.", {
+            code: "skill_resync_missing_version",
+          });
+        }
+
+        return persistCommittedReceipt({
+          schemaVersion: SKILL_RESYNC_SCHEMA_VERSION,
+          companyId,
+          skillId,
+          skillKey: skill.key,
+          previousVersionId: input.expectedCurrentVersionId,
+          currentVersionId: currentVersionRow.id,
+          skillUpdatedAt: actualUpdatedAt,
+          label: input.label,
+          sourceSkillMarkdownSha256: source.skillMarkdownSha256,
+          sourceInventorySha256: source.inventorySha256,
+          previousBaseMarkdownSha256: input.expectedBaseMarkdownSha256,
+          baseMarkdownSha256: actualBaseMarkdownSha256,
+          previousBaseFileInventorySha256: input.expectedBaseFileInventorySha256,
+          baseFileInventorySha256: actualBaseFileInventorySha256,
+          previousTrustLevel: input.expectedBaseTrustLevel,
+          trustLevel: skill.trustLevel,
+          currentVersionInventorySha256: actualCurrentInventorySha256,
+          baseMarkdownChanged: input.expectedBaseMarkdownSha256 !== source.skillMarkdownSha256,
+          baseFileInventoryChanged: input.expectedBaseFileInventorySha256 !== sourceFileInventorySha256,
+          trustLevelChanged: input.expectedBaseTrustLevel !== sourceTrustLevel,
+          versionCreated: false,
+          idempotentReplay: true,
+        });
+      }
+
+      const baseMarkdownChanged = actualBaseMarkdownSha256 !== source.skillMarkdownSha256;
+      const versionInventoryChanged = actualCurrentInventorySha256 !== source.inventorySha256;
+      const baseInventoryChanged = !inventoryEntriesEqual(skill.fileInventory, source.fileInventory);
+      const trustLevelChanged = skill.trustLevel !== sourceTrustLevel;
+      const previousVersionId = currentVersionRow.id;
+      let nextVersionId = currentVersionRow.id;
+      let versionCreated = false;
+
+      if (!baseOnly && versionInventoryChanged) {
+        const [{ nextRevision }] = await tx
+          .select({
+            nextRevision: sql<number>`coalesce(max(${companySkillVersions.revisionNumber}), 0) + 1`,
+          })
+          .from(companySkillVersions)
+          .where(and(eq(companySkillVersions.companyId, companyId), eq(companySkillVersions.companySkillId, skillId)));
+        const inserted = await tx
+          .insert(companySkillVersions)
+          .values({
+            companyId,
+            companySkillId: skillId,
+            revisionNumber: Number(nextRevision ?? 1),
+            label: input.label,
+            fileInventory: serializeVersionFileInventory(source.versionInventory),
+            authorUserId: actor.userId!,
+          })
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!inserted) throw conflict("Failed to persist the source skill version.");
+        nextVersionId = inserted.id;
+        versionCreated = true;
+      }
+
+      let nextUpdatedAt = skill.updatedAt;
+      if (baseMarkdownChanged || versionCreated || baseInventoryChanged || trustLevelChanged) {
+        const parsed = parseFrontmatterMarkdown(source.skillMarkdown);
+        const updated = await tx
+          .update(companySkills)
+          .set(baseOnly ? {
+            markdown: source.skillMarkdown,
+            fileInventory: serializeFileInventory(source.fileInventory),
+            trustLevel: sourceTrustLevel,
+            updatedAt: new Date(),
+          } : {
+            ...(baseMarkdownChanged ? {
+              name: asString(parsed.frontmatter.name) ?? skill.name,
+              description: asString(parsed.frontmatter.description) ?? skill.description,
+              markdown: source.skillMarkdown,
+              ...readSkillStoreMetadata(parsed.frontmatter, skill.metadata),
+            } : {}),
+            fileInventory: serializeFileInventory(source.fileInventory),
+            trustLevel: sourceTrustLevel,
+            currentVersionId: nextVersionId,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, skillId)))
+          .returning({ updatedAt: companySkills.updatedAt })
+          .then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("Failed to persist the source skill state.");
+        nextUpdatedAt = updated.updatedAt;
+      }
+
+      return persistCommittedReceipt({
+        schemaVersion: SKILL_RESYNC_SCHEMA_VERSION,
+        companyId,
+        skillId,
+        skillKey: skill.key,
+        previousVersionId,
+        currentVersionId: nextVersionId,
+        skillUpdatedAt: nextUpdatedAt.toISOString(),
+        label: input.label,
+        sourceSkillMarkdownSha256: source.skillMarkdownSha256,
+        sourceInventorySha256: source.inventorySha256,
+        previousBaseMarkdownSha256: actualBaseMarkdownSha256,
+        baseMarkdownSha256: source.skillMarkdownSha256,
+        previousBaseFileInventorySha256: actualBaseFileInventorySha256,
+        baseFileInventorySha256: sourceFileInventorySha256,
+        previousTrustLevel: skill.trustLevel,
+        trustLevel: sourceTrustLevel,
+        currentVersionInventorySha256: source.inventorySha256,
+        baseMarkdownChanged,
+        baseFileInventoryChanged: baseInventoryChanged,
+        trustLevelChanged,
+        versionCreated,
+        idempotentReplay: false,
+      });
+    });
   }
 
   async function listVersions(companyId: string, skillId: string): Promise<CompanySkillVersion[]> {
@@ -2585,51 +3378,101 @@ export function companySkillService(db: Db) {
     return toCompanySkillVersion(versionRow);
   }
 
-  async function refreshStarCount(companyId: string, skillId: string) {
-    const [{ value }] = await db
+  async function refreshStarCount(
+    companyId: string,
+    skillId: string,
+    source: CompanySkillMutationDb = db,
+  ) {
+    const [{ value }] = await source
       .select({ value: sql<number>`count(*)::int` })
       .from(companySkillStars)
       .where(and(eq(companySkillStars.companyId, companyId), eq(companySkillStars.companySkillId, skillId)));
     const starCount = Number(value ?? 0);
-    await db
+    await source
       .update(companySkills)
       .set({ starCount, updatedAt: new Date() })
       .where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)));
     return starCount;
   }
 
+  function normalizeStarActor(actor: SkillActor): SkillActor {
+    if (actor.type !== "agent") return actor;
+    if (!actor.agentId) throw unprocessable("Skill stars require an agent or board user actor.");
+    return { ...actor, agentId: canonicalizeAgentReferenceId(actor.agentId) };
+  }
+
   function actorStarClause(actor: SkillActor) {
-    if (actor.type === "agent" && actor.agentId) return eq(companySkillStars.agentId, actor.agentId);
+    if (actor.type === "agent" && actor.agentId) {
+      return eq(companySkillStars.agentId, actor.agentId);
+    }
     if (actor.type === "user" && actor.userId) return eq(companySkillStars.userId, actor.userId);
     throw unprocessable("Skill stars require an agent or board user actor.");
   }
 
   async function starSkill(companyId: string, skillId: string, actor: SkillActor) {
-    const skill = await getById(companyId, skillId);
-    if (!skill) throw notFound("Skill not found");
-    const existing = await db
-      .select({ id: companySkillStars.id })
-      .from(companySkillStars)
-      .where(and(eq(companySkillStars.companyId, companyId), eq(companySkillStars.companySkillId, skillId), actorStarClause(actor)))
-      .then((rows) => rows[0] ?? null);
-    if (!existing) {
-      await db.insert(companySkillStars).values({
-        companyId,
-        companySkillId: skillId,
-        agentId: actor.type === "agent" ? actor.agentId ?? null : null,
-        userId: actor.type === "user" ? actor.userId ?? null : null,
-      });
-    }
-    return { skillId, starred: true, starCount: await refreshStarCount(companyId, skillId) };
+    const normalizedActor = normalizeStarActor(actor);
+    return db.transaction(async (tx) => {
+      if (normalizedActor.type === "agent" && normalizedActor.agentId) {
+        await lockAgentLifecycleReference(tx as unknown as Db, {
+          companyId,
+          agentId: normalizedActor.agentId,
+          mode: "active",
+        });
+      }
+      const skill = await tx
+        .select({ id: companySkills.id })
+        .from(companySkills)
+        .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, skillId)))
+        .then((rows) => rows[0] ?? null);
+      if (!skill) throw notFound("Skill not found");
+      const existing = await tx
+        .select({ id: companySkillStars.id })
+        .from(companySkillStars)
+        .where(and(
+          eq(companySkillStars.companyId, companyId),
+          eq(companySkillStars.companySkillId, skillId),
+          actorStarClause(normalizedActor),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!existing) {
+        await tx.insert(companySkillStars).values({
+          companyId,
+          companySkillId: skillId,
+          agentId: normalizedActor.type === "agent" ? normalizedActor.agentId ?? null : null,
+          userId: normalizedActor.type === "user" ? normalizedActor.userId ?? null : null,
+        });
+      }
+      const starCount = await refreshStarCount(companyId, skillId, tx);
+      return { skillId, starred: true, starCount };
+    });
   }
 
   async function unstarSkill(companyId: string, skillId: string, actor: SkillActor) {
-    const skill = await getById(companyId, skillId);
-    if (!skill) throw notFound("Skill not found");
-    await db
-      .delete(companySkillStars)
-      .where(and(eq(companySkillStars.companyId, companyId), eq(companySkillStars.companySkillId, skillId), actorStarClause(actor)));
-    return { skillId, starred: false, starCount: await refreshStarCount(companyId, skillId) };
+    const normalizedActor = normalizeStarActor(actor);
+    return db.transaction(async (tx) => {
+      if (normalizedActor.type === "agent" && normalizedActor.agentId) {
+        await lockAgentLifecycleReference(tx as unknown as Db, {
+          companyId,
+          agentId: normalizedActor.agentId,
+          mode: "cleanup",
+        });
+      }
+      const skill = await tx
+        .select({ id: companySkills.id })
+        .from(companySkills)
+        .where(and(eq(companySkills.companyId, companyId), eq(companySkills.id, skillId)))
+        .then((rows) => rows[0] ?? null);
+      if (!skill) throw notFound("Skill not found");
+      await tx
+        .delete(companySkillStars)
+        .where(and(
+          eq(companySkillStars.companyId, companyId),
+          eq(companySkillStars.companySkillId, skillId),
+          actorStarClause(normalizedActor),
+        ));
+      const starCount = await refreshStarCount(companyId, skillId, tx);
+      return { skillId, starred: false, starCount };
+    });
   }
 
   async function listComments(companyId: string, skillId: string): Promise<CompanySkillComment[]> {
@@ -4035,82 +4878,136 @@ export function companySkillService(db: Db) {
     return { normalizedPath, targetPath };
   }
 
-  async function listMaterializedFiles(root: string): Promise<string[] | null> {
-    async function walk(dir: string, base: string): Promise<string[]> {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      const out: string[] = [];
-      for (const entry of entries) {
-        const relativePath = base ? path.posix.join(base, entry.name) : entry.name;
-        const absolutePath = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          out.push(...await walk(absolutePath, relativePath));
-        } else if (entry.isFile()) {
-          out.push(normalizePortablePath(relativePath));
-        } else {
-          out.push(normalizePortablePath(relativePath));
+  async function readMaterializedVersionSnapshot(root: string): Promise<Map<string, string> | null> {
+    const rootStat = await fs.lstat(root).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!rootStat) return null;
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw unprocessable("Company skill version snapshot root is not a private regular directory.");
+    }
+    const files = new Map<string, string>();
+
+    const walk = async (
+      current: string,
+      base: string,
+      expectedDirectory: Awaited<ReturnType<typeof fs.lstat>>,
+    ): Promise<void> => {
+      const before = await fs.lstat(current).catch(() => null);
+      if (!before?.isDirectory() || before.isSymbolicLink() ||
+          before.dev !== expectedDirectory.dev || before.ino !== expectedDirectory.ino) {
+        throw unprocessable("Company skill version snapshot directory changed during verification.");
+      }
+      const entries = await fs.readdir(current, { withFileTypes: true });
+      for (const entry of entries.sort((left, right) => compareCodepoints(left.name, right.name))) {
+        const relativePath = normalizePortablePath(base ? path.posix.join(base, entry.name) : entry.name);
+        const absolutePath = path.join(current, entry.name);
+        const lstat = await fs.lstat(absolutePath);
+        if (!relativePath || lstat.isSymbolicLink()) {
+          throw unprocessable("Company skill version snapshot contains an invalid or symlinked path.");
+        }
+        if (lstat.isDirectory()) {
+          await walk(absolutePath, relativePath, lstat);
+          continue;
+        }
+        if (!lstat.isFile()) {
+          throw unprocessable("Company skill version snapshot contains a non-regular entry.");
+        }
+        const handle = await fs.open(absolutePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+        try {
+          const opened = await handle.stat();
+          if (!opened.isFile() || opened.dev !== lstat.dev || opened.ino !== lstat.ino || opened.size !== lstat.size) {
+            throw unprocessable("Company skill version snapshot file changed during secure open.");
+          }
+          const content = await handle.readFile("utf8");
+          const after = await handle.stat();
+          if (after.dev !== opened.dev || after.ino !== opened.ino ||
+              after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+            throw unprocessable("Company skill version snapshot file changed during verification.");
+          }
+          if (files.has(relativePath)) {
+            throw unprocessable("Company skill version snapshot contains a duplicate path.");
+          }
+          files.set(relativePath, content);
+        } finally {
+          await handle.close();
         }
       }
-      return out;
-    }
+      const after = await fs.lstat(current).catch(() => null);
+      if (!after?.isDirectory() || after.isSymbolicLink() || after.dev !== before.dev || after.ino !== before.ino) {
+        throw unprocessable("Company skill version snapshot directory changed during verification.");
+      }
+    };
 
-    try {
-      return await walk(root, "");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw error;
-    }
+    await walk(root, "", rootStat);
+    return files;
+  }
+
+  function normalizedVersionSnapshotEntries(version: CompanySkillVersion) {
+    return normalizeResyncInventory(version.fileInventory).entries.map((entry) => ({
+      path: entry.path,
+      kind: entry.kind,
+      content: entry.content,
+    }));
   }
 
   async function materializedVersionSnapshotMatches(skillDir: string, version: CompanySkillVersion) {
-    const expected = new Map<string, string>();
-    let sawSkillFile = false;
-    for (const entry of version.fileInventory) {
-      const resolved = resolveVersionSnapshotPath(skillDir, entry.path);
-      if (!resolved) continue;
-      expected.set(resolved.normalizedPath, entry.content);
-      if (resolved.normalizedPath === "SKILL.md") sawSkillFile = true;
-    }
-    if (!sawSkillFile) {
-      throw unprocessable("Company skill version could not be materialized because its SKILL.md snapshot is missing.");
-    }
-
-    const existingFiles = await listMaterializedFiles(skillDir);
-    if (!existingFiles || existingFiles.length !== expected.size) return false;
-    for (const relativePath of existingFiles) {
-      if (!expected.has(relativePath)) return false;
-    }
-    for (const [relativePath, content] of expected.entries()) {
-      const existingContent = await fs.readFile(path.resolve(skillDir, relativePath), "utf8").catch(() => null);
-      if (existingContent !== content) return false;
+    const expectedEntries = normalizedVersionSnapshotEntries(version);
+    const expected = new Map(expectedEntries.map((entry) => [entry.path, entry.content]));
+    const existingFiles = await readMaterializedVersionSnapshot(skillDir);
+    if (!existingFiles || existingFiles.size !== expected.size) return false;
+    for (const [relativePath, content] of existingFiles.entries()) {
+      if (expected.get(relativePath) !== content) return false;
     }
     return true;
   }
 
   async function materializeVersionSnapshot(companyId: string, skill: CompanySkill, version: CompanySkillVersion) {
+    const entries = normalizedVersionSnapshotEntries(version);
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__versions__");
-    const skillDir = path.resolve(runtimeRoot, skill.id, version.id);
-    if (await materializedVersionSnapshotMatches(skillDir, version)) {
+    const versionParent = path.resolve(runtimeRoot, skill.id);
+    const skillDir = path.resolve(versionParent, version.id);
+    if (await materializedVersionSnapshotMatches(skillDir, version)) return skillDir;
+    if (await fs.lstat(skillDir).catch(() => null)) {
+      throw unprocessable("Company skill version snapshot already exists with inconsistent contents.");
+    }
+
+    await fs.mkdir(versionParent, { recursive: true, mode: 0o700 });
+    const stagingDir = await fs.mkdtemp(path.join(versionParent, `.${version.id}.tmp-`));
+    await fs.chmod(stagingDir, 0o700);
+    try {
+      for (const entry of entries) {
+        const resolved = resolveVersionSnapshotPath(stagingDir, entry.path);
+        if (!resolved) throw unprocessable("Company skill version snapshot contains an invalid path.");
+        await fs.mkdir(path.dirname(resolved.targetPath), { recursive: true, mode: 0o700 });
+        const handle = await fs.open(
+          resolved.targetPath,
+          fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+          0o600,
+        );
+        try {
+          await handle.writeFile(entry.content, "utf8");
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      }
+      if (!await materializedVersionSnapshotMatches(stagingDir, version)) {
+        throw unprocessable("Company skill version staging snapshot failed full verification.");
+      }
+      try {
+        await fs.rename(stagingDir, skillDir);
+      } catch (error) {
+        if (!await materializedVersionSnapshotMatches(skillDir, version).catch(() => false)) throw error;
+      }
+      if (!await materializedVersionSnapshotMatches(skillDir, version)) {
+        throw unprocessable("Company skill version published snapshot failed full verification.");
+      }
       return skillDir;
+    } finally {
+      await fs.rm(stagingDir, { recursive: true, force: true });
     }
-    await fs.rm(skillDir, { recursive: true, force: true });
-    await fs.mkdir(skillDir, { recursive: true });
-
-    let wroteSkillFile = false;
-    for (const entry of version.fileInventory) {
-      const resolved = resolveVersionSnapshotPath(skillDir, entry.path);
-      if (!resolved) continue;
-      const { normalizedPath, targetPath } = resolved;
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, entry.content, "utf8");
-      if (normalizedPath === "SKILL.md") wroteSkillFile = true;
-    }
-
-    if (!wroteSkillFile) {
-      await fs.rm(skillDir, { recursive: true, force: true });
-      throw unprocessable("Company skill version could not be materialized because its SKILL.md snapshot is missing.");
-    }
-
-    return skillDir;
   }
 
   function resolveRuntimeSkillMaterializedPath(companyId: string, skill: Pick<CompanySkill, "key" | "slug">) {
@@ -4123,22 +5020,45 @@ export function companySkillService(db: Db) {
     skill: CompanySkill,
     options: RuntimeSkillEntryOptions,
   ): Promise<RuntimeSkillSourceResolution | null> {
+    const missingVersionResolution = (versionId: string, detail: string): RuntimeSkillSourceResolution => ({
+      status: "missing",
+      source: path.resolve(resolveManagedSkillsRoot(companyId), "__versions__", skill.id, versionId),
+      detail,
+    });
     const selectedVersionId = options.versionSelections?.get(skill.key) ?? null;
     if (selectedVersionId) {
-      const version = await getVersion(companyId, skill.id, selectedVersionId);
+      const version = await getVersion(companyId, skill.id, selectedVersionId).catch(() => null);
       if (!version) {
-        return {
-          status: "missing",
-          source: path.resolve(resolveManagedSkillsRoot(companyId), "__versions__", skill.id, selectedVersionId),
-          detail: "The selected skill version no longer exists.",
-        };
+        return missingVersionResolution(selectedVersionId, "The selected skill version no longer exists or is invalid.");
       }
       const versionSource = await materializeVersionSnapshot(companyId, skill, version).catch(() => null);
-      return versionSource ? { status: "available", source: versionSource } : null;
+      return versionSource
+        ? { status: "available", source: versionSource }
+        : missingVersionResolution(selectedVersionId, "The selected skill version snapshot is not safely materializable.");
     }
 
     const source = await resolveExistingSkillDirectory(normalizeSkillDirectory(skill));
     if (source) return { status: "available", source };
+
+    // A pinned current version is the immutable runtime authority when the
+    // live source disappears. This keeps catalog/base metadata changes from
+    // silently changing an unpinned agent's executable skill fallback.
+    if (skill.currentVersionId) {
+      const currentVersion = await getVersion(companyId, skill.id, skill.currentVersionId).catch(() => null);
+      if (!currentVersion) {
+        return missingVersionResolution(
+          skill.currentVersionId,
+          "The pinned current version is missing, belongs to another skill, or has invalid inventory.",
+        );
+      }
+      const versionSource = await materializeVersionSnapshot(companyId, skill, currentVersion).catch(() => null);
+      return versionSource
+        ? { status: "available", source: versionSource }
+        : missingVersionResolution(
+          skill.currentVersionId,
+          "The pinned current version snapshot is not safely materializable.",
+        );
+    }
 
     if (options.materializeMissing === false) {
       const materializedPath = resolveRuntimeSkillMaterializedPath(companyId, skill);
@@ -4466,6 +5386,8 @@ export function companySkillService(db: Db) {
     },
     categoryCounts,
     detail,
+    resyncPreflight,
+    resyncFromSource,
     listVersions,
     getVersion,
     createVersion,

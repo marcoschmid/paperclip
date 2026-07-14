@@ -1,8 +1,18 @@
 import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
 import path from "node:path";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import {
+  agents as agentsTable,
+  authUsers,
+  companies,
+  companySkills as companySkillsTable,
+  heartbeatRuns,
+  issues as issuesTable,
+  projects as projectsTable,
+} from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
   agentSkillSyncSchema,
@@ -14,7 +24,11 @@ import {
   createAgentSchema,
   deriveAgentUrlKey,
   isUuidLike,
+  isAgentRetirementSource,
   normalizeIssueIdentifier,
+  agentLifecycleSchema,
+  pauseAgentSchema,
+  resumeAgentSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
   type AgentDesiredSkillEntry,
@@ -28,6 +42,13 @@ import {
   updateAgentSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
+  agentRetirementCleanupRequestSchema,
+  agentRetirementEvidenceSchema,
+  agentRetirementExecutionRecoveryRequestSchema,
+  agentRetirementPreflightRequestSchema,
+  agentRetirementTerminationSchema,
+  type AgentLifecycleGate,
+  type AgentLifecycleTransition,
 } from "@paperclipai/shared";
 import {
   resolvePaperclipInstanceRootForAdapter,
@@ -38,6 +59,7 @@ import { trackAgentCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import {
   agentService,
+  agentRetirementService,
   agentInstructionsService,
   accessService,
   approvalService,
@@ -52,7 +74,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -69,6 +91,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { secretService } from "../services/secrets.js";
+import { agentAdapterSecretExternalizationService } from "../services/agent-adapter-secret-externalization.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import {
   detectAdapterModel,
@@ -83,7 +106,10 @@ import { redactEventPayload } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
+import {
+  assertClaudePermissionConfigIsFailClosed,
+  runClaudeLogin,
+} from "@paperclipai/adapter-claude-local/server";
 import {
   DEFAULT_ACPX_LOCAL_AGENT,
   DEFAULT_ACPX_LOCAL_MODE,
@@ -91,6 +117,7 @@ import {
   DEFAULT_ACPX_LOCAL_PERMISSION_MODE,
 } from "@paperclipai/adapter-acpx-local";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
+import { assertCodexPermissionConfigIsFailClosed } from "@paperclipai/adapter-codex-local/server";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
@@ -105,9 +132,38 @@ import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
+import { createAgentConfigurationFingerprint } from "../services/effective-run-config-fingerprints.js";
+import {
+  computeAgentLifecycleConfigFingerprint,
+  createAgentLifecycleCanaryReceipt,
+  createAgentLifecycleValidationReceipt,
+  hashAgentLifecycleContent,
+  parseAgentLifecycleGate,
+  resolveAgentLifecycleDesiredSkills,
+  SERVER_MANAGED_AGENT_LIFECYCLE_GATE_KEYS,
+  validateAgentLifecyclePatchTransition,
+  validateAgentLifecycleGate,
+  type AgentLifecycleFingerprintInput,
+} from "../services/agent-lifecycle.js";
+import {
+  assertHistoricalAgentTombstoneAccessMutable,
+  assertHistoricalAgentTombstoneMutable,
+} from "../services/agent-retirement-historical-tombstones.js";
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
+const adapterSecretExternalizationSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  expectedCompanyId: z.string().uuid(),
+  expectedAdapterType: z.literal("openclaw_gateway"),
+  expectedConfigFingerprint: z.string().regex(/^v1:hmac-sha256:[a-f0-9]{64}$/),
+  expectedPreflightReceipt: z.string().regex(/^v1:hmac-sha256:[a-f0-9]{64}$/),
+}).strict();
+const adapterSecretExternalizationProofSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  expectedCompanyId: z.string().uuid(),
+  expectedReceipt: z.string().regex(/^v1:hmac-sha256:[a-f0-9]{64}$/),
+}).strict();
 
 function readRunLogLimitBytes(value: unknown) {
   const parsed = Number(value ?? RUN_LOG_DEFAULT_LIMIT_BYTES);
@@ -175,6 +231,7 @@ export function agentRoutes(
 
   const router = Router();
   const svc = agentService(db);
+  const retirement = agentRetirementService(db);
   const access = accessService(db);
   const approvalsSvc = approvalService(db);
   const budgets = budgetService(db);
@@ -186,13 +243,129 @@ export function agentRoutes(
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const recovery = recoveryService(db, { enqueueWakeup: heartbeat.wakeup });
+  const issuesSvc = issueService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  const adapterSecretExternalization = agentAdapterSecretExternalizationService(db);
   const instructions = agentInstructionsService();
   const companySkills = companySkillService(db);
   const workspaceOperations = workspaceOperationService(db);
   const instanceSettings = instanceSettingsService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  type LifecycleAgentCandidate = {
+    id: string;
+    companyId: string;
+    adapterType: string;
+    adapterConfig: unknown;
+    runtimeConfig: unknown;
+    permissions: unknown;
+    metadata: unknown;
+    name: string;
+  };
+
+  function readSha256Reference(...values: unknown[]) {
+    return values.find((value): value is string =>
+      typeof value === "string" && /^(?:sha256:|v1:sha256:)[a-f0-9]{64}$/.test(value),
+    ) ?? null;
+  }
+
+  async function buildLifecycleFingerprintInput(
+    agent: LifecycleAgentCandidate,
+  ): Promise<AgentLifecycleFingerprintInput> {
+    const adapterConfig = asRecord(agent.adapterConfig) ?? {};
+    const runtimeConfig = asRecord(agent.runtimeConfig) ?? {};
+    const metadata = asRecord(agent.metadata) ?? {};
+    const desiredSkillEntries = readPaperclipSkillSyncPreference(adapterConfig).desiredSkillEntries;
+    const [grants, bundle, skillCatalog] = await Promise.all([
+      access.listPrincipalGrants(agent.companyId, "agent", agent.id),
+      instructions.exportFiles(agent),
+      desiredSkillEntries.length > 0
+        ? db
+          .select({
+            id: companySkillsTable.id,
+            key: companySkillsTable.key,
+            currentVersionId: companySkillsTable.currentVersionId,
+          })
+          .from(companySkillsTable)
+          .where(and(
+            eq(companySkillsTable.companyId, agent.companyId),
+            inArray(companySkillsTable.key, desiredSkillEntries.map((entry) => entry.key)),
+          ))
+        : Promise.resolve([]),
+    ]);
+    const desiredSkills = resolveAgentLifecycleDesiredSkills(desiredSkillEntries, skillCatalog);
+    const contextPackContent = bundle.files[bundle.entryFile] ?? "";
+    return {
+      agentId: agent.id,
+      companyId: agent.companyId,
+      adapterType: agent.adapterType,
+      adapterConfig,
+      runtimeConfig,
+      permissions: asRecord(agent.permissions) ?? {},
+      grants: grants.map((grant) => ({
+        permissionKey: grant.permissionKey,
+        scope: asRecord(grant.scope),
+      })),
+      desiredSkills,
+      lifecycle: metadata.lifecycle,
+      contextPackSha256: hashAgentLifecycleContent(contextPackContent),
+      managedInstructionsSha256: hashAgentLifecycleContent(bundle.files),
+      companyProfileSha256: readSha256Reference(
+        adapterConfig.companyProfileSha256,
+        runtimeConfig.companyProfileSha256,
+      ),
+    };
+  }
+
+  function lifecycleGateFailure(result: Exclude<ReturnType<typeof validateAgentLifecycleGate>, { ok: true }>): never {
+    throw conflict("Agent lifecycle gate failed", {
+      code: "lifecycle_gate_failed",
+      reason: result.reason,
+      ...(result.issues ? { issues: result.issues } : {}),
+    });
+  }
+
+  async function assertLifecycleGate(agent: LifecycleAgentCandidate) {
+    const metadata = asRecord(agent.metadata) ?? {};
+    const result = validateAgentLifecycleGate({
+      fingerprintInput: await buildLifecycleFingerprintInput(agent),
+      gate: metadata.lifecycleGate,
+    });
+    if (!result.ok) lifecycleGateFailure(result);
+    return result;
+  }
+
+  async function refreshLifecycleReceiptForPatch(input: {
+    existing: LifecycleAgentCandidate;
+    candidate: LifecycleAgentCandidate;
+    patchData: Record<string, unknown>;
+    requestMetadata: Record<string, unknown> | null;
+  }) {
+    const metadata = asRecord(input.candidate.metadata) ?? {};
+    if (!Object.prototype.hasOwnProperty.call(metadata, "lifecycle")) return null;
+    const lifecycleRelevantChange = ["adapterType", "adapterConfig", "runtimeConfig"]
+      .some((key) => Object.prototype.hasOwnProperty.call(input.patchData, key))
+      || Boolean(input.requestMetadata && Object.prototype.hasOwnProperty.call(input.requestMetadata, "lifecycle"));
+    if (!lifecycleRelevantChange) return null;
+
+    const existingMetadata = asRecord(input.existing.metadata) ?? {};
+    let lifecycleGate: AgentLifecycleGate | undefined;
+    try {
+      lifecycleGate = createAgentLifecycleValidationReceipt({
+        fingerprintInput: await buildLifecycleFingerprintInput(input.candidate),
+        previousGate: parseAgentLifecycleGate(existingMetadata.lifecycleGate),
+      });
+    } catch {
+      lifecycleGate = undefined;
+    }
+    const nextMetadata = { ...metadata };
+    if (lifecycleGate) nextMetadata.lifecycleGate = lifecycleGate;
+    else delete nextMetadata.lifecycleGate;
+    input.patchData.metadata = nextMetadata;
+    input.candidate.metadata = nextMetadata;
+    return { lifecycleGate: lifecycleGate ?? null };
+  }
 
   async function assertAgentEnvironmentSelection(
     companyId: string,
@@ -531,15 +704,6 @@ export function agentRoutes(
       };
     }
 
-    if (canCreateAgents(agent)) {
-      return {
-        canAssignTasks: true,
-        taskAssignSource: "agent_creator" as const,
-        membership,
-        grants,
-      };
-    }
-
     if (hasExplicitTaskAssignGrant) {
       return {
         canAssignTasks: true,
@@ -549,10 +713,10 @@ export function agentRoutes(
       };
     }
 
-    if (membership?.status === "active") {
+    if (asRecord(agent.permissions)?.canAssignTasks === true) {
       return {
         canAssignTasks: true,
-        taskAssignSource: "simple_default" as const,
+        taskAssignSource: "permission_manifest" as const,
         membership,
         grants,
       };
@@ -645,18 +809,42 @@ export function agentRoutes(
     };
   }
 
-  async function applyDefaultAgentTaskAssignGrant(
+  async function applyAgentTaskAssignGrant(
     companyId: string,
-    agentId: string,
+    agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
     grantedByUserId: string | null,
+    options: { allowPendingApproval?: boolean } = {},
   ) {
-    await access.ensureMembership(companyId, "agent", agentId, "member", "active");
+    const enabled = agent.role === "ceo"
+      || asRecord(agent.permissions)?.canAssignTasks === true;
+    if (options.allowPendingApproval === true) {
+      await access.ensureMembership(
+        companyId,
+        "agent",
+        agent.id,
+        "member",
+        "active",
+        { allowPendingApproval: true },
+      );
+      await access.setPrincipalPermission(
+        companyId,
+        "agent",
+        agent.id,
+        "tasks:assign",
+        enabled,
+        grantedByUserId,
+        null,
+        { allowPendingApproval: true },
+      );
+      return;
+    }
+    await access.ensureMembership(companyId, "agent", agent.id, "member", "active");
     await access.setPrincipalPermission(
       companyId,
       "agent",
-      agentId,
+      agent.id,
       "tasks:assign",
-      true,
+      enabled,
       grantedByUserId,
     );
   }
@@ -689,6 +877,24 @@ export function agentRoutes(
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
+  async function assertCanManageAgentPermissions(
+    req: Request,
+    existing: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+  ) {
+    assertCompanyAccess(req, existing.companyId);
+    if (req.actor.type === "agent") {
+      const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+      if (!actorAgent || actorAgent.companyId !== existing.companyId) {
+        throw forbidden("Forbidden");
+      }
+      if (actorAgent.role !== "ceo") {
+        throw forbidden("Only CEO can manage permissions");
+      }
+      return;
+    }
+    await assertBoardCanManageAgentsForCompany(req, existing.companyId);
   }
 
   async function assertCanReadConfigurations(req: Request, companyId: string) {
@@ -1009,6 +1215,484 @@ export function agentRoutes(
     return null;
   }
 
+  type GovernedPermissionBypass =
+    | "claude_permission_mode"
+    | "codex_approvals_and_sandbox";
+
+  const CLAUDE_GLOBAL_BYPASS_FLAG = "--dangerously-skip-permissions";
+  const CODEX_GLOBAL_BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
+
+  function isUuidValue(value: unknown): value is string {
+    return typeof value === "string" && isUuidLike(value);
+  }
+
+  function requiredPermissionBypass(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown>,
+  ): GovernedPermissionBypass | null {
+    const extraArgs = [
+      ...(Array.isArray(adapterConfig.extraArgs) ? adapterConfig.extraArgs : []),
+      ...(Array.isArray(adapterConfig.args) ? adapterConfig.args : []),
+    ].filter((value): value is string => typeof value === "string");
+    if (
+      adapterType === "claude_local"
+      && (
+        adapterConfig.dangerouslySkipPermissions === true
+        || extraArgs.some(
+          (arg) => arg === CLAUDE_GLOBAL_BYPASS_FLAG
+            || arg.startsWith(`${CLAUDE_GLOBAL_BYPASS_FLAG}=`),
+        )
+      )
+    ) {
+      return "claude_permission_mode";
+    }
+    if (
+      adapterType === "codex_local"
+      && (
+        adapterConfig.dangerouslyBypassApprovalsAndSandbox === true
+        || adapterConfig.dangerouslyBypassSandbox === true
+        || extraArgs.some(
+          (arg) => arg === CODEX_GLOBAL_BYPASS_FLAG
+            || arg.startsWith(`${CODEX_GLOBAL_BYPASS_FLAG}=`),
+        )
+      )
+    ) {
+      return "codex_approvals_and_sandbox";
+    }
+    return null;
+  }
+
+  function hasCurrentCompletePermissionException(
+    permissions: unknown,
+    requiredBypass: GovernedPermissionBypass,
+    now = new Date(),
+  ): boolean {
+    const permissionRecord = asRecord(permissions);
+    const bypassPolicy = asRecord(permissionRecord?.bypass);
+    const expectsClaude = requiredBypass === "claude_permission_mode";
+    if (
+      bypassPolicy?.claudePermissionMode !== expectsClaude
+      || bypassPolicy?.codexApprovalsAndSandbox !== !expectsClaude
+    ) {
+      return false;
+    }
+
+    const exception = asRecord(permissionRecord?.exception);
+    if (exception?.kind !== "approved" || !isUuidValue(exception.exceptionIssueId)) {
+      return false;
+    }
+
+    const owner = asRecord(exception.owner);
+    const validOwner = owner?.ownerType === "agent"
+      ? isUuidValue(owner.ownerAgentId)
+        && owner.ownerUserId === undefined
+        && owner.ownerRoleSlug === undefined
+      : owner?.ownerType === "board_user"
+        ? Boolean(asNonEmptyString(owner.ownerUserId))
+          && owner.ownerAgentId === undefined
+          && owner.ownerRoleSlug === undefined
+        : owner?.ownerType === "board_role"
+          ? Boolean(asNonEmptyString(owner.ownerRoleSlug))
+            && owner.ownerAgentId === undefined
+            && owner.ownerUserId === undefined
+          : false;
+    if (!validOwner) return false;
+
+    const scope = asRecord(exception.scope);
+    const cwdRoots = Array.isArray(scope?.cwdRoots) ? scope.cwdRoots : null;
+    const tools = Array.isArray(scope?.tools) ? scope.tools : null;
+    const networkHosts = Array.isArray(scope?.networkHosts) ? scope.networkHosts : null;
+    const bypasses = Array.isArray(scope?.bypasses) ? scope.bypasses : null;
+    if (
+      !cwdRoots
+      || !cwdRoots.every((value) => typeof value === "string" && path.isAbsolute(value))
+      || !tools
+      || !tools.every((value) => Boolean(asNonEmptyString(value)))
+      || !networkHosts
+      || !networkHosts.every(
+        (value) => typeof value === "string"
+          && /^[a-z0-9.-]+$/i.test(value)
+          && !value.includes(".."),
+      )
+      || !bypasses
+      || bypasses.length !== 1
+      || bypasses[0] !== requiredBypass
+    ) {
+      return false;
+    }
+
+    if (!asNonEmptyString(exception.justification)) return false;
+    const evidence = asRecord(exception.evidence);
+    if (
+      !isUuidValue(evidence?.canaryIssueId)
+      || !isUuidValue(evidence?.runId)
+      || typeof evidence?.configFingerprint !== "string"
+      || !/^[a-f0-9]{64}$/.test(evidence.configFingerprint)
+      || evidence.result !== "passed"
+    ) {
+      return false;
+    }
+
+    if (
+      typeof exception.approvedAt !== "string"
+      || typeof exception.expiresAt !== "string"
+    ) {
+      return false;
+    }
+    const approvedAt = new Date(exception.approvedAt).getTime();
+    const expiresAt = new Date(exception.expiresAt).getTime();
+    const nowMs = now.getTime();
+    const maxExceptionMs = 30 * 24 * 60 * 60 * 1_000;
+    return Number.isFinite(approvedAt)
+      && Number.isFinite(expiresAt)
+      && approvedAt <= nowMs
+      && expiresAt > nowMs
+      && expiresAt > approvedAt
+      && expiresAt - approvedAt <= maxExceptionMs;
+  }
+
+  async function isActualCompanyBoardUser(companyId: string, userId: string) {
+    const [membership, user] = await Promise.all([
+      access.getMembership(companyId, "user", userId),
+      db
+        .select({ id: authUsers.id })
+        .from(authUsers)
+        .where(eq(authUsers.id, userId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    return Boolean(user?.id === userId && membership?.status === "active");
+  }
+
+  async function hasCompanyBoundPermissionOwner(
+    companyId: string,
+    owner: Record<string, unknown>,
+  ) {
+    if (owner.ownerType === "agent") {
+      const ownerAgentId = asNonEmptyString(owner.ownerAgentId);
+      if (!ownerAgentId) return false;
+      const ownerAgent = await svc.getById(ownerAgentId);
+      return ownerAgent?.companyId === companyId && ownerAgent.status !== "terminated";
+    }
+    if (owner.ownerType === "board_user") {
+      const ownerUserId = asNonEmptyString(owner.ownerUserId);
+      return ownerUserId ? isActualCompanyBoardUser(companyId, ownerUserId) : false;
+    }
+    if (owner.ownerType === "board_role") {
+      const ownerRoleSlug = asNonEmptyString(owner.ownerRoleSlug);
+      if (!ownerRoleSlug) return false;
+      const members = await access.listMembers(companyId);
+      const candidates = members.filter(
+        (member) => member.principalType === "user"
+          && member.status === "active"
+          && member.membershipRole === ownerRoleSlug,
+      );
+      for (const candidate of candidates) {
+        if (await isActualCompanyBoardUser(companyId, candidate.principalId)) return true;
+      }
+    }
+    return false;
+  }
+
+  function permissionGovernanceError(code: string, message: string): never {
+    throw badRequest(message, { code });
+  }
+
+  function assertAdapterSecurityConfigFailClosed(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown>,
+  ) {
+    try {
+      if (adapterType === "claude_local") {
+        assertClaudePermissionConfigIsFailClosed(adapterConfig);
+      } else if (adapterType === "codex_local") {
+        assertCodexPermissionConfigIsFailClosed(adapterConfig);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      permissionGovernanceError(
+        message.includes("Board-managed tool scope")
+          ? "claude_allowed_tools_board_manifest_required"
+          : "adapter_security_args_not_allowlisted",
+        message,
+      );
+    }
+  }
+
+  function sameStringArray(left: unknown, right: unknown): boolean {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => typeof value === "string" && value === right[index]);
+  }
+
+  function isPathWithinRoot(candidate: string, root: string) {
+    const relative = path.relative(path.resolve(root), path.resolve(candidate));
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  }
+
+  function readRunEffectiveConfigFingerprint(run: unknown): string | null {
+    const resultJson = asRecord(asRecord(run)?.resultJson);
+    const configFreshness = asRecord(resultJson?.configFreshness);
+    const session = asRecord(configFreshness?.session);
+    const fingerprint = asNonEmptyString(session?.nextFingerprint);
+    const match = fingerprint?.match(/^v1:sha256:([a-f0-9]{64})$/);
+    return match?.[1] ?? null;
+  }
+
+  function readRunAgentConfigurationFingerprint(run: unknown): string | null {
+    const resultJson = asRecord(asRecord(run)?.resultJson);
+    const configFreshness = asRecord(resultJson?.configFreshness);
+    const session = asRecord(configFreshness?.session);
+    const fingerprint = asNonEmptyString(session?.agentConfigurationFingerprint);
+    return fingerprint && /^v1:sha256:[a-f0-9]{64}$/.test(fingerprint) ? fingerprint : null;
+  }
+
+  async function pathIsContainedWithoutSymlinks(candidate: string, root: string) {
+    const lexicalRoot = path.resolve(root);
+    const lexicalCandidate = path.resolve(candidate);
+    if (!isPathWithinRoot(lexicalCandidate, lexicalRoot)) return false;
+    try {
+      const rootStat = await fs.lstat(lexicalRoot);
+      if (rootStat.isSymbolicLink()) return false;
+      const relative = path.relative(lexicalRoot, lexicalCandidate);
+      let cursor = lexicalRoot;
+      for (const segment of relative.split(path.sep).filter(Boolean)) {
+        cursor = path.join(cursor, segment);
+        const stat = await fs.lstat(cursor);
+        if (stat.isSymbolicLink()) return false;
+      }
+      const [realRoot, realCandidate] = await Promise.all([
+        fs.realpath(lexicalRoot),
+        fs.realpath(lexicalCandidate),
+      ]);
+      return isPathWithinRoot(realCandidate, realRoot);
+    } catch {
+      return false;
+    }
+  }
+
+  function boardApprovalMatchesException(input: {
+    approval: Record<string, unknown>;
+    agentId: string;
+    companyId: string;
+    requiredBypass: GovernedPermissionBypass;
+    exception: Record<string, unknown>;
+    evidence: Record<string, unknown>;
+    agentConfigurationFingerprint: string;
+  }) {
+    const payload = asRecord(input.approval.payload);
+    const payloadScope = asRecord(payload?.scope);
+    const exceptionScope = asRecord(input.exception.scope);
+    return input.approval.companyId === input.companyId
+      && input.approval.type === "request_board_approval"
+      && input.approval.status === "approved"
+      && Boolean(asNonEmptyString(input.approval.decidedByUserId))
+      && input.approval.decidedAt != null
+      && new Date(input.approval.decidedAt as string | Date).getTime()
+        === new Date(String(input.exception.approvedAt)).getTime()
+      && payload?.action === "agent_permission_exception"
+      && payload.agentId === input.agentId
+      && payload.configFingerprint === input.evidence.configFingerprint
+      && payload.agentConfigurationFingerprint === input.agentConfigurationFingerprint
+      && payload.expiresAt === input.exception.expiresAt
+      && sameStringArray(payload.bypasses, [input.requiredBypass])
+      && sameStringArray(payloadScope?.cwdRoots, exceptionScope?.cwdRoots)
+      && sameStringArray(payloadScope?.tools, exceptionScope?.tools)
+      && sameStringArray(payloadScope?.networkHosts, exceptionScope?.networkHosts)
+      && sameStringArray(payloadScope?.bypasses, exceptionScope?.bypasses);
+  }
+
+  async function assertPermissionBypassGoverned(input: {
+    agentId: string;
+    companyId: string;
+    adapterType: string | null | undefined;
+    adapterConfig: Record<string, unknown>;
+    runtimeConfig: Record<string, unknown>;
+    permissions: unknown;
+  }) {
+    let governedAdapterConfig = input.adapterConfig;
+    let requiredBypass = requiredPermissionBypass(input.adapterType, governedAdapterConfig);
+    if (!requiredBypass) {
+      for (const profile of listRuntimeModelProfileAdapterConfigs(input.runtimeConfig)) {
+        const effectiveProfileConfig = { ...input.adapterConfig, ...profile.adapterConfig };
+        requiredBypass = requiredPermissionBypass(input.adapterType, effectiveProfileConfig);
+        if (requiredBypass) {
+          governedAdapterConfig = effectiveProfileConfig;
+          break;
+        }
+      }
+    }
+    if (!requiredBypass) {
+      assertAdapterSecurityConfigFailClosed(input.adapterType, input.adapterConfig);
+      for (const profile of listRuntimeModelProfileAdapterConfigs(input.runtimeConfig)) {
+        assertAdapterSecurityConfigFailClosed(input.adapterType, {
+          ...input.adapterConfig,
+          ...profile.adapterConfig,
+        });
+      }
+      return;
+    }
+    const rejectIncomplete = (): never => permissionGovernanceError(
+      "permission_exception_incomplete",
+      `Explicit ${requiredBypass} bypass requires a current complete lifecycle permission exception`,
+    );
+    if (!hasCurrentCompletePermissionException(input.permissions, requiredBypass)) rejectIncomplete();
+
+    const permissions = asRecord(input.permissions);
+    const exception = asRecord(permissions?.exception);
+    const owner = asRecord(exception?.owner);
+    const evidence = asRecord(exception?.evidence);
+    const exceptionIssueId = asNonEmptyString(exception?.exceptionIssueId);
+    const canaryIssueId = asNonEmptyString(evidence?.canaryIssueId);
+    const runId = asNonEmptyString(evidence?.runId);
+    const scope = asRecord(exception?.scope);
+    if (!owner || !scope || !exceptionIssueId || !canaryIssueId || !runId) rejectIncomplete();
+    const boundOwner = owner as Record<string, unknown>;
+    const boundScope = scope as Record<string, unknown>;
+    const boundExceptionIssueId = exceptionIssueId as string;
+    const boundCanaryIssueId = canaryIssueId as string;
+    const boundRunId = runId as string;
+
+    const [ownerValid, exceptionIssue, canaryIssue, run, linkedApprovals] = await Promise.all([
+      hasCompanyBoundPermissionOwner(input.companyId, boundOwner),
+      issuesSvc.getById(boundExceptionIssueId),
+      issuesSvc.getById(boundCanaryIssueId),
+      heartbeat.getRun(boundRunId),
+      issueApprovalsSvc.listApprovalsForIssue(boundExceptionIssueId),
+    ]);
+    const runContext = asRecord(run?.contextSnapshot);
+    const runWorkspace = asRecord(runContext?.paperclipWorkspace);
+    if (
+      !ownerValid
+      || exceptionIssue?.id !== boundExceptionIssueId
+      || exceptionIssue.companyId !== input.companyId
+      || canaryIssue?.id !== boundCanaryIssueId
+      || canaryIssue.companyId !== input.companyId
+      || canaryIssue.assigneeAgentId !== input.agentId
+      || canaryIssue.status !== "done"
+      || canaryIssue.executionRunId !== boundRunId
+      || run?.id !== boundRunId
+      || run.companyId !== input.companyId
+      || run.agentId !== input.agentId
+      || run.status !== "succeeded"
+      || runContext?.issueId !== boundCanaryIssueId
+    ) {
+      permissionGovernanceError(
+        "permission_exception_canary_invalid",
+        "The permission exception canary issue and successful run must be bound to this agent and company",
+      );
+    }
+
+    const runFingerprint = readRunEffectiveConfigFingerprint(run);
+    if (!runFingerprint || evidence?.configFingerprint !== runFingerprint) {
+      permissionGovernanceError(
+        "permission_exception_run_fingerprint_mismatch",
+        "The permission exception must match the canary run's persisted effective-run-config fingerprint",
+      );
+    }
+
+    const canaryAgentConfigurationFingerprint = readRunAgentConfigurationFingerprint(run);
+    const currentAgentConfigurationFingerprint = createAgentConfigurationFingerprint({
+      adapterType: input.adapterType ?? "",
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+    });
+    if (
+      !canaryAgentConfigurationFingerprint
+      || currentAgentConfigurationFingerprint !== canaryAgentConfigurationFingerprint
+    ) {
+      permissionGovernanceError(
+        "permission_exception_current_config_fingerprint_mismatch",
+        "The current adapter and runtime model-profile configuration must exactly match the canary configuration",
+      );
+    }
+
+    const approval = linkedApprovals.find((candidate) => boardApprovalMatchesException({
+      approval: candidate as Record<string, unknown>,
+      agentId: input.agentId,
+      companyId: input.companyId,
+      requiredBypass,
+      exception: exception as Record<string, unknown>,
+      evidence: evidence as Record<string, unknown>,
+      agentConfigurationFingerprint: currentAgentConfigurationFingerprint,
+    })) as Record<string, unknown> | undefined;
+    const decidedByUserId = approval ? asNonEmptyString(approval.decidedByUserId) : null;
+    if (!approval || !decidedByUserId || !(await isActualCompanyBoardUser(input.companyId, decidedByUserId))) {
+      permissionGovernanceError(
+        "permission_exception_board_approval_missing",
+        "The permission exception requires a linked, completed Board approval decision",
+      );
+    }
+
+    const actualCwd = asNonEmptyString(runWorkspace?.cwd);
+    const cwdRoots = Array.isArray(boundScope.cwdRoots)
+      ? boundScope.cwdRoots.filter((value): value is string => typeof value === "string")
+      : [];
+    const cwdContained = actualCwd && path.isAbsolute(actualCwd)
+      ? (await Promise.all(cwdRoots.map((root) => pathIsContainedWithoutSymlinks(actualCwd, root)))).some(Boolean)
+      : false;
+    if (!cwdContained) {
+      permissionGovernanceError(
+        "permission_exception_cwd_scope_mismatch",
+        "The canary run's actual working directory is outside the approved roots",
+      );
+    }
+
+    if (Array.isArray(boundScope.networkHosts) && boundScope.networkHosts.length > 0) {
+      permissionGovernanceError(
+        "permission_exception_network_scope_unenforceable",
+        "Host-level network scopes are not enforceable by the current Claude and Codex runtimes",
+      );
+    }
+
+    if (input.adapterType === "claude_local") {
+      const allowedTools = Array.isArray(governedAdapterConfig.allowedTools)
+        ? governedAdapterConfig.allowedTools.filter((value): value is string => typeof value === "string")
+        : [];
+      if (!sameStringArray(boundScope.tools, allowedTools)) {
+        permissionGovernanceError(
+          "permission_exception_tool_scope_mismatch",
+          "Claude allowedTools must exactly match the approved and canary-tested tool scope",
+        );
+      }
+    }
+
+    permissionGovernanceError(
+      "global_permission_bypass_unenforceable",
+      "Global Claude/Codex permission and sandbox bypasses are disabled because their declared scopes cannot be enforced at runtime",
+    );
+  }
+
+  function mergeAgentPermissionPatch(existing: unknown, patchValue: unknown) {
+    const current = asRecord(existing) ?? {};
+    const patch = asRecord(patchValue) ?? {};
+    const merged: Record<string, unknown> = { ...current, ...patch };
+    const currentBypass = asRecord(current.bypass);
+    const patchBypass = asRecord(patch.bypass);
+    if (patchBypass) merged.bypass = { ...(currentBypass ?? {}), ...patchBypass };
+
+    const patchException = asRecord(patch.exception);
+    if (patchException) {
+      if (patchException.kind === "none") {
+        merged.exception = { kind: "none" };
+      } else {
+        const currentException = asRecord(current.exception) ?? {};
+        const nextException: Record<string, unknown> = { ...currentException, ...patchException };
+        for (const field of ["owner", "scope", "evidence"] as const) {
+          const nestedPatch = asRecord(patchException[field]);
+          if (nestedPatch) {
+            nextException[field] = {
+              ...(asRecord(currentException[field]) ?? {}),
+              ...nestedPatch,
+            };
+          }
+        }
+        merged.exception = nextException;
+      }
+    }
+    return merged;
+  }
+
   function parseNumberLike(value: unknown): number | null {
     if (typeof value === "number" && Number.isFinite(value)) return value;
     if (typeof value !== "string") return null;
@@ -1141,6 +1825,16 @@ export function agentRoutes(
     return privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   }
 
+  function hasConfiguredGatewayDeviceKey(value: unknown): boolean {
+    if (asNonEmptyString(value)) return true;
+    const binding = asRecord(value);
+    if (binding?.type === "plain") return asNonEmptyString(binding.value) !== null;
+    if (binding?.type === "secret_ref") return asNonEmptyString(binding.secretId) !== null;
+    // Preserve unsupported binding shapes so the secret normalizer rejects
+    // them instead of silently replacing operator input with a new literal.
+    return binding?.type === "user_secret_ref";
+  }
+
   function ensureGatewayDeviceKey(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
@@ -1148,7 +1842,7 @@ export function agentRoutes(
     if (adapterType !== "openclaw_gateway") return adapterConfig;
     const disableDeviceAuth = parseBooleanLike(adapterConfig.disableDeviceAuth) === true;
     if (disableDeviceAuth) return adapterConfig;
-    if (asNonEmptyString(adapterConfig.devicePrivateKeyPem)) return adapterConfig;
+    if (hasConfiguredGatewayDeviceKey(adapterConfig.devicePrivateKeyPem)) return adapterConfig;
     return { ...adapterConfig, devicePrivateKeyPem: generateEd25519PrivateKeyPem() };
   }
 
@@ -1207,6 +1901,12 @@ export function agentRoutes(
       }
       if (!asNonEmptyString(next.nonInteractivePermissions)) {
         next.nonInteractivePermissions = DEFAULT_ACPX_LOCAL_NON_INTERACTIVE_PERMISSIONS;
+      }
+      return ensureGatewayDeviceKey(adapterType, next);
+    }
+    if (adapterType === "claude_local") {
+      if (typeof next.dangerouslySkipPermissions !== "boolean") {
+        next.dangerouslySkipPermissions = false;
       }
       return ensureGatewayDeviceKey(adapterType, next);
     }
@@ -1635,6 +2335,13 @@ export function agentRoutes(
         undefined,
         { adapterType: type },
       );
+      if (requiredPermissionBypass(type, runtimeAdapterConfig)) {
+        permissionGovernanceError(
+          "global_permission_bypass_unenforceable",
+          "Global Claude/Codex permission and sandbox bypasses are disabled for environment probes",
+        );
+      }
+      assertAdapterSecurityConfigFailClosed(type, runtimeAdapterConfig);
 
       const { executionTarget, environmentName, fallbackChecks, release } =
         await resolveAdapterTestExecutionContext({
@@ -2028,6 +2735,33 @@ export function agentRoutes(
     res.json(rows);
   });
 
+  // Register the dynamic-id mutation guard after every static /agents/me
+  // route. Otherwise Express resolves `me` through router.param("id") for
+  // this middleware before the static self route can handle the request.
+  router.use("/agents/:id", (req, _res, next) => {
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
+      next();
+      return;
+    }
+
+    const routePath = req.originalUrl.split("?", 1)[0] ?? "";
+    if (
+      req.method === "POST" &&
+      (routePath.endsWith("/retirement-preflight") || routePath.endsWith("/retirement-postcheck"))
+    ) {
+      next();
+      return;
+    }
+
+    const agentId = req.params.id as string;
+    if (/\/agents\/[^/]+\/(?:permissions|keys)(?:\/|$)/.test(routePath)) {
+      assertHistoricalAgentTombstoneAccessMutable(agentId);
+    } else {
+      assertHistoricalAgentTombstoneMutable(agentId);
+    }
+    next();
+  });
+
   router.get("/agents/:id", async (req, res) => {
     const id = req.params.id as string;
     const agent = await svc.getById(id);
@@ -2245,6 +2979,14 @@ export function agentRoutes(
       normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig),
       normalizedAdapterConfig,
     );
+    await assertPermissionBypassGoverned({
+      agentId: hiredAgentId,
+      companyId,
+      adapterType: hireInput.adapterType,
+      adapterConfig: normalizedAdapterConfig,
+      runtimeConfig: normalizedRuntimeConfig,
+      permissions: hireInput.permissions,
+    });
     const normalizedHireInput = {
       ...hireInput,
       adapterConfig: normalizedAdapterConfig,
@@ -2356,10 +3098,11 @@ export function agentRoutes(
       trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
     }
 
-    await applyDefaultAgentTaskAssignGrant(
+    await applyAgentTaskAssignGrant(
       companyId,
-      agent.id,
+      agent,
       actor.actorType === "user" ? actor.actorId : null,
+      { allowPendingApproval: agent.status === "pending_approval" },
     );
 
     if (approval) {
@@ -2438,6 +3181,14 @@ export function agentRoutes(
       normalizeNewAgentRuntimeConfig(createInput.runtimeConfig),
       normalizedAdapterConfig,
     );
+    await assertPermissionBypassGoverned({
+      agentId,
+      companyId,
+      adapterType: createInput.adapterType,
+      adapterConfig: normalizedAdapterConfig,
+      runtimeConfig: normalizedRuntimeConfig,
+      permissions: createInput.permissions,
+    });
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
       allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
@@ -2476,9 +3227,9 @@ export function agentRoutes(
       trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
     }
 
-    await applyDefaultAgentTaskAssignGrant(
+    await applyAgentTaskAssignGrant(
       companyId,
-      agent.id,
+      agent,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
 
@@ -2505,30 +3256,35 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    assertCompanyAccess(req, existing.companyId);
+    await assertCanManageAgentPermissions(req, existing);
 
-    if (req.actor.type === "agent") {
-      const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
-      if (!actorAgent || actorAgent.companyId !== existing.companyId) {
-        res.status(403).json({ error: "Forbidden" });
-        return;
-      }
-      if (actorAgent.role !== "ceo") {
-        res.status(403).json({ error: "Only CEO can manage permissions" });
-        return;
-      }
-    } else {
-      await assertBoardCanManageAgentsForCompany(req, existing.companyId);
-    }
+    const currentCanAssignTasks = await access.hasPermission(
+      existing.companyId,
+      "agent",
+      existing.id,
+      "tasks:assign",
+    );
+    const effectivePermissions = mergeAgentPermissionPatch(existing.permissions, req.body);
+    const requestedCanAssignTasks = typeof req.body.canAssignTasks === "boolean"
+      ? req.body.canAssignTasks
+      : asRecord(existing.permissions)?.canAssignTasks === true || currentCanAssignTasks;
+    const effectiveCanAssignTasks = existing.role === "ceo" || requestedCanAssignTasks;
+    effectivePermissions.canAssignTasks = effectiveCanAssignTasks;
+    await assertPermissionBypassGoverned({
+      agentId: existing.id,
+      companyId: existing.companyId,
+      adapterType: existing.adapterType,
+      adapterConfig: asRecord(existing.adapterConfig) ?? {},
+      runtimeConfig: asRecord(existing.runtimeConfig) ?? {},
+      permissions: effectivePermissions,
+    });
 
-    const agent = await svc.updatePermissions(id, req.body);
+    const agent = await svc.updatePermissions(id, effectivePermissions as Record<string, unknown> & { canCreateAgents: boolean });
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
 
-    const effectiveCanAssignTasks =
-      agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
     await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
     await access.setPrincipalPermission(
       agent.companyId,
@@ -2811,14 +3567,39 @@ export function agentRoutes(
     }
     await assertCanUpdateAgent(req, existing);
 
-    if (hasOwn(req.body as object, "permissions")) {
+    const patchData = { ...(req.body as Record<string, unknown>) };
+    const lifecycleTransition = patchData.lifecycleTransition as AgentLifecycleTransition | undefined;
+    delete patchData.lifecycleTransition;
+    if (lifecycleTransition) assertBoard(req);
+    const requestMetadata = Object.prototype.hasOwnProperty.call(patchData, "metadata")
+      ? asRecord(patchData.metadata)
+      : null;
+    if (
+      patchData.metadata === null
+      && Object.prototype.hasOwnProperty.call(asRecord(existing.metadata) ?? {}, "lifecycle")
+    ) {
+      throw unprocessable("An existing lifecycle contract cannot be removed", {
+        code: "agent_lifecycle_removal_forbidden",
+      });
+    }
+    if (requestMetadata) {
+      const mergedMetadata = {
+        ...(asRecord(existing.metadata) ?? {}),
+        ...requestMetadata,
+      };
+      if (lifecycleTransition?.mode === "reviewed_passed_revalidation") {
+        for (const key of SERVER_MANAGED_AGENT_LIFECYCLE_GATE_KEYS) {
+          delete mergedMetadata[key];
+        }
+      }
+      patchData.metadata = mergedMetadata;
+    }
+    const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
+    delete patchData.replaceAdapterConfig;
+    if (hasOwn(patchData, "permissions")) {
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
       return;
     }
-
-    const patchData = { ...(req.body as Record<string, unknown>) };
-    const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
-    delete patchData.replaceAdapterConfig;
     if (hasOwn(patchData, "adapterConfig")) {
       const adapterConfig = asRecord(patchData.adapterConfig);
       if (!adapterConfig) {
@@ -2909,6 +3690,58 @@ export function agentRoutes(
         baseAdapterConfig,
       );
     }
+    const lifecycleCandidate = {
+      ...existing,
+      ...patchData,
+      adapterType: requestedAdapterType,
+      adapterConfig: asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {},
+      runtimeConfig: asRecord(patchData.runtimeConfig) ?? asRecord(existing.runtimeConfig) ?? {},
+      permissions: existing.permissions,
+      metadata: Object.prototype.hasOwnProperty.call(patchData, "metadata")
+        ? patchData.metadata
+        : existing.metadata,
+    };
+    if (
+      lifecycleTransition
+      || Boolean(requestMetadata && Object.prototype.hasOwnProperty.call(requestMetadata, "lifecycle"))
+    ) {
+      const transitionResult = validateAgentLifecyclePatchTransition({
+        previousLifecycle: (asRecord(existing.metadata) ?? {}).lifecycle,
+        nextLifecycle: (asRecord(lifecycleCandidate.metadata) ?? {}).lifecycle,
+        transition: lifecycleTransition,
+        currentAgentUpdatedAt: existing.updatedAt,
+        nextAgentStatus: typeof lifecycleCandidate.status === "string"
+          ? lifecycleCandidate.status
+          : existing.status,
+        fingerprintRelevantChange: ["adapterType", "adapterConfig", "runtimeConfig", "permissions"]
+          .some((key) => Object.prototype.hasOwnProperty.call(patchData, key)),
+      });
+      if (!transitionResult.ok) {
+        throw conflict("Agent lifecycle transition is not allowed through a board/config PATCH", {
+          code: "agent_lifecycle_transition_forbidden",
+          reason: transitionResult.reason,
+        });
+      }
+    }
+    const lifecycleGateRefresh = lifecycleTransition?.mode === "reviewed_passed_revalidation"
+      ? null
+      : await refreshLifecycleReceiptForPatch({
+          existing,
+          candidate: lifecycleCandidate,
+          patchData,
+          requestMetadata,
+        });
+    if (patchData.status === "idle") {
+      await assertLifecycleGate(lifecycleCandidate);
+    }
+    await assertPermissionBypassGoverned({
+      agentId: existing.id,
+      companyId: existing.companyId,
+      adapterType: requestedAdapterType,
+      adapterConfig: asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {},
+      runtimeConfig: asRecord(patchData.runtimeConfig) ?? asRecord(existing.runtimeConfig) ?? {},
+      permissions: existing.permissions,
+    });
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
       await assertAgentDefaultEnvironmentSelection(
         existing.companyId,
@@ -2923,13 +3756,21 @@ export function agentRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agent = await svc.update(id, patchData, {
+    const updateOptions = {
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         source: "patch",
       },
-    });
+      ...(lifecycleTransition ? { lifecycleTransition } : {}),
+    };
+    const agent = lifecycleGateRefresh
+      ? await svc.updateLifecycleGate(id, patchData, {
+          ...updateOptions,
+          lifecycleGate: lifecycleGateRefresh.lifecycleGate,
+          expectedAgentUpdatedAt: existing.updatedAt.toISOString(),
+        })
+      : await svc.update(id, patchData, updateOptions);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -2944,19 +3785,186 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: {
+        ...summarizeAgentUpdateDetails(patchData),
+        ...(lifecycleTransition ? { lifecycleTransition } : {}),
+      },
     });
 
     res.json(agent);
   });
 
-  router.post("/agents/:id/pause", async (req, res) => {
+  router.get(
+    "/agents/:id/adapter-secrets/externalization-preflight",
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      const existing = await svc.getById(id);
+      if (!existing) {
+        res.status(404).json({ error: "Agent not found" });
+        return;
+      }
+      await assertBoardCanManageAgentsForCompany(req, existing.companyId);
+      res.json(await adapterSecretExternalization.preflight(id, existing.companyId));
+    },
+  );
+
+  router.post(
+    "/agents/:id/adapter-secrets/externalization-proof",
+    validate(adapterSecretExternalizationProofSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      const existing = await svc.getById(id);
+      if (!existing) {
+        res.status(404).json({ error: "Agent not found" });
+        return;
+      }
+      await assertBoardCanManageAgentsForCompany(req, existing.companyId);
+      if (req.body.expectedCompanyId !== existing.companyId) {
+        throw conflict("Agent company does not match adapter secret proof request", {
+          code: "agent_adapter_secret_company_mismatch",
+        });
+      }
+      res.json(await adapterSecretExternalization.proof(
+        id,
+        existing.companyId,
+        req.body.expectedReceipt,
+      ));
+    },
+  );
+
+  router.post(
+    "/agents/:id/adapter-secrets/externalize",
+    validate(adapterSecretExternalizationSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      const existing = await svc.getById(id);
+      if (!existing) {
+        res.status(404).json({ error: "Agent not found" });
+        return;
+      }
+      await assertBoardCanManageAgentsForCompany(req, existing.companyId);
+      if (req.body.expectedCompanyId !== existing.companyId) {
+        throw conflict("Agent company does not match adapter secret externalization request", {
+          code: "agent_adapter_secret_company_mismatch",
+        });
+      }
+      const actor = getActorInfo(req);
+      const result = await adapterSecretExternalization.externalize(
+        id,
+        req.body,
+        { userId: actor.actorType === "user" ? actor.actorId : null },
+      );
+
+      await logActivity(db, {
+        companyId: result.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "agent.adapter_secrets_externalized",
+        entityType: "agent",
+        entityId: result.agentId,
+        details: {
+          createdSecretCount: result.createdSecretCount,
+          createdSecretIds: result.createdSecretIds,
+          removedHeaderCount: result.removedHeaderCount,
+          removedHeaderPaths: result.removedHeaderPaths,
+          secretRefCount: result.secretRefCount,
+          secretRefPaths: result.secretRefPaths,
+          secretIds: result.secretIds,
+          configFingerprint: result.configFingerprint,
+          preflightReceipt: result.preflightReceipt,
+          proofReceipt: result.proof.receipt,
+          updatedAt: result.updatedAt,
+        },
+      });
+
+      res.json(result);
+    },
+  );
+
+  router.get("/agents/:id/lifecycle-canary-preflight", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const existing = await getAccessibleAgent(req, res, id);
+    if (!existing) return;
+    await assertBoardCanManageAgentsForCompany(req, existing.companyId);
+
+    const blockers: Array<{ code: string; message: string }> = [];
+    if (existing.status !== "paused") {
+      blockers.push({
+        code: "agent_not_paused",
+        message: "Lifecycle canary bootstrap requires a paused agent.",
+      });
+    }
+    const metadata = asRecord(existing.metadata) ?? {};
+    const lifecycleResult = agentLifecycleSchema.safeParse(metadata.lifecycle);
+    let canaryIssueId: string | null = null;
+    let configFingerprint: string | null = null;
+    if (!lifecycleResult.success) {
+      blockers.push({ code: "lifecycle_invalid", message: "The lifecycle contract is structurally invalid." });
+    } else if (lifecycleResult.data.lastCanaryResult !== "pending") {
+      blockers.push({
+        code: "lifecycle_not_pending",
+        message: "A failed or passed lifecycle requires an explicit reviewed PATCH before another pending canary.",
+      });
+      canaryIssueId = lifecycleResult.data.canaryIssueId;
+    } else if (!lifecycleResult.data.canaryIssueId) {
+      blockers.push({
+        code: "canary_issue_missing",
+        message: "Patch a reviewed canary issue UUID into the pending lifecycle contract first.",
+      });
+    } else {
+      canaryIssueId = lifecycleResult.data.canaryIssueId;
+      try {
+        configFingerprint = computeAgentLifecycleConfigFingerprint(
+          await buildLifecycleFingerprintInput(existing),
+        );
+      } catch (error) {
+        blockers.push({
+          code: "fingerprint_unavailable",
+          message: error instanceof Error ? error.message : "Current lifecycle fingerprint could not be calculated.",
+        });
+      }
+      const isolation = await heartbeat.inspectLifecycleCanaryIsolation({
+        agentId: existing.id,
+        companyId: existing.companyId,
+        canaryIssueId,
+      });
+      blockers.push(...isolation.blockers);
+    }
+
+    res.json({
+      agentId: existing.id,
+      companyId: existing.companyId,
+      canaryIssueId,
+      ready: blockers.length === 0 && configFingerprint !== null,
+      blockers,
+      configFingerprint,
+      agentUpdatedAt: existing.updatedAt.toISOString(),
+    });
+  });
+
+  router.post("/agents/:id/pause", validate(pauseAgentSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     if (!(await getAccessibleAgent(req, res, id))) {
       return;
     }
-    const agent = await svc.pause(id);
+    if (isAgentRetirementSource(id)) {
+      throw conflict("This agent requires the gated retirement workflow", {
+        code: "retirement_gated_termination_required",
+        sourceAgentId: id,
+      });
+    }
+    const pauseReason = req.body.reason as "manual" | "maintenance";
+    const maintenanceOptions = pauseReason === "maintenance"
+      ? { maintenanceOperationId: req.body.operationId as string }
+      : undefined;
+    const agent = await svc.pause(id, pauseReason, maintenanceOptions);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -2971,12 +3979,15 @@ export function agentRoutes(
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
+      details: pauseReason === "maintenance"
+        ? { pauseReason: agent.pauseReason, maintenanceOperationId: maintenanceOptions!.maintenanceOperationId }
+        : { pauseReason: agent.pauseReason },
     });
 
     res.json(agent);
   });
 
-  router.post("/agents/:id/resume", async (req, res) => {
+  router.post("/agents/:id/resume", validate(resumeAgentSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
@@ -2989,6 +4000,74 @@ export function agentRoutes(
       });
       return;
     }
+    if (req.body.mode === "pending_canary") {
+      await assertBoardCanManageAgentsForCompany(req, existing.companyId);
+      const expectedAgentUpdatedAt = new Date(req.body.expectedAgentUpdatedAt);
+      if (existing.updatedAt.getTime() !== expectedAgentUpdatedAt.getTime()) {
+        throw conflict("Agent changed after lifecycle canary preflight", {
+          code: "agent_lifecycle_canary_agent_changed",
+          currentAgentUpdatedAt: existing.updatedAt.toISOString(),
+        });
+      }
+      if (existing.status !== "paused") {
+        throw conflict("Lifecycle canary bootstrap requires a paused agent", {
+          code: "agent_lifecycle_canary_status_invalid",
+        });
+      }
+      const metadata = asRecord(existing.metadata) ?? {};
+      const lifecycleResult = agentLifecycleSchema.safeParse(metadata.lifecycle);
+      if (!lifecycleResult.success || lifecycleResult.data.lastCanaryResult !== "pending") {
+        throw conflict("Lifecycle canary bootstrap requires a pending lifecycle contract", {
+          code: "agent_lifecycle_canary_lifecycle_invalid",
+        });
+      }
+      if (lifecycleResult.data.canaryIssueId !== req.body.canaryIssueId) {
+        throw conflict("Pending lifecycle canary issue does not match the requested issue", {
+          code: "agent_lifecycle_canary_issue_mismatch",
+        });
+      }
+      const fingerprintInput = await buildLifecycleFingerprintInput(existing);
+      const currentConfigFingerprint = computeAgentLifecycleConfigFingerprint(fingerprintInput);
+      if (currentConfigFingerprint !== req.body.expectedConfigFingerprint) {
+        throw conflict("Expected lifecycle config fingerprint does not match current configuration", {
+          code: "agent_lifecycle_canary_fingerprint_mismatch",
+        });
+      }
+      const runId = randomUUID();
+      let receipt;
+      try {
+        receipt = createAgentLifecycleCanaryReceipt({
+          fingerprintInput,
+          canaryIssueId: req.body.canaryIssueId,
+          runId,
+          expectedConfigFingerprint: req.body.expectedConfigFingerprint,
+        });
+      } catch (error) {
+        throw conflict(
+          error instanceof Error ? error.message : "Lifecycle canary bootstrap validation failed",
+          { code: "agent_lifecycle_canary_policy_invalid" },
+        );
+      }
+      const queued = await heartbeat.enqueueLifecycleCanary({
+        agentId: existing.id,
+        companyId: existing.companyId,
+        canaryIssueId: req.body.canaryIssueId,
+        receipt,
+        expectedAgentUpdatedAt,
+        requestedByUserId: req.actor.userId ?? "board",
+        ...(req.body.systemReplacementProof
+          ? { systemReplacementProof: req.body.systemReplacementProof }
+          : {}),
+      });
+      res.status(202).json({
+        agentId: existing.id,
+        canaryIssueId: req.body.canaryIssueId,
+        runId: queued.run.id,
+        receiptExpiresAt: receipt.expiresAt,
+      });
+      return;
+    }
+    await assertLifecycleGate(existing);
     const agent = await svc.resume(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -3020,6 +4099,8 @@ export function agentRoutes(
       });
       return;
     }
+
+    await assertLifecycleGate(existing);
 
     const agent = await svc.clearError(id);
     if (!agent) {
@@ -3093,12 +4174,81 @@ export function agentRoutes(
     res.json(agent);
   });
 
+  router.post("/agents/:id/retirement-preflight", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!(await getAccessibleAgent(req, res, id))) return;
+    const parsed = z.union([
+      agentRetirementPreflightRequestSchema,
+      agentRetirementExecutionRecoveryRequestSchema,
+      agentRetirementEvidenceSchema,
+    ]).safeParse(req.body);
+    if (!parsed.success) {
+      throw badRequest("Retirement evidence is invalid", {
+        code: "retirement_evidence_invalid",
+        issues: parsed.error.issues,
+      });
+    }
+    res.json(await retirement.preflight(id, parsed.data, {
+      actorUserId: req.actor.userId ?? "board",
+    }));
+  });
+
+  router.post("/agents/:id/retirement-cleanup", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!(await getAccessibleAgent(req, res, id))) return;
+    const parsed = agentRetirementCleanupRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw badRequest("Retirement cleanup evidence is invalid", {
+        code: "retirement_cleanup_invalid",
+        issues: parsed.error.issues,
+      });
+    }
+    res.json(await retirement.cleanup(id, parsed.data, {
+      actorUserId: req.actor.userId ?? "board",
+    }));
+  });
+
+  router.post("/agents/:id/retirement-postcheck", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!(await getAccessibleAgent(req, res, id))) return;
+    const parsed = agentRetirementTerminationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw badRequest("Retirement termination evidence is invalid", {
+        code: "retirement_termination_invalid",
+        issues: parsed.error.issues,
+      });
+    }
+    res.json(await retirement.postcheck(id, parsed.data));
+  });
+
   router.post("/agents/:id/terminate", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
+    }
+    let authorizedRetirementAgent: Awaited<ReturnType<typeof svc.terminate>> = null;
+    let retirementGated = false;
+    if (isAgentRetirementSource(id)) {
+      retirementGated = true;
+      const parsed = agentRetirementTerminationSchema.safeParse(req.body);
+      if (!parsed.success) {
+        throw badRequest("Retirement termination evidence is invalid", {
+          code: "retirement_termination_invalid",
+          issues: parsed.error.issues,
+        });
+      }
+      const authorized = await retirement.terminateAuthorized(id, parsed.data, {
+        actorUserId: req.actor.userId ?? "board",
+      });
+      authorizedRetirementAgent = await svc.getById(authorized.agent.id);
+      if (!authorizedRetirementAgent) {
+        throw notFound("Agent not found");
+      }
     }
 
     // Terminating an agent that is still awaiting approval is the agent-detail
@@ -3107,8 +4257,8 @@ export function agentRoutes(
     // (clearing the inbox "Approve/Reject" card) and terminates the agent.
     // Mirror the approve path's branch-or-fallback so we never terminate twice:
     // reject() already calls agentsSvc.terminate() internally.
-    let agent: Awaited<ReturnType<typeof svc.terminate>> = null;
-    if (existing.status === "pending_approval") {
+    let agent: Awaited<ReturnType<typeof svc.terminate>> = authorizedRetirementAgent;
+    if (!agent && existing.status === "pending_approval") {
       const openApproval = await approvalsSvc.findOpenHireApprovalForAgent(existing.companyId, id);
       if (openApproval) {
         await approvalsSvc.reject(openApproval.id, req.actor.userId ?? "board");
@@ -3116,7 +4266,11 @@ export function agentRoutes(
       }
     }
     if (!agent) {
-      agent = await svc.terminate(id);
+      agent = await svc.terminate(id, {
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        source: "agent_terminate_route",
+      });
     }
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -3139,26 +4293,28 @@ export function agentRoutes(
       "Cancelled because the agent was terminated or became invalid-org-chain under a terminated manager",
     );
 
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
-      action: "agent.terminated",
-      entityType: "agent",
-      entityId: agent.id,
-      details: {
-        invalidOrgChain: {
-          descendantCount: invalidOrgChainDescendantIds.length,
-          descendantIds: invalidOrgChainDescendantIds,
-          state: invalidOrgChainDescendantIds.length > 0 ? "descendants_invalid_under_terminated_manager" : "none",
+    if (!retirementGated) {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "agent.termination_followup",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          invalidOrgChain: {
+            descendantCount: invalidOrgChainDescendantIds.length,
+            descendantIds: invalidOrgChainDescendantIds,
+            state: invalidOrgChainDescendantIds.length > 0 ? "descendants_invalid_under_terminated_manager" : "none",
+          },
+          cancellation: {
+            agentIds: cancellation.agentIds,
+            runsCancelled: cancellation.runsCancelled,
+            wakeupsCancelled: cancellation.wakeupsCancelled,
+          },
         },
-        cancellation: {
-          agentIds: cancellation.agentIds,
-          runsCancelled: cancellation.runsCancelled,
-          wakeupsCancelled: cancellation.wakeupsCancelled,
-        },
-      },
-    });
+      });
+    }
 
     res.json(agent);
   });
@@ -3168,6 +4324,11 @@ export function agentRoutes(
     const id = req.params.id as string;
     if (!(await getAccessibleAgent(req, res, id))) {
       return;
+    }
+    if (isAgentRetirementSource(id)) {
+      throw conflict("Retirement sources must retain their tombstone and historical attribution", {
+        code: "retirement_physical_delete_forbidden",
+      });
     }
     const agent = await svc.remove(id);
     if (!agent) {

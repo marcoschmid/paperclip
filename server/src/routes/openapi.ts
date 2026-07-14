@@ -10,9 +10,16 @@ import {
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   createAgentKeySchema,
+  pauseAgentSchema,
+  resumeAgentSchema,
   wakeAgentSchema,
   resetAgentSessionSchema,
   agentSkillSyncSchema,
+  agentRetirementCleanupRequestSchema,
+  agentRetirementEvidenceSchema,
+  agentRetirementExecutionRecoveryRequestSchema,
+  agentRetirementPreflightRequestSchema,
+  agentRetirementTerminationSchema,
   testAdapterEnvironmentSchema,
   // Issue
   createIssueSchema,
@@ -63,6 +70,14 @@ import {
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
+  approvalExecutionClaimConsumeRequestSchema,
+  approvalExecutionClaimExecutionReceiptSchema,
+  approvalExecutionClaimFinalizeRequestSchema,
+  approvalExecutionClaimFinalizationReceiptSchema,
+  approvalExecutionClaimRecoveryRequestSchema,
+  approvalExecutionClaimRecoveryReceiptSchema,
+  approvalExecutionClaimRequestSchema,
+  approvalExecutionClaimReceiptSchema,
   // Cost / budget
   createCostEventSchema,
   createFinanceEventSchema,
@@ -91,6 +106,8 @@ import {
   companySkillFileUpdateSchema,
   companySkillImportSchema,
   companySkillProjectScanRequestSchema,
+  companySkillResyncPreflightSchema,
+  companySkillResyncRequestSchema,
   // Issue tree
   createIssueTreeHoldSchema,
   previewIssueTreeControlSchema,
@@ -157,6 +174,7 @@ type OpenApiPathRegistration = {
   request?: {
     params?: z.ZodTypeAny;
     query?: z.ZodTypeAny;
+    headers?: z.ZodTypeAny;
     body?: {
       content: Record<string, { schema: unknown }>;
       required?: boolean;
@@ -239,6 +257,7 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
 
   if (typeName === "ZodBoolean") return { type: "boolean" };
   if (typeName === "ZodDate") return { type: "string", format: "date-time" };
+  if (typeName === "ZodNull") return { nullable: true, enum: [null] };
   if (typeName === "ZodAny" || typeName === "ZodUnknown") return {};
 
   if (typeName === "ZodLiteral") {
@@ -314,6 +333,7 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
     }
     const jsonSchema: JsonSchema = { type: "object", properties };
     if (required.length > 0) jsonSchema.required = required;
+    if (unwrapped._def.unknownKeys === "strict") jsonSchema.additionalProperties = false;
     return jsonSchema;
   }
 
@@ -360,7 +380,7 @@ function normalizeResponses(responses: Record<string, OpenApiResponse> = {}) {
   );
 }
 
-function parametersFromSchema(schema: z.ZodTypeAny, location: "path" | "query") {
+function parametersFromSchema(schema: z.ZodTypeAny, location: "path" | "query" | "header") {
   const objectSchema = unwrapSchema(schema);
   if (zodTypeName(objectSchema) !== "ZodObject") return [];
   const shape = objectSchema._def.shape();
@@ -399,6 +419,12 @@ class OpenAPIRegistry {
         normalizedOperation.parameters = [
           ...((normalizedOperation.parameters as unknown[]) ?? []),
           ...parametersFromSchema(request.query, "query"),
+        ];
+      }
+      if (request?.headers) {
+        normalizedOperation.parameters = [
+          ...((normalizedOperation.parameters as unknown[]) ?? []),
+          ...parametersFromSchema(request.headers, "header"),
         ];
       }
       if (request?.body) {
@@ -601,6 +627,206 @@ const workTimelineResponseSchema = z.object({
   }).strict(),
 }).strict();
 
+const maintenanceFingerprintSchema = z.string().regex(/^v1:sha256:[a-f0-9]{64}$/);
+const maintenanceAgentIdsSchema = z.array(z.string().uuid()).min(1).max(100);
+const maintenanceAgentIdsQuerySchema = z.object({
+  agentIds: z.string().regex(new RegExp(
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}" +
+    "(?:,[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}){0,99}$",
+  )),
+}).strict();
+const maintenanceLeaseTokenHeadersSchema = z.object({
+  "X-Paperclip-Maintenance-Lease": z.string().min(1).max(256),
+}).strict();
+const acquireMaintenanceLeaseRequestSchema = z.object({
+  scope: z.literal("codex_profile_migration"),
+  agentIds: maintenanceAgentIdsSchema,
+}).strict();
+const acquireMaintenanceLeaseResponseSchema = z.object({
+  leaseId: z.string().uuid(),
+  leaseToken: z.string().min(1).max(256),
+  status: z.literal("acquired"),
+  expiresAt: z.string().datetime(),
+}).strict();
+const maintenanceLeaseDrainResponseSchema = z.object({
+  leaseId: z.string().uuid(),
+  status: z.enum(["draining", "drained"]),
+  agentIds: maintenanceAgentIdsSchema,
+  drainedAt: z.string().datetime().nullable(),
+  runningCount: z.number().int().nonnegative(),
+  expiresAt: z.string().datetime(),
+}).strict();
+const maintenanceLeaseReleaseResponseSchema = z.object({
+  leaseId: z.string().uuid(),
+  status: z.literal("released"),
+  restoredAgentIds: z.array(z.string().uuid()),
+  releasedAt: z.string().datetime(),
+}).strict();
+const portfolioMaintenanceGateSchema = z.object({
+  operationId: z.string().uuid(),
+  expectedSnapshotFingerprint: maintenanceFingerprintSchema,
+  receiptId: maintenanceFingerprintSchema,
+  stage: z.enum(["fenced", "quiesced"]),
+}).strict();
+const portfolioMaintenanceLifecycleGateSchema = z.object({
+  agentId: z.string().uuid(),
+  status: z.string(),
+  lastCanaryResult: z.enum(["pending", "passed", "failed"]).nullable(),
+  canaryIssueId: z.string().uuid().nullable(),
+  currentConfigFingerprint: maintenanceFingerprintSchema.nullable(),
+  gateConfigFingerprint: maintenanceFingerprintSchema.nullable(),
+  lastSatisfiedRunId: z.string().uuid().nullable(),
+  receiptHash: maintenanceFingerprintSchema.nullable(),
+  validatedAt: z.string().datetime().nullable(),
+  expiresAt: z.string().datetime().nullable(),
+  valid: z.boolean(),
+}).strict();
+const portfolioMaintenancePreflightResponseSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  companyId: z.string().uuid(),
+  agentIds: maintenanceAgentIdsSchema,
+  ready: z.boolean(),
+  restoreReady: z.boolean(),
+  blockers: z.array(z.object({ code: z.string(), message: z.string() }).strict()),
+  coverage: z.object({
+    hiddenIssues: z.literal(true),
+    pluginOperations: z.literal(true),
+    wakesComplete: z.literal(true),
+    liveRunsComplete: z.literal(true),
+    wakeQuiesce: z.literal(true),
+    triggerCas: z.literal(true),
+  }).strict(),
+  snapshotFingerprint: maintenanceFingerprintSchema,
+  maintenanceGate: portfolioMaintenanceGateSchema.nullable(),
+  lifecycleGates: z.array(portfolioMaintenanceLifecycleGateSchema),
+  issues: z.array(z.object({
+    id: z.string().uuid(),
+    companyId: z.string().uuid(),
+    status: z.string(),
+    assigneeAgentId: z.string().uuid(),
+    originKind: z.string(),
+    hidden: z.boolean(),
+    updatedAt: z.string().datetime(),
+  }).strict()),
+  wakes: z.array(z.object({
+    id: z.string().uuid(),
+    agentId: z.string().uuid(),
+    issueId: z.string().uuid().nullable(),
+    status: z.enum(["queued", "claimed", "deferred_issue_execution"]),
+    updatedAt: z.string().datetime(),
+  }).strict()),
+  liveRuns: z.array(z.object({
+    id: z.string().uuid(),
+    agentId: z.string().uuid(),
+    issueId: z.string().uuid().nullable(),
+    status: z.enum(["queued", "running", "scheduled_retry", "orphan_process"]),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  }).strict()),
+}).strict();
+const portfolioMaintenanceQuiesceRequestSchema = z.object({
+  agentIds: maintenanceAgentIdsSchema,
+  operationId: z.string().uuid(),
+  expectedSnapshotFingerprint: maintenanceFingerprintSchema,
+}).strict();
+const portfolioMaintenanceQuiesceResponseSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  companyId: z.string().uuid(),
+  agentIds: maintenanceAgentIdsSchema,
+  operationId: z.string().uuid(),
+  expectedSnapshotFingerprint: maintenanceFingerprintSchema,
+  receiptId: maintenanceFingerprintSchema,
+  stage: z.literal("quiesced"),
+  quiescedAt: z.string().datetime(),
+  cancelledWakeRequestIds: z.array(z.string().uuid()),
+  remainingWakeRequestIds: z.array(z.string().uuid()),
+  remainingLiveRunIds: z.array(z.string().uuid()),
+}).strict();
+const portfolioMaintenanceGateReleaseRequestSchema = z.object({
+  agentIds: maintenanceAgentIdsSchema,
+  receiptIds: z.array(maintenanceFingerprintSchema).min(1).max(100),
+  expectedSnapshotFingerprint: maintenanceFingerprintSchema,
+}).strict();
+const portfolioMaintenanceGateReleaseResponseSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  companyId: z.string().uuid(),
+  agentIds: maintenanceAgentIdsSchema,
+  receiptId: maintenanceFingerprintSchema,
+  expectedSnapshotFingerprint: maintenanceFingerprintSchema,
+  releasedAt: z.string().datetime(),
+}).strict();
+
+const adapterSecretHmacFingerprintSchema = z.string().regex(
+  /^v1:hmac-sha256:[a-f0-9]{64}$/,
+);
+const sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const adapterSecretExternalizationRequestSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  expectedCompanyId: z.string().uuid(),
+  expectedAdapterType: z.literal("openclaw_gateway"),
+  expectedConfigFingerprint: adapterSecretHmacFingerprintSchema,
+  expectedPreflightReceipt: adapterSecretHmacFingerprintSchema,
+}).strict();
+const adapterSecretExternalizationProofRequestSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  expectedCompanyId: z.string().uuid(),
+  expectedReceipt: adapterSecretHmacFingerprintSchema,
+}).strict();
+const adapterSecretExternalizationPreflightResponseSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  agentId: z.string().uuid(),
+  companyId: z.string().uuid(),
+  adapterType: z.literal("openclaw_gateway"),
+  configFingerprint: adapterSecretHmacFingerprintSchema,
+  masterKeyFingerprintSha256: sha256HexSchema,
+  receipt: adapterSecretHmacFingerprintSchema,
+}).strict();
+const adapterSecretExternalizationProofResponseSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  agentId: z.string().uuid(),
+  companyId: z.string().uuid(),
+  adapterType: z.literal("openclaw_gateway"),
+  configFingerprint: adapterSecretHmacFingerprintSchema,
+  provider: z.literal("local_encrypted"),
+  secretRefCount: z.number().int().nonnegative(),
+  secretRefPaths: z.array(z.string()),
+  secretIds: z.array(z.string().uuid()),
+  bindingCount: z.number().int().nonnegative(),
+  bindingIds: z.array(z.string().uuid()),
+  runtimeResolvedCount: z.number().int().nonnegative(),
+  runtimeResolutionHash: sha256HexSchema,
+  masterKeyFingerprintSha256: sha256HexSchema,
+  receipt: adapterSecretHmacFingerprintSchema,
+}).strict();
+const adapterSecretExternalizationResponseSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  agentId: z.string().uuid(),
+  companyId: z.string().uuid(),
+  createdSecretCount: z.number().int().nonnegative(),
+  createdSecretIds: z.array(z.string().uuid()),
+  removedHeaderCount: z.number().int().nonnegative(),
+  removedHeaderPaths: z.array(z.string()),
+  secretRefCount: z.number().int().nonnegative(),
+  secretRefPaths: z.array(z.string()),
+  secretIds: z.array(z.string().uuid()),
+  configFingerprint: adapterSecretHmacFingerprintSchema,
+  preflightReceipt: adapterSecretHmacFingerprintSchema,
+  proof: adapterSecretExternalizationProofResponseSchema,
+  updatedAt: z.string().datetime(),
+}).strict();
+const lifecycleCanaryPreflightResponseSchema = z.object({
+  agentId: z.string().uuid(),
+  companyId: z.string().uuid(),
+  canaryIssueId: z.string().uuid().nullable(),
+  ready: z.boolean(),
+  blockers: z.array(z.object({
+    code: z.string(),
+    message: z.string(),
+  }).strict()),
+  configFingerprint: z.string().regex(/^v1:sha256:[a-f0-9]{64}$/).nullable(),
+  agentUpdatedAt: z.string().datetime(),
+}).strict();
+
 function paramsSchemaFromPath(routePath: string): z.ZodObject<z.ZodRawShape> | undefined {
   const names = [...routePath.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map((match) => match[1]);
   if (names.length === 0) return undefined;
@@ -617,14 +843,16 @@ function registerCurrentRoute(input: {
   tags: string[];
   summary: string;
   query?: z.ZodTypeAny;
+  headers?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
 }) {
   const params = paramsSchemaFromPath(input.path);
-  const request = params || input.query || input.body
+  const request = params || input.query || input.headers || input.body
     ? {
         ...(params ? { params } : {}),
         ...(input.query ? { query: input.query } : {}),
+        ...(input.headers ? { headers: input.headers } : {}),
         ...(input.body ? { body: jsonBody(input.body) } : {}),
       }
     : undefined;
@@ -641,12 +869,15 @@ function registerCurrentRoute(input: {
 type OpenApiAuthLevel =
   | "public"
   | "authenticated"
+  | "agent"
   | "board"
   | "instance_admin";
 
 const BOARD_SESSION_AUTH_SCHEME = "BoardSessionAuth";
 const BOARD_API_KEY_AUTH_SCHEME = "BoardApiKeyAuth";
 const AGENT_BEARER_AUTH_SCHEME = "AgentBearerAuth";
+const APPROVAL_EXECUTION_CLAIM_RECOVERY_OPERATION =
+  "POST /api/companies/{companyId}/approvals/{id}/execution-claim/recover-expired";
 
 function securityRequirement(name: string): Record<string, string[]> {
   return { [name]: [] };
@@ -680,6 +911,12 @@ const PUBLIC_OPERATIONS = new Set([
   "POST /api/join-requests/{requestId}/claim-api-key",
 ]);
 
+const AGENT_ONLY_OPERATIONS = new Set([
+  "POST /api/approvals/{id}/execution-claim",
+  "POST /api/approvals/{id}/execution-claim/consume",
+  "POST /api/approvals/{id}/execution-claim/finalize",
+]);
+
 const BOARD_ONLY_PREFIXES = [
   "/api/auth/",
   "/api/admin/",
@@ -707,11 +944,26 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
   "GET /api/companies/{companyId}/user-directory",
+  "POST /api/companies/{companyId}/maintenance-leases/acquire",
+  "GET /api/companies/{companyId}/maintenance-leases/{leaseId}/drain-receipt",
+  "POST /api/companies/{companyId}/maintenance-leases/{leaseId}/release",
+  "GET /api/companies/{companyId}/portfolio-maintenance-preflight",
+  "POST /api/companies/{companyId}/portfolio-maintenance-wakes/quiesce",
+  "POST /api/companies/{companyId}/portfolio-maintenance-gates/release",
+  "POST /api/agents/{id}/pause",
+  "POST /api/agents/{id}/resume",
+  "POST /api/companies/{companyId}/approvals/{id}/execution-claim/recover-expired",
+  "GET /api/agents/{id}/adapter-secrets/externalization-preflight",
+  "POST /api/agents/{id}/adapter-secrets/externalization-proof",
+  "POST /api/agents/{id}/adapter-secrets/externalize",
+  "GET /api/agents/{id}/lifecycle-canary-preflight",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
   "DELETE /api/board-api-keys/{keyId}",
   "POST /api/bootstrap/claim",
   "GET /api/companies/{companyId}/resource-memberships/me",
+  "GET /api/companies/{companyId}/skills/{skillId}/resync-preflight",
+  "POST /api/companies/{companyId}/skills/{skillId}/resync",
   "PUT /api/companies/{companyId}/resource-memberships/me/agents/{agentId}",
   "PUT /api/companies/{companyId}/resource-memberships/me/projects/{projectId}",
   "GET /api/companies/{companyId}/secret-provider-configs",
@@ -833,6 +1085,7 @@ function isBoardOnlyOperation(method: string, path: string) {
 function resolveOperationAuthLevel(method: string, path: string): OpenApiAuthLevel {
   const key = operationKey(method, path);
   if (PUBLIC_OPERATIONS.has(key)) return "public";
+  if (AGENT_ONLY_OPERATIONS.has(key)) return "agent";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (isBoardOnlyOperation(method, path)) return "board";
   return "authenticated";
@@ -880,22 +1133,34 @@ function applyDocumentFixups(document: any): any {
       const authLevel = resolveOperationAuthLevel(method, path);
       if (authLevel === "public") {
         operation.security = [];
+      } else if (authLevel === "agent") {
+        operation.security = [securityRequirement(AGENT_BEARER_AUTH_SCHEME)];
       } else if (authLevel === "authenticated") {
         operation.security = AUTHENTICATED_SECURITY;
       } else {
         operation.security = BOARD_SECURITY;
       }
 
+      const key = operationKey(method, path);
       operation["x-paperclip-authorization"] =
-        authLevel === "instance_admin"
+        key === APPROVAL_EXECUTION_CLAIM_RECOVERY_OPERATION
+          ? {
+              actor: "board",
+              anyOf: [
+                { permission: "environments:manage" },
+                { instanceAdmin: true },
+              ],
+            }
+          : authLevel === "instance_admin"
           ? { actor: "board", instanceAdmin: true }
           : authLevel === "board"
             ? { actor: "board" }
+            : authLevel === "agent"
+              ? { actor: "agent", boundRun: true, taskBridgeKey: false }
             : authLevel === "authenticated"
               ? { actor: "board_or_agent" }
               : { actor: "public" };
 
-      const key = operationKey(method, path);
       if (authLevel !== "public") {
         const responses = (operation.responses ??= {}) as Record<string, unknown>;
         if (!responses["403"]) {
@@ -1163,6 +1428,114 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/maintenance-leases/acquire",
+  tags: ["maintenance"],
+  summary: "Acquire an agent maintenance lease",
+  request: {
+    params: z.object({ companyId: z.string().uuid() }),
+    body: jsonBody(acquireMaintenanceLeaseRequestSchema),
+  },
+  responses: {
+    200: r.ok(acquireMaintenanceLeaseResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/maintenance-leases/{leaseId}/drain-receipt",
+  tags: ["maintenance"],
+  summary: "Get an agent maintenance lease drain receipt",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), leaseId: z.string().uuid() }),
+    headers: maintenanceLeaseTokenHeadersSchema,
+  },
+  responses: {
+    200: r.ok(maintenanceLeaseDrainResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/maintenance-leases/{leaseId}/release",
+  tags: ["maintenance"],
+  summary: "Release an agent maintenance lease",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), leaseId: z.string().uuid() }),
+    headers: maintenanceLeaseTokenHeadersSchema,
+  },
+  responses: {
+    200: r.ok(maintenanceLeaseReleaseResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/portfolio-maintenance-preflight",
+  tags: ["maintenance"],
+  summary: "Get an exact portfolio maintenance preflight",
+  request: {
+    params: z.object({ companyId: z.string().uuid() }),
+    query: maintenanceAgentIdsQuerySchema,
+  },
+  responses: {
+    200: r.ok(portfolioMaintenancePreflightResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/portfolio-maintenance-wakes/quiesce",
+  tags: ["maintenance"],
+  summary: "Establish and quiesce a portfolio maintenance execution gate",
+  request: {
+    params: z.object({ companyId: z.string().uuid() }),
+    body: jsonBody(portfolioMaintenanceQuiesceRequestSchema),
+  },
+  responses: {
+    200: r.ok(portfolioMaintenanceQuiesceResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/portfolio-maintenance-gates/release",
+  tags: ["maintenance"],
+  summary: "Release a restored portfolio maintenance execution gate",
+  request: {
+    params: z.object({ companyId: z.string().uuid() }),
+    body: jsonBody(portfolioMaintenanceGateReleaseRequestSchema),
+  },
+  responses: {
+    200: r.ok(portfolioMaintenanceGateReleaseResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
 // ─── Teams Catalog ──────────────────────────────────────────────────────────
 
 for (const route of [
@@ -1277,6 +1650,75 @@ registry.registerPath({
     body: jsonBody(updateAgentSchema.omit({ permissions: true })),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/adapter-secrets/externalization-preflight",
+  tags: ["agents"],
+  summary: "Preflight OpenClaw adapter secret externalization",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: {
+    200: r.ok(adapterSecretExternalizationPreflightResponseSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/adapter-secrets/externalization-proof",
+  tags: ["agents"],
+  summary: "Prove OpenClaw adapter secret externalization",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(adapterSecretExternalizationProofRequestSchema),
+  },
+  responses: {
+    200: r.ok(adapterSecretExternalizationProofResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/adapter-secrets/externalize",
+  tags: ["agents"],
+  summary: "Externalize OpenClaw adapter secrets",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(adapterSecretExternalizationRequestSchema),
+  },
+  responses: {
+    200: r.ok(adapterSecretExternalizationResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/lifecycle-canary-preflight",
+  tags: ["agents"],
+  summary: "Preflight a pending lifecycle canary",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: {
+    200: r.ok(lifecycleCanaryPreflightResponseSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({
@@ -1497,8 +1939,18 @@ registry.registerPath({
   path: "/api/agents/{id}/pause",
   tags: ["agents"],
   summary: "Pause an agent",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(pauseAgentSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({
@@ -1506,8 +1958,19 @@ registry.registerPath({
   path: "/api/agents/{id}/resume",
   tags: ["agents"],
   summary: "Resume an agent",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(resumeAgentSchema),
+  },
+  responses: {
+    200: r.ok(),
+    202: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({
@@ -1521,11 +1984,85 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/agents/{id}/retirement-preflight",
+  tags: ["agents"],
+  summary: "Preflight an allowlisted agent retirement",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(z.union([
+      agentRetirementPreflightRequestSchema,
+      agentRetirementExecutionRecoveryRequestSchema,
+      agentRetirementEvidenceSchema,
+    ])),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/retirement-cleanup",
+  tags: ["agents"],
+  summary: "Disable live access artifacts for an allowlisted agent retirement",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(agentRetirementCleanupRequestSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/agents/{id}/terminate",
   tags: ["agents"],
   summary: "Terminate an agent",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ id: z.string() }),
+    body: {
+      ...jsonBody(agentRetirementTerminationSchema),
+      required: false,
+    },
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/retirement-postcheck",
+  tags: ["agents"],
+  summary: "Verify an allowlisted retirement tombstone and its atomic audit receipt",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(agentRetirementTerminationSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({
@@ -2627,7 +3164,76 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/execution-claim",
+  tags: ["approvals"],
+  summary: "Atomically claim one approved external pipe execution",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(approvalExecutionClaimRequestSchema),
+  },
+  responses: {
+    200: r.ok(approvalExecutionClaimReceiptSchema),
+    201: r.ok(approvalExecutionClaimReceiptSchema),
+    400: r.badRequest,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/execution-claim/consume",
+  tags: ["approvals"],
+  summary: "Atomically consume a pending execution claim immediately before provider dispatch",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(approvalExecutionClaimConsumeRequestSchema),
+  },
+  responses: {
+    200: r.ok(approvalExecutionClaimExecutionReceiptSchema),
+    400: r.badRequest,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/execution-claim/finalize",
+  tags: ["approvals"],
+  summary: "Finalize an executing provider lease with a bounded outcome",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(approvalExecutionClaimFinalizeRequestSchema),
+  },
+  responses: {
+    200: r.ok(approvalExecutionClaimFinalizationReceiptSchema),
+    400: r.badRequest,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
 // ─── Costs ───────────────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/approvals/{id}/execution-claim/recover-expired",
+  tags: ["approvals"],
+  summary: "Manually fail an expired executing claim after evidence-backed board review",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), id: z.string().uuid() }),
+    body: jsonBody(approvalExecutionClaimRecoveryRequestSchema),
+  },
+  responses: {
+    200: r.ok(approvalExecutionClaimRecoveryReceiptSchema),
+    400: r.badRequest,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
 
 const costSummaryPaths = [
   "summary", "by-agent", "by-agent-model", "by-provider",
@@ -3584,6 +4190,35 @@ registry.registerPath({
   summary: "Get a company skill",
   request: { params: z.object({ companyId: z.string(), skillId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/skills/{skillId}/resync-preflight",
+  tags: ["skills"],
+  summary: "Preflight an exact local-path company skill resync",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), skillId: z.string().uuid() }),
+  },
+  responses: {
+    200: r.ok(companySkillResyncPreflightSchema),
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/skills/{skillId}/resync",
+  tags: ["skills"],
+  summary: "CAS-resync an exact local-path company skill",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), skillId: z.string().uuid() }),
+    body: jsonBody(companySkillResyncRequestSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

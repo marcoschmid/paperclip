@@ -22,6 +22,7 @@ import {
   type IssueTreePreviewWarning,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { lockAgentLifecycleReferences } from "./agent-lifecycle-fence.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -958,37 +959,79 @@ export function issueTreeControlService(db: Db) {
     const releasedCancelHoldIds = activeCancelHolds.map((hold) => hold.id);
     const updatedIssues = await db.transaction(async (tx) => {
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
+      const candidateIssueIds = [...restoreStatusByIssueId.keys()];
+      const restorableIssues = candidateIssueIds.length > 0
+        ? await tx
+          .select({
+            id: issues.id,
+            assigneeAgentId: issues.assigneeAgentId,
+          })
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, candidateIssueIds),
+            eq(issues.status, "cancelled"),
+          ))
+        : [];
+      await lockAgentLifecycleReferences(tx as unknown as Db, {
+        companyId,
+        agentIds: restorableIssues
+          .map((issue) => issue.assigneeAgentId)
+          .filter((agentId): agentId is string => Boolean(agentId)),
+      });
+      const restorableById = new Map(restorableIssues.map((issue) => [issue.id, issue]));
       for (const [status, issueIdsForStatus] of issueIdsByStatus) {
         if (issueIdsForStatus.length === 0) continue;
-        const rows = await tx
-          .update(issues)
-          .set({
-            status,
-            cancelledAt: null,
-            completedAt: null,
-            checkoutRunId: null,
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: now,
-          })
-          .where(
-            and(
+        for (const issueId of issueIdsForStatus) {
+          const expected = restorableById.get(issueId);
+          if (!expected) continue;
+          const assigneeCondition = expected.assigneeAgentId
+            ? eq(issues.assigneeAgentId, expected.assigneeAgentId)
+            : isNull(issues.assigneeAgentId);
+          const [updated] = await tx
+            .update(issues)
+            .set({
+              status,
+              cancelledAt: null,
+              completedAt: null,
+              checkoutRunId: null,
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: now,
+            })
+            .where(and(
               eq(issues.companyId, companyId),
-              inArray(issues.id, issueIdsForStatus),
+              eq(issues.id, issueId),
               eq(issues.status, "cancelled"),
-            ),
-          )
-          .returning({
-            id: issues.id,
-            status: issues.status,
-            assigneeAgentId: issues.assigneeAgentId,
+              assigneeCondition,
+            ))
+            .returning({
+              id: issues.id,
+              status: issues.status,
+              assigneeAgentId: issues.assigneeAgentId,
+            });
+          if (!updated) {
+            const current = await tx
+              .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+              .from(issues)
+              .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+              .then((rows) => rows[0] ?? null);
+            if (current?.status === "cancelled" && current.assigneeAgentId !== expected.assigneeAgentId) {
+              throw conflict("Issue assignee changed while restoring cancelled issue", {
+                issueId,
+                expectedAssigneeAgentId: expected.assigneeAgentId,
+                currentAssigneeAgentId: current.assigneeAgentId,
+              });
+            }
+            continue;
+          }
+          restored.push({
+            id: updated.id,
+            status: coerceIssueStatus(updated.status),
+            assigneeAgentId: updated.assigneeAgentId,
           });
-        restored.push(...rows.map((issue) => ({
-          id: issue.id,
-          status: coerceIssueStatus(issue.status),
-          assigneeAgentId: issue.assigneeAgentId,
-        })));
+        }
       }
 
       if (releasedCancelHoldIds.length > 0) {

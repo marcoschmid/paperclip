@@ -27,6 +27,7 @@ const DEFAULT_AGENT_JWT_TTL_SECONDS = "172800";
 const DEFAULT_AGENT_JWT_ISSUER = "paperclip";
 const DEFAULT_AGENT_JWT_AUDIENCE = "paperclip-api";
 const DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS = "30000";
+const DEFAULT_ROUTINE_DELIVERY_WORKER_INTERVAL_MS = "30000";
 const DEFAULT_SECRETS_PROVIDER = "local_encrypted";
 const DEFAULT_STORAGE_PROVIDER = "local_disk";
 function defaultSecretsKeyFilePath(): string {
@@ -144,6 +145,9 @@ function collectDeploymentEnvRows(config: PaperclipConfig | null, configPath: st
 
   const heartbeatInterval = process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS ?? DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS;
   const heartbeatEnabled = process.env.HEARTBEAT_SCHEDULER_ENABLED ?? "true";
+  const routineDeliveryWorkerInterval =
+    process.env.ROUTINE_DELIVERY_WORKER_INTERVAL_MS ?? DEFAULT_ROUTINE_DELIVERY_WORKER_INTERVAL_MS;
+  const routineDeliveryWorkerEnabled = process.env.ROUTINE_DELIVERY_WORKER_ENABLED ?? "true";
   const secretsProvider =
     process.env.PAPERCLIP_SECRETS_PROVIDER ??
     config?.secrets?.provider ??
@@ -267,6 +271,20 @@ function collectDeploymentEnvRows(config: PaperclipConfig | null, configPath: st
       source: process.env.HEARTBEAT_SCHEDULER_ENABLED ? "env" : "default",
       required: false,
       note: "Set to `false` to disable timer scheduling",
+    },
+    {
+      key: "ROUTINE_DELIVERY_WORKER_INTERVAL_MS",
+      value: routineDeliveryWorkerInterval,
+      source: process.env.ROUTINE_DELIVERY_WORKER_INTERVAL_MS ? "env" : "default",
+      required: false,
+      note: "Durable routine delivery outbox reconciliation interval in ms",
+    },
+    {
+      key: "ROUTINE_DELIVERY_WORKER_ENABLED",
+      value: routineDeliveryWorkerEnabled,
+      source: process.env.ROUTINE_DELIVERY_WORKER_ENABLED ? "env" : "default",
+      required: false,
+      note: "Set to `false` only to explicitly suppress durable routine delivery reconciliation",
     },
     {
       key: "PAPERCLIP_SECRETS_PROVIDER",

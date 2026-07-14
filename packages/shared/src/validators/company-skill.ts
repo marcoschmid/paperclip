@@ -112,6 +112,93 @@ export const companySkillVersionCreateSchema = z.object({
   label: z.string().trim().min(1).nullable().optional(),
 }).default({});
 
+const companySkillResyncFingerprintSchema = z.string().regex(/^v1:sha256:[a-f0-9]{64}$/);
+const companySkillResyncAgentIdsAreUniqueAndSorted = (agentIds: string[]) =>
+  new Set(agentIds).size === agentIds.length &&
+  agentIds.every((agentId, index) => index === 0 || agentIds[index - 1]! < agentId);
+const companySkillResyncPreflightAgentIdsSchema = z.array(z.string().uuid()).min(0).max(100)
+  .refine(companySkillResyncAgentIdsAreUniqueAndSorted, {
+    message: "agent ids must be unique and strictly codepoint-sorted",
+  });
+const companySkillResyncRequiredAgentIdsSchema = z.array(z.string().uuid()).min(1).max(100)
+  .refine(companySkillResyncAgentIdsAreUniqueAndSorted, {
+    message: "agent ids must be unique and strictly codepoint-sorted",
+  });
+const companySkillResyncEmptyAgentIdsSchema = z.array(z.string().uuid()).min(0).max(0);
+
+export const companySkillResyncPreflightSchema = z.object({
+  schemaVersion: z.literal("1.0.0"),
+  companyId: z.string().uuid(),
+  skillId: z.string().uuid(),
+  skillKey: z.string().trim().min(1),
+  sourceType: z.literal("local_path"),
+  sourceLocator: z.string().min(1),
+  sourceLocatorSha256: companySkillResyncFingerprintSchema,
+  sourceInventoryMode: z.enum(["full", "project_root"]),
+  skillUpdatedAt: z.string().datetime({ offset: true }),
+  currentVersionId: z.string().uuid(),
+  currentVersionLabel: z.string().nullable(),
+  baseMarkdownSha256: companySkillResyncFingerprintSchema,
+  currentVersionInventorySha256: companySkillResyncFingerprintSchema,
+  sourceSkillMarkdownSha256: companySkillResyncFingerprintSchema,
+  sourceInventorySha256: companySkillResyncFingerprintSchema,
+  baseFileInventorySha256: companySkillResyncFingerprintSchema,
+  sourceFileInventorySha256: companySkillResyncFingerprintSchema,
+  baseTrustLevel: companySkillTrustLevelSchema,
+  sourceTrustLevel: companySkillTrustLevelSchema,
+  sourceFileCount: z.number().int().positive(),
+  sourceTotalBytes: z.number().int().nonnegative(),
+  affectedAgentIds: companySkillResyncPreflightAgentIdsSchema,
+}).strict();
+
+const companySkillResyncRequestCasShape = {
+  schemaVersion: z.literal("1.0.0"),
+  approvalIssue: z.literal("TEC-355"),
+  maintenanceOperationId: z.string().uuid(),
+  label: z.string().trim().min(1).max(500).startsWith("TEC-355 skill-resync"),
+  expectedSkillKey: z.string().trim().min(1),
+  expectedSourceType: z.literal("local_path"),
+  expectedSourceInventoryMode: z.enum(["full", "project_root"]),
+  expectedSourceLocatorSha256: companySkillResyncFingerprintSchema,
+  expectedSkillUpdatedAt: z.string().datetime({ offset: true }),
+  expectedCurrentVersionId: z.string().uuid(),
+  expectedBaseMarkdownSha256: companySkillResyncFingerprintSchema,
+  expectedCurrentVersionInventorySha256: companySkillResyncFingerprintSchema,
+  expectedSourceSkillMarkdownSha256: companySkillResyncFingerprintSchema,
+  expectedSourceInventorySha256: companySkillResyncFingerprintSchema,
+  expectedBaseFileInventorySha256: companySkillResyncFingerprintSchema,
+  expectedSourceFileInventorySha256: companySkillResyncFingerprintSchema,
+  expectedBaseTrustLevel: companySkillTrustLevelSchema,
+  expectedSourceTrustLevel: companySkillTrustLevelSchema,
+} as const;
+
+const companySkillResyncGatedRequestSchema = z.object({
+  ...companySkillResyncRequestCasShape,
+  maintenanceAgentIds: companySkillResyncRequiredAgentIdsSchema,
+  maintenanceReceiptId: companySkillResyncFingerprintSchema,
+  maintenanceExpectedSnapshotFingerprint: companySkillResyncFingerprintSchema,
+}).strict();
+
+const companySkillResyncBaseOnlyRequestSchema = z.object({
+  ...companySkillResyncRequestCasShape,
+  expectedSourceInventoryMode: z.literal("full"),
+  maintenanceAgentIds: companySkillResyncEmptyAgentIdsSchema,
+  maintenanceReceiptId: z.null(),
+  maintenanceExpectedSnapshotFingerprint: z.null(),
+}).strict().refine(
+  (input) => input.expectedSourceInventoryMode === "full" &&
+    input.expectedCurrentVersionInventorySha256 === input.expectedSourceInventorySha256,
+  {
+    message: "base-only resync requires a full source inventory equal to the expected pinned version inventory",
+    path: ["expectedSourceInventoryMode"],
+  },
+);
+
+export const companySkillResyncRequestSchema = z.union([
+  companySkillResyncGatedRequestSchema,
+  companySkillResyncBaseOnlyRequestSchema,
+]);
+
 export const companySkillStarResultSchema = z.object({
   skillId: z.string().uuid(),
   starred: z.boolean(),
@@ -357,6 +444,8 @@ export type CompanySkillProjectScan = z.infer<typeof companySkillProjectScanRequ
 export type CompanySkillCreate = z.infer<typeof companySkillCreateSchema>;
 export type CompanySkillFileUpdate = z.infer<typeof companySkillFileUpdateSchema>;
 export type CompanySkillVersionCreate = z.infer<typeof companySkillVersionCreateSchema>;
+export type CompanySkillResyncPreflight = z.infer<typeof companySkillResyncPreflightSchema>;
+export type CompanySkillResyncRequest = z.infer<typeof companySkillResyncRequestSchema>;
 export type CompanySkillCommentCreate = z.infer<typeof companySkillCommentCreateSchema>;
 export type CompanySkillCommentUpdate = z.infer<typeof companySkillCommentUpdateSchema>;
 export type CompanySkillFork = z.infer<typeof companySkillForkSchema>;

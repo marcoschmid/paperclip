@@ -221,6 +221,47 @@ describe("buildAgentUpdatePatch", () => {
     });
   });
 
+  it("clears both canonical and legacy Codex bypass keys when disabling a legacy-only config", () => {
+    const agent = makeAgent();
+    agent.adapterType = "codex_local";
+    agent.adapterConfig = {
+      ...agent.adapterConfig,
+      dangerouslyBypassSandbox: true,
+    };
+
+    const patch = buildAgentUpdatePatch(
+      agent,
+      makeOverlay({
+        adapterConfig: { dangerouslyBypassApprovalsAndSandbox: false },
+      }),
+    );
+
+    expect(patch.adapterConfig).toEqual(expect.objectContaining({
+      dangerouslyBypassApprovalsAndSandbox: false,
+      dangerouslyBypassSandbox: false,
+    }));
+  });
+
+  it("persists the canonical Claude bypass key as false when clearing a legacy true value", () => {
+    const agent = makeAgent();
+    agent.adapterType = "claude_local";
+    agent.adapterConfig = {
+      ...agent.adapterConfig,
+      dangerouslySkipPermissions: true,
+    };
+
+    const patch = buildAgentUpdatePatch(
+      agent,
+      makeOverlay({
+        adapterConfig: { dangerouslySkipPermissions: false },
+      }),
+    );
+
+    expect(patch.adapterConfig).toEqual(expect.objectContaining({
+      dangerouslySkipPermissions: false,
+    }));
+  });
+
   it("preserves paperclip skill-sync selections when changing adapter types", () => {
     // Desired skills are adapter-agnostic (company-level selections) but are
     // persisted inside the per-adapter config under `paperclipSkillSync`. A

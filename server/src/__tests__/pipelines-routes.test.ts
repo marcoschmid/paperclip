@@ -5,6 +5,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
@@ -44,6 +45,7 @@ import {
   PIPELINE_CONTEXT_PACK_EVENT_LIMIT,
 } from "../services/pipelines.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -57,7 +59,55 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("pipeline routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-  const noopHeartbeat = { wakeup: async () => null };
+  const durableHeartbeat: IssueAssignmentWakeupDeps = {
+    wakeup: async (agentId, wakeupOpts) => {
+      const issueId =
+        (typeof wakeupOpts.payload?.issueId === "string" && wakeupOpts.payload.issueId)
+        || (typeof wakeupOpts.contextSnapshot?.issueId === "string" && wakeupOpts.contextSnapshot.issueId)
+        || null;
+      if (!issueId) return null;
+      const issue = await db
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) return null;
+
+      const queuedRunId = randomUUID();
+      const wakeupRequestId = randomUUID();
+      await db.transaction(async (tx) => {
+        await tx.insert(agentWakeupRequests).values({
+          id: wakeupRequestId,
+          companyId: issue.companyId,
+          agentId,
+          source: wakeupOpts.source ?? "assignment",
+          triggerDetail: wakeupOpts.triggerDetail ?? null,
+          reason: wakeupOpts.reason ?? null,
+          payload: wakeupOpts.payload ?? { issueId },
+          status: "queued",
+          requestedByActorType: wakeupOpts.requestedByActorType ?? null,
+          requestedByActorId: wakeupOpts.requestedByActorId ?? null,
+          idempotencyKey: wakeupOpts.idempotencyKey ?? null,
+          runId: queuedRunId,
+        });
+        await tx.insert(heartbeatRuns).values({
+          id: queuedRunId,
+          companyId: issue.companyId,
+          agentId,
+          invocationSource: wakeupOpts.source ?? "assignment",
+          triggerDetail: wakeupOpts.triggerDetail ?? null,
+          status: "queued",
+          wakeupRequestId,
+          contextSnapshot: { ...(wakeupOpts.contextSnapshot ?? {}), issueId },
+        });
+        await tx
+          .update(issues)
+          .set({ executionRunId: queuedRunId, executionLockedAt: new Date() })
+          .where(eq(issues.id, issueId));
+      });
+      return { id: queuedRunId };
+    },
+  };
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pipelines-routes-");
@@ -79,6 +129,7 @@ describeEmbeddedPostgres("pipeline routes", () => {
     await db.delete(activityLog);
     await db.delete(routineRuns);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(pipelines);
@@ -103,7 +154,7 @@ describeEmbeddedPostgres("pipeline routes", () => {
       req.actor = actor;
       next();
     });
-    instance.use("/api", pipelineRoutes(db, { heartbeat: noopHeartbeat }));
+    instance.use("/api", pipelineRoutes(db, { heartbeat: durableHeartbeat }));
     instance.use("/api", issueRoutes(db, {} as any));
     instance.use(errorHandler);
     return instance;
@@ -303,6 +354,93 @@ describeEmbeddedPostgres("pipeline routes", () => {
     await http.post(`/api/cases/${blocked.body.case.id}/automations/retry-me/retry`).expect(200);
 
     await http.delete(`/api/pipelines/${pipelineId}/stages/${stageId}?moveCasesToStageId=${qaStage.body.id}`).expect(200);
+  });
+
+  it("keeps archived pipelines inert when stage approvers or automation assignees are invalid", async () => {
+    const company = await seedCompany("Archived pipeline validation");
+    const tombstoneId = "8d403783-c4e2-4746-adad-7689cd95ae33";
+    const terminatedAgentId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: tombstoneId,
+        companyId: company.id,
+        name: "Historical approver",
+        role: "reviewer",
+        status: "terminated",
+      },
+      {
+        id: terminatedAgentId,
+        companyId: company.id,
+        name: "Terminated automator",
+        role: "engineer",
+        status: "terminated",
+      },
+    ]);
+    const [routine] = await db.insert(routines).values({
+      companyId: company.id,
+      title: "Archived automation",
+      assigneeAgentId: terminatedAgentId,
+      status: "active",
+    }).returning();
+    const archivedAt = new Date("2026-07-14T00:00:00.000Z");
+    const [approverPipeline, automationPipeline] = await db.insert(pipelines).values([
+      {
+        companyId: company.id,
+        key: `archived-approver-${randomUUID().slice(0, 8)}`,
+        name: "Archived approver pipeline",
+        archivedAt,
+      },
+      {
+        companyId: company.id,
+        key: `archived-automation-${randomUUID().slice(0, 8)}`,
+        name: "Archived automation pipeline",
+        archivedAt,
+      },
+    ]).returning();
+    await db.insert(pipelineStages).values([
+      {
+        pipelineId: approverPipeline!.id,
+        key: "review",
+        name: "Review",
+        kind: "review",
+        position: 100,
+        config: {
+          approveToStageKey: "done",
+          rejectToStageKey: "cancelled",
+          requireApproval: true,
+          approver: { kind: "agent", id: tombstoneId.toUpperCase() },
+        },
+      },
+      {
+        pipelineId: automationPipeline!.id,
+        key: "work",
+        name: "Work",
+        kind: "working",
+        position: 100,
+        config: { onEnter: { type: "run_routine", routineId: routine!.id } },
+      },
+    ]);
+    const http = request(app(boardActor));
+
+    const approverResponse = await http
+      .patch(`/api/pipelines/${approverPipeline!.id}`)
+      .send({ archived: false });
+    expect(approverResponse.status, JSON.stringify(approverResponse.body)).toBe(409);
+    expect(approverResponse.body.details).toMatchObject({
+      code: "historical_agent_tombstone_active_reference_forbidden",
+    });
+    const automationResponse = await http
+      .patch(`/api/pipelines/${automationPipeline!.id}`)
+      .send({ archived: false });
+    expect(automationResponse.status, JSON.stringify(automationResponse.body)).toBe(409);
+    expect(automationResponse.body.details).toMatchObject({
+      code: "agent_lifecycle_reference_forbidden",
+      reason: "terminated",
+    });
+
+    const persisted = await db.select().from(pipelines);
+    expect(persisted.find((row) => row.id === approverPipeline!.id)?.archivedAt).toEqual(archivedAt);
+    expect(persisted.find((row) => row.id === automationPipeline!.id)?.archivedAt).toEqual(archivedAt);
   });
 
   it("patches case content and workspaceRef in one service transaction", async () => {

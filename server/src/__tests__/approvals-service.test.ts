@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { approvalService } from "../services/approvals.ts";
 
 const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(),
   activatePendingApproval: vi.fn(),
   create: vi.fn(),
   terminate: vi.fn(),
@@ -25,6 +26,7 @@ type ApprovalRecord = {
   payload: Record<string, unknown>;
   requestedByAgentId: string | null;
 };
+const PROTECTED_SOURCE_ID = "007bcd1f-0462-4c9e-b58a-c6c546393f41";
 
 function createApproval(status: string): ApprovalRecord {
   return {
@@ -39,7 +41,13 @@ function createApproval(status: string): ApprovalRecord {
 
 function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
-  const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
+  const selectWhere = vi.fn(() => {
+    const result = pendingSelectResults.shift() ?? [];
+    const promise = Promise.resolve(result);
+    return Object.assign(promise, {
+      for: vi.fn(() => Promise.resolve(result)),
+    });
+  });
   const from = vi.fn(() => ({ where: selectWhere }));
   const select = vi.fn(() => ({ from }));
 
@@ -48,8 +56,15 @@ function createDbStub(selectResults: ApprovalRecord[][], updateResults: Approval
   const set = vi.fn(() => ({ where: updateWhere }));
   const update = vi.fn(() => ({ set }));
 
+  const db = { select, update } as {
+    select: typeof select;
+    update: typeof update;
+    transaction: ReturnType<typeof vi.fn>;
+  };
+  db.transaction = vi.fn(async (callback: (tx: typeof db) => Promise<unknown>) => callback(db));
+
   return {
-    db: { select, update },
+    db,
     selectWhere,
     returning,
   };
@@ -59,6 +74,7 @@ describe("approvalService resolution idempotency", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockAgentService.activatePendingApproval.mockResolvedValue({ agent: { id: "agent-1" }, activated: true });
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1", status: "pending_approval" });
     mockAgentService.create.mockResolvedValue({ id: "agent-1" });
     mockAgentService.terminate.mockResolvedValue(undefined);
     mockNotifyHireApproved.mockResolvedValue(undefined);
@@ -103,6 +119,42 @@ describe("approvalService resolution idempotency", () => {
     expect(result.applied).toBe(true);
     expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1");
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a hire-agent rejection for a protected retirement source before resolving the approval", async () => {
+    const protectedApproval = {
+      ...createApproval("pending"),
+      payload: { agentId: PROTECTED_SOURCE_ID },
+    };
+    const dbStub = createDbStub([[protectedApproval], [protectedApproval]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.reject("approval-1", "board", "not now")).rejects.toMatchObject({
+      status: 409,
+      details: { code: "retirement_gated_termination_required" },
+    });
+    expect(dbStub.returning).not.toHaveBeenCalled();
+    expect(mockAgentService.terminate).not.toHaveBeenCalled();
+  });
+
+  it("refuses a hire-agent rejection for a mixed-case protected retirement source", async () => {
+    const mixedCaseId = PROTECTED_SOURCE_ID.toUpperCase();
+    const protectedApproval = {
+      ...createApproval("pending"),
+      payload: { agentId: mixedCaseId },
+    };
+    const dbStub = createDbStub([[protectedApproval], [protectedApproval]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.reject("approval-1", "board", "not now")).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "retirement_gated_termination_required",
+        sourceAgentId: mixedCaseId,
+      },
+    });
+    expect(dbStub.returning).not.toHaveBeenCalled();
+    expect(mockAgentService.terminate).not.toHaveBeenCalled();
   });
 
   it("creates the agent from payload when approval does not reference a pending agent", async () => {

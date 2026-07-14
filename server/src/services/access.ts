@@ -11,6 +11,11 @@ import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
+import { assertHistoricalAgentTombstoneAccessMutable } from "./agent-retirement-historical-tombstones.js";
+import {
+  canonicalizeAgentReferenceId,
+  lockAgentLifecycleReference,
+} from "./agent-lifecycle-fence.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -25,8 +30,60 @@ type MemberArchiveInput = {
   } | null;
 };
 
+type AgentAccessMutationOptions = {
+  /** Internal onboarding exception. Never bind this flag to request input. */
+  allowPendingApproval?: boolean;
+};
+
 export function accessService(db: Db) {
   const authorization = authorizationService(db);
+
+  function assertPrincipalAccessMutable(
+    principalType: string,
+    principalId: string,
+  ): asserts principalType is PrincipalType {
+    if (principalType !== "user" && principalType !== "agent") {
+      throw conflict("Unsupported membership principal type");
+    }
+    if (principalType === "agent") {
+      assertHistoricalAgentTombstoneAccessMutable(principalId);
+    }
+  }
+
+  function canonicalPrincipalId(principalType: PrincipalType, principalId: string) {
+    return principalType === "agent" ? canonicalizeAgentReferenceId(principalId) : principalId;
+  }
+
+  function principalIdPredicate(principalType: PrincipalType, principalId: string) {
+    return principalType === "agent"
+      ? sql`lower(${companyMemberships.principalId}) = ${principalId}`
+      : eq(companyMemberships.principalId, principalId);
+  }
+
+  function grantPrincipalIdPredicate(principalType: PrincipalType, principalId: string) {
+    return principalType === "agent"
+      ? sql`lower(${principalPermissionGrants.principalId}) = ${principalId}`
+      : eq(principalPermissionGrants.principalId, principalId);
+  }
+
+  async function lockAgentAccessTarget(
+    targetDb: Db,
+    input: {
+      companyId: string;
+      principalType: PrincipalType;
+      principalId: string;
+      activeReference: boolean;
+      allowPendingApproval?: boolean;
+    },
+  ) {
+    if (input.principalType !== "agent") return;
+    await lockAgentLifecycleReference(targetDb, {
+      companyId: input.companyId,
+      agentId: input.principalId,
+      mode: input.activeReference ? "active" : "cleanup",
+      allowPendingApproval: input.allowPendingApproval,
+    });
+  }
 
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
@@ -43,6 +100,7 @@ export function accessService(db: Db) {
     principalType: PrincipalType,
     principalId: string,
   ): Promise<MembershipRow | null> {
+    const canonicalId = canonicalPrincipalId(principalType, principalId);
     return db
       .select()
       .from(companyMemberships)
@@ -50,7 +108,7 @@ export function accessService(db: Db) {
         and(
           eq(companyMemberships.companyId, companyId),
           eq(companyMemberships.principalType, principalType),
-          eq(companyMemberships.principalId, principalId),
+          principalIdPredicate(principalType, canonicalId),
         ),
       )
       .then((rows) => rows[0] ?? null);
@@ -130,23 +188,47 @@ export function accessService(db: Db) {
   ) {
     const member = await getMemberById(companyId, memberId);
     if (!member) return null;
-
-    await db.transaction(async (tx) => {
+    assertPrincipalAccessMutable(member.principalType, member.principalId);
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const existing = await txDb
+        .select()
+        .from(companyMemberships)
+        .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
+        .then((rows) => rows[0] ?? null);
+      if (!existing) return null;
+      assertPrincipalAccessMutable(existing.principalType, existing.principalId);
+      const principalType = existing.principalType as PrincipalType;
+      const principalId = canonicalPrincipalId(principalType, existing.principalId);
+      await lockAgentAccessTarget(txDb, {
+        companyId,
+        principalType,
+        principalId,
+        activeReference: grants.length > 0,
+      });
+      const normalizedMember = principalType === "agent" && existing.principalId !== principalId
+        ? await txDb
+            .update(companyMemberships)
+            .set({ principalId, updatedAt: new Date() })
+            .where(eq(companyMemberships.id, existing.id))
+            .returning()
+            .then((rows) => rows[0] ?? existing)
+        : existing;
       await tx
         .delete(principalPermissionGrants)
         .where(
           and(
             eq(principalPermissionGrants.companyId, companyId),
-            eq(principalPermissionGrants.principalType, member.principalType),
-            eq(principalPermissionGrants.principalId, member.principalId),
+            eq(principalPermissionGrants.principalType, principalType),
+            grantPrincipalIdPredicate(principalType, principalId),
           ),
         );
       if (grants.length > 0) {
         await tx.insert(principalPermissionGrants).values(
           grants.map((grant) => ({
             companyId,
-            principalType: member.principalType,
-            principalId: member.principalId,
+            principalType,
+            principalId,
             permissionKey: grant.permissionKey,
             scope: grant.scope ?? null,
             grantedByUserId,
@@ -155,9 +237,8 @@ export function accessService(db: Db) {
           })),
         );
       }
+      return normalizedMember;
     });
-
-    return member;
   }
 
   async function updateMemberAndPermissions(
@@ -187,10 +268,19 @@ export function accessService(db: Db) {
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
         .then((rows) => rows[0] ?? null);
       if (!existing) return null;
+      assertPrincipalAccessMutable(existing.principalType, existing.principalId);
 
       const nextMembershipRole =
         data.membershipRole !== undefined ? data.membershipRole : existing.membershipRole;
       const nextStatus = data.status ?? existing.status;
+      const principalType = existing.principalType;
+      const principalId = canonicalPrincipalId(principalType, existing.principalId);
+      await lockAgentAccessTarget(tx as unknown as Db, {
+        companyId,
+        principalType,
+        principalId,
+        activeReference: nextStatus !== "suspended" || data.grants.length > 0,
+      });
 
       if (
         existing.principalType === "user" &&
@@ -219,6 +309,7 @@ export function accessService(db: Db) {
       const updated = await tx
         .update(companyMemberships)
         .set({
+          principalId,
           membershipRole: nextMembershipRole,
           status: nextStatus,
           updatedAt: now,
@@ -232,16 +323,16 @@ export function accessService(db: Db) {
         .where(
           and(
             eq(principalPermissionGrants.companyId, companyId),
-            eq(principalPermissionGrants.principalType, existing.principalType),
-            eq(principalPermissionGrants.principalId, existing.principalId),
+            eq(principalPermissionGrants.principalType, principalType),
+            grantPrincipalIdPredicate(principalType, principalId),
           ),
         );
       if (data.grants.length > 0) {
         await tx.insert(principalPermissionGrants).values(
           data.grants.map((grant) => ({
             companyId,
-            principalType: existing.principalType,
-            principalId: existing.principalId,
+            principalType,
+            principalId,
             permissionKey: grant.permissionKey,
             scope: grant.scope ?? null,
             grantedByUserId,
@@ -336,6 +427,7 @@ export function accessService(db: Db) {
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
         .then((rows) => rows[0] ?? null);
       if (!existing) return null;
+      assertPrincipalAccessMutable(existing.principalType, existing.principalId);
       if (existing.principalType !== "user") {
         throw conflict("Only human company members can be archived");
       }
@@ -538,32 +630,52 @@ export function accessService(db: Db) {
     principalId: string,
     membershipRole: string | null = "member",
     status: "pending" | "active" | "suspended" = "active",
+    options: AgentAccessMutationOptions = {},
   ) {
-    const existing = await getMembership(companyId, principalType, principalId);
-    if (existing) {
-      if (existing.status !== status || existing.membershipRole !== membershipRole) {
-        const updated = await db
-          .update(companyMemberships)
-          .set({ status, membershipRole, updatedAt: new Date() })
-          .where(eq(companyMemberships.id, existing.id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        return updated ?? existing;
-      }
-      return existing;
-    }
-
-    return db
-      .insert(companyMemberships)
-      .values({
+    assertPrincipalAccessMutable(principalType, principalId);
+    const canonicalId = canonicalPrincipalId(principalType, principalId);
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const existing = await txDb
+        .select()
+        .from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, companyId),
+          eq(companyMemberships.principalType, principalType),
+          principalIdPredicate(principalType, canonicalId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      await lockAgentAccessTarget(txDb, {
         companyId,
         principalType,
-        principalId,
+        principalId: canonicalId,
+        activeReference: !existing || status !== "suspended",
+        allowPendingApproval: options.allowPendingApproval,
+      });
+      if (existing) {
+        if (
+          existing.principalId !== canonicalId
+          || existing.status !== status
+          || existing.membershipRole !== membershipRole
+        ) {
+          const updated = await txDb
+            .update(companyMemberships)
+            .set({ principalId: canonicalId, status, membershipRole, updatedAt: new Date() })
+            .where(eq(companyMemberships.id, existing.id))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          return updated ?? existing;
+        }
+        return existing;
+      }
+      return txDb.insert(companyMemberships).values({
+        companyId,
+        principalType,
+        principalId: canonicalId,
         status,
         membershipRole,
-      })
-      .returning()
-      .then((rows) => rows[0]);
+      }).returning().then((rows) => rows[0]);
+    });
   }
 
   async function setPrincipalGrants(
@@ -572,15 +684,26 @@ export function accessService(db: Db) {
     principalId: string,
     grants: GrantInput[],
     grantedByUserId: string | null,
+    options: AgentAccessMutationOptions = {},
   ) {
+    assertPrincipalAccessMutable(principalType, principalId);
+    const canonicalId = canonicalPrincipalId(principalType, principalId);
     await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockAgentAccessTarget(txDb, {
+        companyId,
+        principalType,
+        principalId: canonicalId,
+        activeReference: grants.length > 0,
+        allowPendingApproval: options.allowPendingApproval,
+      });
       await tx
         .delete(principalPermissionGrants)
         .where(
           and(
             eq(principalPermissionGrants.companyId, companyId),
             eq(principalPermissionGrants.principalType, principalType),
-            eq(principalPermissionGrants.principalId, principalId),
+            grantPrincipalIdPredicate(principalType, canonicalId),
           ),
         );
       if (grants.length === 0) return;
@@ -588,7 +711,7 @@ export function accessService(db: Db) {
         grants.map((grant) => ({
           companyId,
           principalType,
-          principalId,
+          principalId: canonicalId,
           permissionKey: grant.permissionKey,
           scope: grant.scope ?? null,
           grantedByUserId,
@@ -659,57 +782,92 @@ export function accessService(db: Db) {
     enabled: boolean,
     grantedByUserId: string | null,
     scope: Record<string, unknown> | null = null,
+    options: AgentAccessMutationOptions = {},
   ) {
-    if (!enabled) {
-      await db
-        .delete(principalPermissionGrants)
-        .where(
-          and(
+    assertPrincipalAccessMutable(principalType, principalId);
+    const canonicalId = canonicalPrincipalId(principalType, principalId);
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await lockAgentAccessTarget(txDb, {
+        companyId,
+        principalType,
+        principalId: canonicalId,
+        activeReference: enabled,
+        allowPendingApproval: options.allowPendingApproval,
+      });
+      if (!enabled) {
+        await txDb
+          .delete(principalPermissionGrants)
+          .where(and(
             eq(principalPermissionGrants.companyId, companyId),
             eq(principalPermissionGrants.principalType, principalType),
-            eq(principalPermissionGrants.principalId, principalId),
+            grantPrincipalIdPredicate(principalType, canonicalId),
             eq(principalPermissionGrants.permissionKey, permissionKey),
-          ),
-        );
-      return;
-    }
+          ));
+        return;
+      }
 
-    await ensureMembership(companyId, principalType, principalId, "member", "active");
+      const membership = await txDb
+        .select()
+        .from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, companyId),
+          eq(companyMemberships.principalType, principalType),
+          principalIdPredicate(principalType, canonicalId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (membership) {
+        if (
+          membership.principalId !== canonicalId
+          || membership.status !== "active"
+          || membership.membershipRole !== "member"
+        ) {
+          await txDb.update(companyMemberships).set({
+            principalId: canonicalId,
+            status: "active",
+            membershipRole: "member",
+            updatedAt: new Date(),
+          }).where(eq(companyMemberships.id, membership.id));
+        }
+      } else {
+        await txDb.insert(companyMemberships).values({
+          companyId,
+          principalType,
+          principalId: canonicalId,
+          status: "active",
+          membershipRole: "member",
+        });
+      }
 
-    const existing = await db
-      .select()
-      .from(principalPermissionGrants)
-      .where(
-        and(
+      const existing = await txDb
+        .select()
+        .from(principalPermissionGrants)
+        .where(and(
           eq(principalPermissionGrants.companyId, companyId),
           eq(principalPermissionGrants.principalType, principalType),
-          eq(principalPermissionGrants.principalId, principalId),
+          grantPrincipalIdPredicate(principalType, canonicalId),
           eq(principalPermissionGrants.permissionKey, permissionKey),
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
-
-    if (existing) {
-      await db
-        .update(principalPermissionGrants)
-        .set({
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (existing) {
+        await txDb.update(principalPermissionGrants).set({
+          principalId: canonicalId,
           scope,
           grantedByUserId,
           updatedAt: new Date(),
-        })
-        .where(eq(principalPermissionGrants.id, existing.id));
-      return;
-    }
-
-    await db.insert(principalPermissionGrants).values({
-      companyId,
-      principalType,
-      principalId,
-      permissionKey,
-      scope,
-      grantedByUserId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+        }).where(eq(principalPermissionGrants.id, existing.id));
+        return;
+      }
+      await txDb.insert(principalPermissionGrants).values({
+        companyId,
+        principalType,
+        principalId: canonicalId,
+        permissionKey,
+        scope,
+        grantedByUserId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
     });
   }
 
@@ -738,10 +896,19 @@ export function accessService(db: Db) {
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
         .then((rows) => rows[0] ?? null);
       if (!existing) return null;
+      assertPrincipalAccessMutable(existing.principalType, existing.principalId);
 
       const nextMembershipRole =
         data.membershipRole !== undefined ? data.membershipRole : existing.membershipRole;
       const nextStatus = data.status ?? existing.status;
+      const principalType = existing.principalType;
+      const principalId = canonicalPrincipalId(principalType, existing.principalId);
+      await lockAgentAccessTarget(tx as unknown as Db, {
+        companyId,
+        principalType,
+        principalId,
+        activeReference: nextStatus === "active" || nextStatus === "pending",
+      });
 
       if (
         existing.principalType === "user" &&
@@ -769,6 +936,7 @@ export function accessService(db: Db) {
       return tx
         .update(companyMemberships)
         .set({
+          principalId,
           membershipRole: nextMembershipRole,
           status: nextStatus,
           updatedAt: new Date(),

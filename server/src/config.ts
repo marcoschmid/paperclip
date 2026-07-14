@@ -85,6 +85,8 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  routineDeliveryWorkerEnabled: boolean;
+  routineDeliveryWorkerIntervalMs: number;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
 }
@@ -331,6 +333,11 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    routineDeliveryWorkerEnabled: process.env.ROUTINE_DELIVERY_WORKER_ENABLED !== "false",
+    routineDeliveryWorkerIntervalMs: Math.max(
+      10000,
+      Number(process.env.ROUTINE_DELIVERY_WORKER_INTERVAL_MS) || 30000,
+    ),
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };

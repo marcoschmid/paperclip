@@ -21,6 +21,7 @@ import { resourceMembershipService } from "../services/resource-memberships.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -354,6 +355,33 @@ describeEmbeddedPostgres("resource membership routes", () => {
 
     expect(projectRes.status).toBe(404);
     expect(agentRes.status).toBe(404);
+  });
+
+  it("blocks historical tombstone resource-membership changes with the stable access code", async () => {
+    const { companyId } = await seed();
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const app = createApp(db, boardActor(companyId));
+
+    const response = await request(app)
+      .put(`/api/companies/${companyId}/resource-memberships/me/agents/${HISTORICAL_TOMBSTONE_ID}`)
+      .send({ starred: true });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.details).toMatchObject({
+      code: "historical_agent_tombstone_access_forbidden",
+      agentId: HISTORICAL_TOMBSTONE_ID,
+    });
+    await expect(db.select().from(agentMemberships)).resolves.toHaveLength(0);
   });
 
   it("rejects agent API key actors", async () => {

@@ -99,6 +99,21 @@ describeEmbeddedPostgres("secretService", () => {
     });
   }
 
+  async function seedAgent(
+    companyId: string,
+    status: "idle" | "pending_approval" | "terminated" = "idle",
+  ) {
+    return db.insert(agents).values({
+      companyId,
+      name: `${status}-${randomUUID()}`,
+      role: "engineer",
+      status,
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning().then((rows) => rows[0]!);
+  }
+
   it("rejects cross-company secret references during env normalization", async () => {
     const companyA = await seedCompany("A");
     const companyB = await seedCompany("B");
@@ -118,6 +133,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("prevents duplicate bindings for a target config path", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     const svc = secretService(db);
     const firstSecret = await svc.create(companyId, {
       name: `first-${randomUUID()}`,
@@ -134,7 +150,7 @@ describeEmbeddedPostgres("secretService", () => {
       companyId,
       secretId: firstSecret.id,
       targetType: "agent",
-      targetId: "agent-1",
+      targetId: agentId,
       configPath: "env.API_KEY",
     });
 
@@ -143,10 +159,125 @@ describeEmbeddedPostgres("secretService", () => {
         companyId,
         secretId: secondSecret.id,
         targetType: "agent",
-        targetId: "agent-1",
+        targetId: agentId,
         configPath: "env.API_KEY",
       }),
     ).rejects.toThrow(/already exists/i);
+  });
+
+  it("fences agent binding and declaration writers by canonical lifecycle identity", async () => {
+    const companyId = await seedCompany("Binding owner");
+    const foreignCompanyId = await seedCompany("Binding foreign");
+    const [liveAgent, pendingAgent, terminatedAgent, foreignAgent] = await Promise.all([
+      seedAgent(companyId),
+      seedAgent(companyId, "pending_approval"),
+      seedAgent(companyId, "terminated"),
+      seedAgent(foreignCompanyId),
+    ]);
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `agent-binding-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "value",
+    });
+    const definition = await svc.createUserSecretDefinition(companyId, {
+      key: `binding_${randomUUID().replaceAll("-", "")}`,
+      name: "Binding definition",
+      provider: "local_encrypted",
+    });
+
+    const created = await svc.createBinding({
+      companyId,
+      secretId: secret.id,
+      targetType: "agent",
+      targetId: liveAgent.id.toUpperCase(),
+      configPath: "env.API_KEY",
+    });
+    expect(created.targetId).toBe(liveAgent.id);
+    await svc.syncUserSecretDeclarationsForTarget(companyId, {
+      targetType: "agent",
+      targetId: liveAgent.id.toUpperCase(),
+    }, [{
+      definitionKey: definition.key,
+      configPath: "env.USER_TOKEN",
+      envKey: "USER_TOKEN",
+    }]);
+    await expect(
+      db.select().from(userSecretDeclarations).where(eq(userSecretDeclarations.targetId, liveAgent.id)),
+    ).resolves.toHaveLength(1);
+
+    for (const invalidAgentId of [pendingAgent.id, terminatedAgent.id]) {
+      await expect(svc.syncSecretRefsForTarget(companyId, {
+        targetType: "agent",
+        targetId: invalidAgentId,
+      }, [{ secretId: secret.id, configPath: "env.BLOCKED" }])).rejects.toMatchObject({
+        status: 409,
+        details: { code: "agent_lifecycle_reference_forbidden" },
+      });
+      await expect(svc.syncUserSecretDeclarationsForTarget(companyId, {
+        targetType: "agent",
+        targetId: invalidAgentId,
+      }, [{
+        definitionKey: definition.key,
+        configPath: "env.BLOCKED_USER",
+        envKey: "BLOCKED_USER",
+      }])).rejects.toMatchObject({
+        status: 409,
+        details: { code: "agent_lifecycle_reference_forbidden" },
+      });
+    }
+    await expect(svc.createBinding({
+      companyId,
+      secretId: secret.id,
+      targetType: "agent",
+      targetId: foreignAgent.id,
+      configPath: "env.FOREIGN",
+    })).rejects.toMatchObject({
+      status: 404,
+      message: "Agent not found",
+    });
+    await expect(svc.createBinding({
+      companyId,
+      secretId: secret.id,
+      targetType: "agent",
+      targetId: randomUUID(),
+      configPath: "env.MISSING",
+    })).rejects.toMatchObject({ status: 404 });
+
+    await db.insert(companySecretBindings).values({
+      companyId,
+      secretId: secret.id,
+      targetType: "agent",
+      targetId: terminatedAgent.id,
+      configPath: "env.STALE",
+      versionSelector: "latest",
+      required: true,
+    });
+    await db.insert(userSecretDeclarations).values({
+      companyId,
+      userSecretDefinitionId: definition.id,
+      targetType: "agent",
+      targetId: terminatedAgent.id,
+      configPath: "env.STALE_USER",
+      envKey: "STALE_USER",
+      versionSelector: "latest",
+      required: true,
+      allowMissingOverride: false,
+    });
+    await expect(svc.syncSecretRefsForTarget(companyId, {
+      targetType: "agent",
+      targetId: terminatedAgent.id.toUpperCase(),
+    }, [], { replaceAll: true })).resolves.toEqual([]);
+    await expect(svc.syncUserSecretDeclarationsForTarget(companyId, {
+      targetType: "agent",
+      targetId: terminatedAgent.id.toUpperCase(),
+    }, [], { replaceAll: true })).resolves.toEqual([]);
+    await expect(
+      db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, terminatedAgent.id)),
+    ).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(userSecretDeclarations).where(eq(userSecretDeclarations.targetId, terminatedAgent.id)),
+    ).resolves.toHaveLength(0);
   });
 
   it("syncs top-level secret refs idempotently", async () => {
@@ -231,6 +362,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("enforces binding context and records value-free access events", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     const svc = secretService(db);
     const secret = await svc.create(companyId, {
       name: `runtime-${randomUUID()}`,
@@ -241,7 +373,7 @@ describeEmbeddedPostgres("secretService", () => {
       API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const },
     };
 
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: agentId }, env);
 
     await expect(
       svc.resolveEnvBindings(companyId, env, {
@@ -254,9 +386,9 @@ describeEmbeddedPostgres("secretService", () => {
 
     const resolved = await svc.resolveEnvBindings(companyId, env, {
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
       actorType: "agent",
-      actorId: "agent-1",
+      actorId: agentId,
     });
 
     expect(resolved.env.API_KEY).toBe("runtime-secret");
@@ -268,6 +400,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("collects declared secret refs that have no binding without resolving values", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     const svc = secretService(db);
     const secretName = `unbound-${randomUUID()}`;
     const secret = await svc.create(companyId, {
@@ -282,13 +415,13 @@ describeEmbeddedPostgres("secretService", () => {
 
     const missing = await svc.collectMissingRuntimeBindings(companyId, env, {
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
     });
 
     expect(missing).toHaveLength(1);
     expect(missing[0]).toMatchObject({
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
       configPath: "env.API_KEY",
       envKey: "API_KEY",
       secretId: secret.id,
@@ -297,17 +430,18 @@ describeEmbeddedPostgres("secretService", () => {
     // Value-free validation: no access events recorded.
     expect(await svc.listAccessEvents(companyId, secret.id)).toHaveLength(0);
 
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: agentId }, env);
 
     const afterBinding = await svc.collectMissingRuntimeBindings(companyId, env, {
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
     });
     expect(afterBinding).toEqual([]);
   });
 
   it("denies runtime secret resolution outside the low-trust binding allowlist", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     const svc = secretService(db);
     const secret = await svc.create(companyId, {
       name: `low-trust-${randomUUID()}`,
@@ -318,16 +452,16 @@ describeEmbeddedPostgres("secretService", () => {
       API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const },
     };
 
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: agentId }, env);
     const [binding] = await svc.listBindings(companyId, secret.id);
     expect(binding?.id).toBeTruthy();
 
     await expect(
       svc.resolveEnvBindings(companyId, env, {
         consumerType: "agent",
-        consumerId: "agent-1",
+        consumerId: agentId,
         actorType: "agent",
-        actorId: "agent-1",
+        actorId: agentId,
         allowedBindingIds: ["11111111-1111-4111-8111-111111111111"],
       }),
     ).rejects.toMatchObject({
@@ -337,9 +471,9 @@ describeEmbeddedPostgres("secretService", () => {
 
     const resolved = await svc.resolveEnvBindings(companyId, env, {
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
       actorType: "agent",
-      actorId: "agent-1",
+      actorId: agentId,
       allowedBindingIds: [binding!.id],
     });
     expect(resolved.env.API_KEY).toBe("runtime-secret");
@@ -348,6 +482,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("denies user secret resolution outside the low-trust declaration allowlist", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     await seedCompanyMember(companyId, "user-1", "owner");
     const svc = secretService(db);
     const definition = await svc.createUserSecretDefinition(companyId, {
@@ -359,7 +494,7 @@ describeEmbeddedPostgres("secretService", () => {
       GITHUB_TOKEN: { type: "user_secret_ref" as const, key: "github_token", version: "latest" as const },
     };
 
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: agentId }, env);
     await svc.createCurrentUserSecretValue(companyId, "user-1", {
       definitionKey: "github_token",
       value: "user-one-secret",
@@ -373,9 +508,9 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(
       svc.resolveEnvBindings(companyId, env, {
         consumerType: "agent",
-        consumerId: "agent-1",
+        consumerId: agentId,
         actorType: "agent",
-        actorId: "agent-1",
+        actorId: agentId,
         responsibleUserId: "user-1",
         allowedBindingIds: ["11111111-1111-4111-8111-111111111111"],
       }),
@@ -386,9 +521,9 @@ describeEmbeddedPostgres("secretService", () => {
 
     const resolved = await svc.resolveEnvBindings(companyId, env, {
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
       actorType: "agent",
-      actorId: "agent-1",
+      actorId: agentId,
       responsibleUserId: "user-1",
       allowedBindingIds: [declaration!.id],
     });
@@ -443,6 +578,8 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("resolves user secret refs through responsible-user values and records owner metadata", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
+    const optionalAgentId = (await seedAgent(companyId)).id;
     await seedCompanyMember(companyId, "user-1", "owner");
     await seedCompanyMember(companyId, "user-2", "member");
     const svc = secretService(db);
@@ -455,7 +592,7 @@ describeEmbeddedPostgres("secretService", () => {
       GITHUB_TOKEN: { type: "user_secret_ref" as const, key: "github_token", version: "latest" as const },
     };
 
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: agentId }, env);
     const userOneSecret = await svc.createCurrentUserSecretValue(companyId, "user-1", {
       definitionKey: "github_token",
       value: "user-one-secret",
@@ -464,16 +601,16 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(
       svc.resolveEnvBindings(companyId, env, {
         consumerType: "agent",
-        consumerId: "agent-1",
+        consumerId: agentId,
         actorType: "agent",
-        actorId: "agent-1",
+        actorId: agentId,
         responsibleUserId: "user-2",
       }),
     ).rejects.toThrow(/not configured/i);
     await expect(
       svc.collectMissingRuntimeBindings(companyId, env, {
         consumerType: "agent",
-        consumerId: "agent-1",
+        consumerId: agentId,
         responsibleUserId: "user-2",
       }),
     ).resolves.toEqual([
@@ -496,20 +633,20 @@ describeEmbeddedPostgres("secretService", () => {
         required: false,
       },
     };
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-optional" }, optionalEnv);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: optionalAgentId }, optionalEnv);
     await expect(
       svc.collectMissingRuntimeBindings(companyId, optionalEnv, {
         consumerType: "agent",
-        consumerId: "agent-optional",
+        consumerId: optionalAgentId,
         responsibleUserId: "user-2",
       }),
     ).resolves.toEqual([]);
     await expect(
       svc.resolveEnvBindings(companyId, optionalEnv, {
         consumerType: "agent",
-        consumerId: "agent-optional",
+        consumerId: optionalAgentId,
         actorType: "agent",
-        actorId: "agent-optional",
+        actorId: optionalAgentId,
         responsibleUserId: "user-2",
       }),
     ).resolves.toMatchObject({
@@ -524,7 +661,7 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(
       svc.collectMissingRuntimeBindings(companyId, env, {
         consumerType: "agent",
-        consumerId: "agent-1",
+        consumerId: agentId,
         responsibleUserId: "user-2",
       }),
     ).resolves.toEqual([
@@ -542,9 +679,9 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(
       svc.resolveEnvBindings(companyId, optionalEnv, {
         consumerType: "agent",
-        consumerId: "agent-optional",
+        consumerId: optionalAgentId,
         actorType: "agent",
-        actorId: "agent-optional",
+        actorId: optionalAgentId,
         responsibleUserId: "user-2",
       }),
     ).resolves.toMatchObject({
@@ -558,9 +695,9 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(
       svc.resolveEnvBindings(companyId, optionalEnv, {
         consumerType: "agent",
-        consumerId: "agent-optional",
+        consumerId: optionalAgentId,
         actorType: "agent",
-        actorId: "agent-optional",
+        actorId: optionalAgentId,
         responsibleUserId: "user-2",
       }),
     ).resolves.toMatchObject({
@@ -574,9 +711,9 @@ describeEmbeddedPostgres("secretService", () => {
 
     const resolved = await svc.resolveEnvBindings(companyId, env, {
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
       actorType: "agent",
-      actorId: "agent-1",
+      actorId: agentId,
       responsibleUserId: "user-1",
     });
 
@@ -592,7 +729,7 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(
       svc.resolveSecretValue(companyId, userOneSecret.id, "latest", {
         consumerType: "agent",
-        consumerId: "agent-1",
+        consumerId: agentId,
         configPath: "env.GITHUB_TOKEN",
       }),
     ).rejects.toThrow(/User-scoped secrets/i);
@@ -989,6 +1126,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("reports missing adapter-config user secret refs before runtime resolution", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     await seedCompanyMember(companyId, "user-1", "owner");
     const svc = secretService(db);
     const definition = await svc.createUserSecretDefinition(companyId, {
@@ -1002,7 +1140,7 @@ describeEmbeddedPostgres("secretService", () => {
     };
     await svc.syncUserSecretDeclarationsForTarget(companyId, {
       targetType: "agent",
-      targetId: "agent-1",
+      targetId: agentId,
     }, [
       {
         definitionKey: "hermes_api_key",
@@ -1018,7 +1156,7 @@ describeEmbeddedPostgres("secretService", () => {
         "hermes_gateway",
         {
           consumerType: "agent",
-          consumerId: "agent-1",
+          consumerId: agentId,
           responsibleUserId: "user-1",
         },
       ),
@@ -1049,7 +1187,7 @@ describeEmbeddedPostgres("secretService", () => {
         "hermes_gateway",
         {
           consumerType: "agent",
-          consumerId: "agent-1",
+          consumerId: agentId,
           responsibleUserId: "user-1",
         },
       ),
@@ -1066,7 +1204,7 @@ describeEmbeddedPostgres("secretService", () => {
         "hermes_gateway",
         {
           consumerType: "agent",
-          consumerId: "agent-1",
+          consumerId: agentId,
           responsibleUserId: "user-1",
         },
       ),
@@ -1199,6 +1337,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("scopes env binding sync deletes to the env path prefix", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     const svc = secretService(db);
     const runtimeSecret = await svc.create(companyId, {
       name: `runtime-ref-${randomUUID()}`,
@@ -1215,31 +1354,32 @@ describeEmbeddedPostgres("secretService", () => {
       companyId,
       secretId: runtimeSecret.id,
       targetType: "agent",
-      targetId: "agent-1",
+      targetId: agentId,
       configPath: "runtime.token",
     });
     await svc.syncEnvBindingsForTarget(
       companyId,
-      { targetType: "agent", targetId: "agent-1" },
+      { targetType: "agent", targetId: agentId },
       {
         API_KEY: { type: "secret_ref", secretId: envSecret.id, version: "latest" },
       },
     );
     await svc.syncEnvBindingsForTarget(
       companyId,
-      { targetType: "agent", targetId: "agent-1" },
+      { targetType: "agent", targetId: agentId },
       {},
     );
 
     const bindings = await db
       .select()
       .from(companySecretBindings)
-      .where(eq(companySecretBindings.targetId, "agent-1"));
+      .where(eq(companySecretBindings.targetId, agentId));
     expect(bindings.map((binding) => binding.configPath)).toEqual(["runtime.token"]);
   });
 
   it("returns resolved secrets even when success metadata writes fail", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     const svc = secretService(db);
     const secret = await svc.create(companyId, {
       name: `metadata-write-${randomUUID()}`,
@@ -1249,7 +1389,7 @@ describeEmbeddedPostgres("secretService", () => {
     const env = {
       API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const },
     };
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: agentId }, env);
 
     vi.spyOn(db, "update").mockImplementationOnce(
       () => ({
@@ -1261,9 +1401,9 @@ describeEmbeddedPostgres("secretService", () => {
 
     const resolved = await svc.resolveEnvBindings(companyId, env, {
       consumerType: "agent",
-      consumerId: "agent-1",
+      consumerId: agentId,
       actorType: "agent",
-      actorId: "agent-1",
+      actorId: agentId,
     });
 
     expect(resolved.env.API_KEY).toBe("runtime-secret");
@@ -1431,6 +1571,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   it("rejects bindings and env refs to soft-deleted external reference secrets", async () => {
     const companyId = await seedCompany();
+    const agentId = (await seedAgent(companyId)).id;
     const svc = secretService(db);
     const awsVault = await svc.createProviderConfig(companyId, {
       provider: "aws_secrets_manager",
@@ -1452,7 +1593,7 @@ describeEmbeddedPostgres("secretService", () => {
         companyId,
         secretId: deleted.id,
         targetType: "agent",
-        targetId: "agent-1",
+        targetId: agentId,
         configPath: "env.API_KEY",
       }),
     ).rejects.toThrow(/not found/i);

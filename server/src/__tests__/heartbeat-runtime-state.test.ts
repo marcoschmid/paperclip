@@ -34,6 +34,7 @@ const { heartbeatService } = await import("../services/heartbeat.ts");
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -101,6 +102,32 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
       adapterType: "codex_local",
       stateJson: {},
     });
+  });
+
+  it("does not lazily create runtime state while reading a historical tombstone", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [historical] = await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning();
+
+    await expect(heartbeatService(db).getRuntimeState(HISTORICAL_TOMBSTONE_ID)).resolves.toBeNull();
+    await expect(db.select().from(agentRuntimeState)).resolves.toHaveLength(0);
+    const persisted = await db.select().from(agents).where(eq(agents.id, HISTORICAL_TOMBSTONE_ID));
+    expect(persisted[0]?.updatedAt).toEqual(historical!.updatedAt);
   });
 
   it("publishes runtime progress without persisting heartbeat run events", async () => {

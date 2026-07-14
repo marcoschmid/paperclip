@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -17,6 +18,7 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -146,5 +148,105 @@ describeEmbeddedPostgres("actorMiddleware agent API key activity logging", () =>
     const rows = await db.select().from(activityLog);
     const authEvents = rows.filter((row) => row.action === "auth.agent_token_used");
     expect(authEvents).toHaveLength(0);
+  });
+
+  it("rejects a fixed historical tombstone key without touching lastUsedAt", async () => {
+    const token = `historical-agent-token-${randomUUID()}`;
+    const companyId = randomUUID();
+    const keyId = randomUUID();
+    const lastUsedAt = new Date("2026-07-13T18:00:00.000Z");
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Historical auth",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agentApiKeys).values({
+      id: keyId,
+      agentId: HISTORICAL_TOMBSTONE_ID,
+      companyId,
+      name: "historical-key",
+      keyHash: hashToken(token),
+      responsibleUserId: randomUUID(),
+      lastUsedAt,
+    });
+
+    const res = await request(buildApp()).get("/actor").set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "none" });
+    const persisted = await db
+      .select()
+      .from(agentApiKeys)
+      .where(eq(agentApiKeys.id, keyId))
+      .then((rows) => rows[0]);
+    expect(persisted?.lastUsedAt).toEqual(lastUsedAt);
+    expect(await db.select().from(activityLog)).toEqual([]);
+  });
+
+  it("validates API-key company ownership before touching lastUsedAt", async () => {
+    const token = `cross-company-agent-token-${randomUUID()}`;
+    const agentCompanyId = randomUUID();
+    const keyCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const keyId = randomUUID();
+    const lastUsedAt = new Date("2026-07-13T18:30:00.000Z");
+    await db.insert(companies).values([
+      {
+        id: agentCompanyId,
+        name: "Agent company",
+        issuePrefix: `A${agentCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: keyCompanyId,
+        name: "Key company",
+        issuePrefix: `K${keyCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(agents).values({
+      id: agentId,
+      companyId: agentCompanyId,
+      name: "CrossCompanyAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agentApiKeys).values({
+      id: keyId,
+      agentId,
+      companyId: keyCompanyId,
+      name: "forged-company-key",
+      keyHash: hashToken(token),
+      responsibleUserId: randomUUID(),
+      lastUsedAt,
+    });
+
+    const res = await request(buildApp()).get("/actor").set("authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "none" });
+    const persisted = await db
+      .select()
+      .from(agentApiKeys)
+      .where(eq(agentApiKeys.id, keyId))
+      .then((rows) => rows[0]);
+    expect(persisted?.lastUsedAt).toEqual(lastUsedAt);
+    expect(await db.select().from(activityLog)).toEqual([]);
   });
 });

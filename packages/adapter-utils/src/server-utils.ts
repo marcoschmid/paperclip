@@ -15,6 +15,8 @@ export interface RunProcessResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  /** True only when this runner sent the terminal-result cleanup signal; omitted means false. */
+  terminalResultCleanupTriggered?: boolean;
   stdout: string;
   stderr: string;
   pid: number | null;
@@ -128,6 +130,92 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "- If blocked, mark the issue blocked and name the unblock owner and action.",
   "- Respect budget, pause/cancel, approval gates, and company boundaries.",
 ].join("\n");
+
+export const PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER =
+  "PAPERCLIP_LIFECYCLE_CANARY_RESULT_V1";
+export const PAPERCLIP_LIFECYCLE_CANARY_EVIDENCE_MAX_BYTES = 320;
+export const PAPERCLIP_LIFECYCLE_CANARY_PREFIX_MAX_BYTES = 1024;
+
+export type PaperclipLifecycleCanaryResult = {
+  outcome: "passed";
+  evidence: string;
+};
+
+/**
+ * Parse the deliberately tiny lifecycle-canary completion envelope. The whole
+ * final answer is authenticated by the surrounding adapter run; accepting no
+ * prose, fences, extra keys, multiline evidence, or non-pass outcomes keeps the
+ * server-mediated write path fail-closed.
+ */
+export function parsePaperclipLifecycleCanaryResult(
+  value: unknown,
+): PaperclipLifecycleCanaryResult | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  const lines = normalized.split(/\r?\n/);
+  if (lines.length !== 2 || lines[0] !== PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER) {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lines[1]!);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  if (Object.keys(record).sort().join(",") !== "evidence,outcome") return null;
+  if (record.outcome !== "passed" || typeof record.evidence !== "string") return null;
+  const evidence = record.evidence;
+  if (evidence !== evidence.trim() || evidence.length === 0) return null;
+  if (
+    /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(evidence)
+    || evidence.includes(PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER)
+  ) {
+    return null;
+  }
+  const evidenceBytes = Buffer.byteLength(evidence, "utf8");
+  if (evidenceBytes < 8 || evidenceBytes > PAPERCLIP_LIFECYCLE_CANARY_EVIDENCE_MAX_BYTES) {
+    return null;
+  }
+  if (lines[1] !== JSON.stringify({ outcome: "passed", evidence })) return null;
+  return { outcome: "passed", evidence };
+}
+
+/**
+ * Extract the exact terminal envelope from an adapter final summary. Some
+ * runtimes prepend one short factual work note even when asked for a two-line
+ * final answer. The trusted proof still comes only from the final envelope:
+ * it must be the only marker, be separated by exactly one blank line, end the
+ * summary, and retain the strict parser's exact JSON/evidence constraints.
+ */
+export function extractPaperclipLifecycleCanaryResultFromFinalSummary(
+  value: unknown,
+): PaperclipLifecycleCanaryResult | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  const lines = normalized.split(/\r?\n/);
+  const markerIndexes = lines.flatMap((line, index) =>
+    line === PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER ? [index] : [],
+  );
+  if (markerIndexes.length !== 1) return null;
+  const markerIndex = markerIndexes[0]!;
+  if (markerIndex === 0) return parsePaperclipLifecycleCanaryResult(normalized);
+  if (markerIndex !== lines.length - 2 || lines[markerIndex - 1] !== "") return null;
+
+  const prefixLines = lines.slice(0, markerIndex - 1);
+  const prefix = prefixLines.join("\n");
+  if (
+    prefix.length === 0
+    || prefix !== prefix.trim()
+    || prefix.includes(PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER)
+    || Buffer.byteLength(prefix, "utf8") > PAPERCLIP_LIFECYCLE_CANARY_PREFIX_MAX_BYTES
+    || prefixLines.some((line) => /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(line))
+  ) return null;
+
+  return parsePaperclipLifecycleCanaryResult(lines.slice(markerIndex).join("\n"));
+}
 
 export const WATCHDOG_DEFAULT_MANDATE = [
   "You are running as a task watchdog, not as the original deliverable worker.",
@@ -1288,6 +1376,16 @@ export function renderPaperclipWakePrompt(
   if (normalized.issue?.priority) {
     lines.push(`- issue priority: ${normalized.issue.priority}`);
   }
+  if (normalized.reason === "lifecycle_pending_canary") {
+    lines.push(
+      "",
+      "## Lifecycle Canary Completion Contract",
+      "",
+      "This one-shot contract supersedes generic Paperclip API/comment/status instructions for this lifecycle canary only.",
+      "Complete only the bounded issue work from the inline task context and permitted local tools. Do not call the Paperclip API, curl Paperclip, or update the issue yourself; the server records the evidence and final disposition atomically for this authenticated run.",
+      `Emit a pass result if and only if the bounded work succeeded. Evidence must be one line, at least 8 and at most ${PAPERCLIP_LIFECYCLE_CANARY_EVIDENCE_MAX_BYTES} UTF-8 bytes. Your entire final answer must consist of exactly the two-line envelope from the final output override. Any other final-answer shape fails closed and requires reviewed repair.`,
+    );
+  }
   if (normalized.checkboxSelection) {
     if (normalized.checkboxSelection.prompt) {
       lines.push(`- checkbox prompt: ${normalized.checkboxSelection.prompt}`);
@@ -1610,6 +1708,19 @@ export function renderPaperclipWakePrompt(
       lines.push("[comment body truncated]");
     }
     lines.push("");
+  }
+
+  if (normalized.reason === "lifecycle_pending_canary") {
+    lines.push(
+      "",
+      "## Lifecycle Canary Final Output Override",
+      "",
+      "Your entire final answer must consist of exactly the two-line envelope below.",
+      "Do not include a work note, findings, explanation, or any other prose; put the bounded factual result only in the evidence string.",
+      "The final two lines below must be the last two lines of your answer, with no text or blank line after them:",
+      PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+      '{"outcome":"passed","evidence":"single-line factual evidence"}',
+    );
   }
 
   return lines.join("\n").trim();
@@ -3011,6 +3122,7 @@ export async function runChildProcess(
                 exitCode: code,
                 signal,
                 timedOut,
+                terminalResultCleanupTriggered: terminalCleanupStarted,
                 stdout,
                 stderr,
                 pid: child.pid ?? null,

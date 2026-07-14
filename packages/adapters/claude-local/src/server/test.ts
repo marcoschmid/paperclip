@@ -33,7 +33,10 @@ import {
 } from "./parse.js";
 import { claudeCommandLooksLike, claudeCommandSupportsEffortFlag } from "./cli-capabilities.js";
 import { isBedrockModelId } from "./models.js";
-import { buildClaudeProbePermissionArgs } from "./permissions.js";
+import {
+  assertClaudePermissionConfigIsFailClosed,
+  buildClaudeProbePermissionArgs,
+} from "./permissions.js";
 import { materializeRemoteClaudeConfig, prepareClaudeConfigSeed } from "./claude-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -90,6 +93,7 @@ export async function testEnvironment(
 ): Promise<AdapterEnvironmentTestResult> {
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
+  assertClaudePermissionConfigIsFailClosed(config);
   const command = asString(config.command, "claude");
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";
@@ -289,7 +293,8 @@ export async function testEnvironment(
       const effort = asString(config.effort, "").trim();
       const chrome = asBoolean(config.chrome, false);
       const maxTurns = asNumber(config.maxTurnsPerRun, 0);
-      const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+      const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, false);
+      const allowedTools = asStringArray(config.allowedTools);
       const extraArgs = (() => {
         const fromExtraArgs = asStringArray(config.extraArgs);
         if (fromExtraArgs.length > 0) return fromExtraArgs;
@@ -320,7 +325,11 @@ export async function testEnvironment(
       }
 
       const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
-      args.push(...buildClaudeProbePermissionArgs({ dangerouslySkipPermissions, targetIsRemote }));
+      args.push(...buildClaudeProbePermissionArgs({
+        dangerouslySkipPermissions,
+        allowedTools,
+        targetIsRemote,
+      }));
       if (chrome) args.push("--chrome");
       // For Bedrock: only pass --model when the ID is a Bedrock-native identifier.
       if (model && (!hasBedrock || isBedrockModelId(model))) {

@@ -556,6 +556,98 @@ describe("resolveExecutionRunAdapterConfig codex_local credential pre-dispatch g
     ).resolves.not.toContain("sk-");
   });
 
+  it("reports the per-agent managed home when keyless config omits CODEX_HOME", async () => {
+    const { managedAgentHome } = await stubManagedCodexEnv({ seedSharedAuth: false });
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { command: "codex", env: { OPENAI_API_KEY: "" } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+
+    await expect(
+      resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        adapterType: "codex_local",
+        executionRunConfig: { command: "codex", env: { OPENAI_API_KEY: "" } },
+        projectEnv: null,
+        secretsSvc: {
+          resolveAdapterConfigForRuntime,
+          resolveEnvBindings: vi.fn(),
+          collectMissingRuntimeBindings: vi.fn().mockResolvedValue([]),
+        } as any,
+      }),
+    ).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          effectiveCodexHome: managedAgentHome,
+        },
+      },
+    });
+  });
+
+  it("surfaces configuration-incomplete for a sibling managed agent CODEX_HOME", async () => {
+    const { managedAgentHome } = await stubManagedCodexEnv({ seedSharedAuth: false });
+    const siblingManagedHome = path.join(
+      path.dirname(path.dirname(managedAgentHome)),
+      "agent-2",
+      "codex-home",
+    );
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { command: "codex", env: { CODEX_HOME: siblingManagedHome, OPENAI_API_KEY: "" } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+
+    await expect(
+      resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        adapterType: "codex_local",
+        executionRunConfig: { command: "codex", env: { CODEX_HOME: siblingManagedHome } },
+        projectEnv: null,
+        secretsSvc: {
+          resolveAdapterConfigForRuntime,
+          resolveEnvBindings: vi.fn(),
+          collectMissingRuntimeBindings: vi.fn().mockResolvedValue([]),
+        } as any,
+      }),
+    ).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          effectiveCodexHome: siblingManagedHome,
+        },
+      },
+    });
+  });
+
+  it("surfaces configuration-incomplete when env overrides CODEX_HOME to the host auth source", async () => {
+    const { root } = await stubManagedCodexEnv({ seedSharedAuth: false });
+    const hostSource = path.join(root, "shared-codex-home");
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { command: "codex", env: { CODEX_HOME: hostSource, OPENAI_API_KEY: "" } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+
+    await expect(
+      resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        adapterType: "codex_local",
+        executionRunConfig: { command: "codex", env: { CODEX_HOME: hostSource } },
+        projectEnv: null,
+        secretsSvc: {
+          resolveAdapterConfigForRuntime,
+          resolveEnvBindings: vi.fn(),
+          collectMissingRuntimeBindings: vi.fn().mockResolvedValue([]),
+        } as any,
+      }),
+    ).rejects.toMatchObject({ code: "configuration_incomplete" });
+  });
+
   it("dispatches normally when a per-agent OPENAI_API_KEY is resolved", async () => {
     const { managedAgentHome } = await stubManagedCodexEnv({ seedSharedAuth: false });
     const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({

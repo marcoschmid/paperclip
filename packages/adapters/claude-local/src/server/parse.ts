@@ -257,8 +257,19 @@ function buildClaudeTransientHaystack(input: {
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean)
+    .filter((line) => line.length > 0 && !isAllowedClaudeRateLimitEvent(line))
     .join("\n");
+}
+
+function isAllowedClaudeRateLimitEvent(line: string): boolean {
+  const event = parseJson(line);
+  if (!event || asString(event.type, "") !== "rate_limit_event") return false;
+  const rateLimitInfo = {
+    ...parseObject(event.rateLimitInfo),
+    ...parseObject(event.rate_limit_info),
+  };
+  const status = asString(rateLimitInfo.status, asString(event.status, ""));
+  return status.trim().toLowerCase() === "allowed";
 }
 
 function readTimeZoneParts(date: Date, timeZone: string) {

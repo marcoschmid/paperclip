@@ -4,12 +4,13 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, companySkills, createDb } from "@paperclipai/db";
+import { agents, companies, companySkills, companySkillStars, companySkillVersions, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { companySkillService } from "../services/company-skills.ts";
+import { resolvePaperclipInstanceRoot } from "../home-paths.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -39,6 +40,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
 
   afterEach(async () => {
     await db.delete(agents);
+    await db.delete(companySkillVersions);
     await db.delete(companySkills);
     await db.delete(companies);
     await Promise.all(Array.from(cleanupDirs, (dir) => fs.rm(dir, { recursive: true, force: true })));
@@ -53,6 +55,71 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     }
     await tempDb?.cleanup();
   });
+
+  async function seedPinnedMissingSourceSkill(
+    versionInventory: Array<{ path: string; kind: string; content: unknown }> = [{
+      path: "SKILL.md",
+      kind: "skill",
+      content: "# Immutable Version\n\nRuntime authority.\n",
+    }],
+  ) {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const versionId = randomUUID();
+    const skillKey = `company/${companyId}/version-fallback`;
+    const missingSkillDir = path.join(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-version-fallback-skill-")),
+      "gone",
+    );
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug: "version-fallback",
+      name: "Version Fallback",
+      description: null,
+      markdown: "# Mutable Base\n\nMust not execute.\n",
+      sourceType: "local_path",
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      currentVersionId: null,
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(companySkillVersions).values({
+      id: versionId,
+      companyId,
+      companySkillId: skillId,
+      revisionNumber: 1,
+      label: "runtime authority",
+      fileInventory: versionInventory as any,
+    });
+    await db.update(companySkills).set({ currentVersionId: versionId }).where(eq(companySkills.id, skillId));
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Version Snapshot Consumer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {
+        paperclipSkillSync: {
+          desiredSkills: [skillKey],
+        },
+      },
+    });
+
+    return { companyId, skillId, versionId, skillKey, missingSkillDir };
+  }
 
   it("lists skills without exposing markdown content", async () => {
     const companyId = randomUUID();
@@ -269,6 +336,114 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       starred: false,
       starCount: 0,
     });
+  });
+
+  it("fences agent skill stars by canonical lifecycle identity while allowing unstar cleanup", async () => {
+    const companyId = randomUUID();
+    const foreignCompanyId = randomUUID();
+    const skillId = randomUUID();
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Skill Star Company",
+        issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: foreignCompanyId,
+        name: "Foreign Skill Star Company",
+        issuePrefix: `F${foreignCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/agent-star-skill`,
+      slug: "agent-star-skill",
+      name: "Agent Star Skill",
+      markdown: "# Agent Star Skill",
+      sourceType: "local_path",
+      sourceLocator: null,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+    const [liveAgent, pendingAgent, terminatedAgent, foreignAgent] = await db.insert(agents).values([
+      {
+        companyId,
+        name: "Live skill star agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      },
+      {
+        companyId,
+        name: "Pending skill star agent",
+        role: "engineer",
+        status: "pending_approval",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      },
+      {
+        companyId,
+        name: "Terminated skill star agent",
+        role: "engineer",
+        status: "terminated",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      },
+      {
+        companyId: foreignCompanyId,
+        name: "Foreign skill star agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      },
+    ]).returning();
+
+    await expect(svc.starSkill(companyId, skillId, {
+      type: "agent",
+      agentId: liveAgent!.id.toUpperCase(),
+    })).resolves.toMatchObject({ starred: true, starCount: 1 });
+    const [storedLiveStar] = await db.select().from(companySkillStars).where(eq(companySkillStars.companySkillId, skillId));
+    expect(storedLiveStar?.agentId).toBe(liveAgent!.id);
+
+    for (const invalidAgentId of [pendingAgent!.id, terminatedAgent!.id]) {
+      await expect(svc.starSkill(companyId, skillId, {
+        type: "agent",
+        agentId: invalidAgentId,
+      })).rejects.toMatchObject({
+        status: 409,
+        details: { code: "agent_lifecycle_reference_forbidden" },
+      });
+    }
+    await expect(svc.starSkill(companyId, skillId, {
+      type: "agent",
+      agentId: foreignAgent!.id,
+    })).rejects.toMatchObject({
+      status: 404,
+      message: "Agent not found",
+    });
+
+    await db.insert(companySkillStars).values({
+      companyId,
+      companySkillId: skillId,
+      agentId: terminatedAgent!.id,
+    });
+    await expect(svc.unstarSkill(companyId, skillId, {
+      type: "agent",
+      agentId: terminatedAgent!.id.toUpperCase(),
+    })).resolves.toMatchObject({ starred: false, starCount: 1 });
+    await expect(
+      db.select().from(companySkillStars).where(eq(companySkillStars.agentId, terminatedAgent!.id)),
+    ).resolves.toHaveLength(0);
   });
 
   it("updates private/company sharing scope and rejects public link publishing", async () => {
@@ -989,6 +1164,145 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await expect(fs.readFile(path.join(entry!.source, "SKILL.md"), "utf8")).resolves.toBe(
       "# Runtime Coach\n\nRecovered from DB.\n",
     );
+  });
+
+  it("uses the immutable current-version snapshot before mutable base metadata when a source is missing", async () => {
+    const { companyId, skillId, versionId, skillKey } = await seedPinnedMissingSourceSkill();
+
+    const entries = await svc.listRuntimeSkillEntries(companyId);
+    const entry = entries.find((candidate) => candidate.key === skillKey);
+
+    expect(entry).toMatchObject({ key: skillKey, sourceStatus: "available", currentVersionId: versionId });
+    await expect(fs.readFile(path.join(entry!.source, "SKILL.md"), "utf8")).resolves.toBe(
+      "# Immutable Version\n\nRuntime authority.\n",
+    );
+  });
+
+  it("fails closed instead of using mutable base metadata when currentVersionId points outside the skill", async () => {
+    const fixture = await seedPinnedMissingSourceSkill();
+    const otherSkillId = randomUUID();
+    const otherVersionId = randomUUID();
+    const otherSkillKey = `company/${fixture.companyId}/other-version-owner`;
+    await db.insert(companySkills).values({
+      id: otherSkillId,
+      companyId: fixture.companyId,
+      key: otherSkillKey,
+      slug: "other-version-owner",
+      name: "Other Version Owner",
+      markdown: "# Other\n",
+      sourceType: "local_path",
+      sourceLocator: fixture.missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+    });
+    await db.insert(companySkillVersions).values({
+      id: otherVersionId,
+      companyId: fixture.companyId,
+      companySkillId: otherSkillId,
+      revisionNumber: 1,
+      fileInventory: [{ path: "SKILL.md", kind: "skill", content: "# Foreign Version\n" }],
+    });
+    await db.update(companySkills).set({ currentVersionId: otherVersionId })
+      .where(eq(companySkills.id, fixture.skillId));
+    await db.update(agents).set({
+      adapterConfig: {
+        paperclipSkillSync: {
+          desiredSkills: [fixture.skillKey, otherSkillKey],
+        },
+      },
+    }).where(eq(agents.companyId, fixture.companyId));
+
+    const entry = (await svc.listRuntimeSkillEntries(fixture.companyId))
+      .find((candidate) => candidate.key === fixture.skillKey);
+
+    expect(entry).toMatchObject({
+      key: fixture.skillKey,
+      currentVersionId: otherVersionId,
+      sourceStatus: "missing",
+      missingDetail: expect.stringContaining("current version"),
+    });
+    await expect(fs.stat(entry!.source)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails closed instead of using mutable base metadata for a corrupt current-version snapshot", async () => {
+    const fixture = await seedPinnedMissingSourceSkill([{
+      path: "SKILL.md",
+      kind: "skill",
+      content: 42,
+    }]);
+
+    const entry = (await svc.listRuntimeSkillEntries(fixture.companyId))
+      .find((candidate) => candidate.key === fixture.skillKey);
+
+    expect(entry).toMatchObject({
+      key: fixture.skillKey,
+      currentVersionId: fixture.versionId,
+      sourceStatus: "missing",
+      missingDetail: expect.stringContaining("current version"),
+    });
+    await expect(fs.stat(entry!.source)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("never deletes or replaces an already visible inconsistent immutable version directory", async () => {
+    const fixture = await seedPinnedMissingSourceSkill();
+    const finalDir = path.join(
+      resolvePaperclipInstanceRoot(),
+      "skills",
+      fixture.companyId,
+      "__versions__",
+      fixture.skillId,
+      fixture.versionId,
+    );
+    await fs.mkdir(finalDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(finalDir, "SKILL.md"), "# Visible Corrupt Snapshot\n", "utf8");
+
+    const entry = (await svc.listRuntimeSkillEntries(fixture.companyId))
+      .find((candidate) => candidate.key === fixture.skillKey);
+
+    expect(entry).toMatchObject({ sourceStatus: "missing" });
+    await expect(fs.readFile(path.join(finalDir, "SKILL.md"), "utf8"))
+      .resolves.toBe("# Visible Corrupt Snapshot\n");
+  });
+
+  it("publishes one complete 0700 immutable snapshot under parallel runtime resolution", async () => {
+    const fixture = await seedPinnedMissingSourceSkill([
+      { path: "SKILL.md", kind: "skill", content: "# Immutable Version\n" },
+      ...Array.from({ length: 24 }, (_, index) => ({
+        path: `references/${index.toString().padStart(2, "0")}.md`,
+        kind: "reference",
+        content: `# Reference ${index}\n${"x".repeat(4096)}`,
+      })),
+    ]);
+    const finalDir = path.join(
+      resolvePaperclipInstanceRoot(),
+      "skills",
+      fixture.companyId,
+      "__versions__",
+      fixture.skillId,
+      fixture.versionId,
+    );
+    const rmCallsOnFinal: string[] = [];
+    const originalRm = fs.rm.bind(fs);
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.resolve(String(target)) === finalDir) rmCallsOnFinal.push(String(target));
+      return originalRm(target, options);
+    });
+    try {
+      const entries = await Promise.all(Array.from({ length: 8 }, async () => (
+        (await svc.listRuntimeSkillEntries(fixture.companyId))
+          .find((candidate) => candidate.key === fixture.skillKey)
+      )));
+      expect(entries.every((entry) => entry?.sourceStatus === "available" && entry.source === finalDir)).toBe(true);
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    expect(rmCallsOnFinal).toEqual([]);
+    expect((await fs.stat(finalDir)).mode & 0o777).toBe(0o700);
+    expect(await fs.readdir(path.dirname(finalDir))).toEqual([fixture.versionId]);
+    await expect(fs.readFile(path.join(finalDir, "references", "23.md"), "utf8"))
+      .resolves.toContain("# Reference 23");
   });
 
   it("falls back to stored markdown when reading SKILL.md from a missing local source", async () => {

@@ -40,6 +40,7 @@ import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -375,6 +376,152 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("rejects reopening done or cancelled issues owned by a terminated agent", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const terminatedAgentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: terminatedAgentId,
+      name: "TerminatedOwner",
+      status: "terminated",
+    }));
+
+    for (const status of ["done", "cancelled"] as const) {
+      const [terminal] = await db.insert(issues).values({
+        companyId,
+        title: `${status} issue`,
+        status,
+        priority: "medium",
+        assigneeAgentId: terminatedAgentId,
+      }).returning();
+
+      await expect(svc.update(terminal!.id, { status: "todo" }))
+        .rejects.toMatchObject({
+          status: 409,
+          details: {
+            code: "agent_not_assignable",
+            reason: "assignee_terminated",
+            assigneeAgentId: terminatedAgentId,
+          },
+        });
+
+      const persisted = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, terminal!.id))
+        .then((rows) => rows[0]);
+      expect(persisted).toEqual({
+        status,
+        assigneeAgentId: terminatedAgentId,
+      });
+    }
+  });
+
+  it("blocks historical tombstone assignment on issue create and patch without partial writes", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: HISTORICAL_TOMBSTONE_ID,
+      name: "HistoricalTombstone",
+      status: "terminated",
+    }));
+    const existing = await svc.create(companyId, {
+      title: "Keep unassigned",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+    });
+
+    await expect(svc.create(companyId, {
+      title: "Must not be created",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    await expect(svc.update(existing.id, {
+      assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+    })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_active_reference_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    const forbiddenCreate = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.title, "Must not be created"));
+    expect(forbiddenCreate).toHaveLength(0);
+    const persisted = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, existing.id))
+      .then((rows) => rows[0]);
+    expect(persisted?.assigneeAgentId).toBeNull();
+
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: HISTORICAL_TOMBSTONE_ID })
+      .where(eq(issues.id, existing.id));
+    await expect(svc.update(existing.id, { title: "Must stay unchanged" }))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          code: "historical_agent_tombstone_active_reference_forbidden",
+          agentId: HISTORICAL_TOMBSTONE_ID,
+        },
+      });
+    const latentAssignment = await db
+      .select({ title: issues.title, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, existing.id))
+      .then((rows) => rows[0]);
+    expect(latentAssignment).toEqual({
+      title: "Keep unassigned",
+      assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+    });
+
+    const terminalCases = [
+      { title: "Done tombstone", status: "done" as const, nextStatus: "todo" as const },
+      { title: "Cancelled tombstone", status: "cancelled" as const, nextStatus: "blocked" as const },
+      { title: "Done tombstone review", status: "done" as const, nextStatus: "in_review" as const },
+    ];
+    for (const input of terminalCases) {
+      const [terminal] = await db.insert(issues).values({
+        companyId,
+        title: input.title,
+        status: input.status,
+        priority: "medium",
+        assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+      }).returning();
+      await expect(svc.update(terminal!.id, { status: input.nextStatus }))
+        .rejects.toMatchObject({
+          status: 409,
+          details: {
+            code: "historical_agent_tombstone_active_reference_forbidden",
+            agentId: HISTORICAL_TOMBSTONE_ID,
+          },
+        });
+      const persistedTerminal = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, terminal!.id))
+        .then((rows) => rows[0]);
+      expect(persistedTerminal).toEqual({
+        status: input.status,
+        assigneeAgentId: HISTORICAL_TOMBSTONE_ID,
+      });
+    }
+  });
+
   it("rejects invalid ancestor-chain assignees and preserves the existing assignment", async () => {
     const companyId = await seedAssignableAgentCompany();
     const activeAgentId = randomUUID();
@@ -457,6 +604,85 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       status: "todo",
     });
   });
+
+  it("serializes checkout assignment against concurrent agent termination", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "ConcurrentCheckoutCoder",
+    }));
+    const issue = await svc.create(companyId, {
+      title: "Concurrent checkout must lose termination race",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+    });
+    const blockerDb = createDb(tempDb!.connectionString);
+    const observerDb = createDb(tempDb!.connectionString);
+    let releaseBlocker!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    let reportLocked!: () => void;
+    const lockedGate = new Promise<void>((resolve) => {
+      reportLocked = resolve;
+    });
+    const blocker = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`select id from agents where id = ${agentId} for update`);
+      reportLocked();
+      await releaseGate;
+      await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+    });
+
+    try {
+      await lockedGate;
+      let writerSettled = false;
+      const writerOutcome = svc.checkout(issue.id, agentId, ["todo"], randomUUID())
+        .then(
+          (value) => ({ status: "fulfilled" as const, value }),
+          (error: unknown) => ({ status: "rejected" as const, error }),
+        )
+        .finally(() => {
+          writerSettled = true;
+        });
+
+      let observedBlockedLock = false;
+      for (let attempt = 0; attempt < 200 && !writerSettled; attempt += 1) {
+        const [row] = await observerDb.execute<{ blocked: boolean }>(sql`
+          select exists(select 1 from pg_locks where granted = false) as blocked
+        `);
+        if (row?.blocked) {
+          observedBlockedLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(observedBlockedLock).toBe(true);
+      releaseBlocker();
+      await blocker;
+      const outcome = await writerOutcome;
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status === "rejected") {
+        expect(outcome.error).toMatchObject({
+          status: 409,
+          details: { code: "agent_lifecycle_reference_forbidden", reason: "terminated" },
+        });
+      }
+      const persisted = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issue.id))
+        .then((rows) => rows[0] ?? null);
+      expect(persisted).toMatchObject({ assigneeAgentId: null, status: "todo" });
+    } finally {
+      releaseBlocker();
+      await blocker.catch(() => undefined);
+      await blockerDb.$client.end();
+      await observerDb.$client.end();
+    }
+  }, 15_000);
 
   it("rejects moving an existing terminated assignment into progress without clearing it", async () => {
     const companyId = await seedAssignableAgentCompany();

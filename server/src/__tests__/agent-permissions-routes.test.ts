@@ -192,6 +192,7 @@ function registerModuleMocks() {
 
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
+    agentRetirementService: () => ({}),
     agentInstructionsService: () => mockAgentInstructionsService,
     accessService: () => mockAccessService,
     approvalService: () => mockApprovalService,
@@ -863,7 +864,7 @@ describe.sequential("agent permission routes", () => {
       "agent",
       agentId,
       "tasks:assign",
-      true,
+      false,
       "agent-admin-user",
     );
   });
@@ -896,7 +897,7 @@ describe.sequential("agent permission routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("grants tasks:assign by default when board creates a new agent", async () => {
+  it("does not grant tasks:assign by default when board creates a new agent", async () => {
     const app = await createApp({
       type: "board",
       userId: "board-user",
@@ -927,10 +928,44 @@ describe.sequential("agent permission routes", () => {
       "agent",
       agentId,
       "tasks:assign",
-      true,
+      false,
       "board-user",
     );
   }, 15_000);
+
+  it("grants tasks:assign on create only when the effective permission manifest requests it", async () => {
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      permissions: { canCreateAgents: false, canAssignTasks: true },
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agents`)
+      .send({
+        name: "Delegating Builder",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+        permissions: { canAssignTasks: true },
+      }));
+
+    expect(res.status).toBe(201);
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      agentId,
+      "tasks:assign",
+      true,
+      "board-user",
+    );
+  });
 
   it("rejects unsupported query parameters on the agent list route", async () => {
     const app = await createApp({
@@ -1098,6 +1133,36 @@ describe.sequential("agent permission routes", () => {
     );
   });
 
+  it("does not grant tasks:assign on hire when the effective permission is false", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({
+        name: "Non-delegating hire",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+        permissions: { canAssignTasks: false },
+      }));
+
+    expect(res.status).toBe(201);
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      agentId,
+      "tasks:assign",
+      false,
+      "board-user",
+    );
+  });
+
   it("allows board users to directly approve pending agents", async () => {
     const pendingAgent = {
       ...baseAgent,
@@ -1260,7 +1325,11 @@ describe.sequential("agent permission routes", () => {
       .send({}));
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.terminate).toHaveBeenCalledWith(agentId);
+    expect(mockAgentService.terminate).toHaveBeenCalledWith(agentId, {
+      actorType: "user",
+      actorId: "board-user",
+      source: "agent_terminate_route",
+    });
     expect(mockApprovalService.findOpenHireApprovalForAgent).not.toHaveBeenCalled();
     expect(mockApprovalService.reject).not.toHaveBeenCalled();
   });
@@ -1545,7 +1614,7 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.access.taskAssignSource).toBe("explicit_grant");
   }, 15_000);
 
-  it("reports simple-mode task assignment as enabled for active company agent members", async () => {
+  it("reports task assignment as disabled for active members without an explicit grant", async () => {
     mockAccessService.listPrincipalGrants.mockResolvedValue([]);
 
     const app = await createApp({
@@ -1559,11 +1628,32 @@ describe.sequential("agent permission routes", () => {
     const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
 
     expect(res.status).toBe(200);
-    expect(res.body.access.canAssignTasks).toBe(true);
-    expect(res.body.access.taskAssignSource).toBe("simple_default");
+    expect(res.body.access.canAssignTasks).toBe(false);
+    expect(res.body.access.taskAssignSource).toBe("none");
   }, 15_000);
 
-  it("keeps task assignment enabled when agent creation privilege is enabled", async () => {
+  it("reports an explicit true permission manifest when no grant row is present", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      permissions: { canCreateAgents: false, canAssignTasks: true },
+    });
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.access.canAssignTasks).toBe(true);
+    expect(res.body.access.taskAssignSource).toBe("permission_manifest");
+  });
+
+  it("does not infer task assignment from agent creation privilege", async () => {
     mockAgentService.updatePermissions.mockResolvedValue({
       ...baseAgent,
       permissions: { canCreateAgents: true },
@@ -1587,11 +1677,11 @@ describe.sequential("agent permission routes", () => {
       "agent",
       agentId,
       "tasks:assign",
-      true,
+      false,
       "board-user",
     );
-    expect(res.body.access.canAssignTasks).toBe(true);
-    expect(res.body.access.taskAssignSource).toBe("agent_creator");
+    expect(res.body.access.canAssignTasks).toBe(false);
+    expect(res.body.access.taskAssignSource).toBe("none");
   });
 
   it("preserves disabled skill creation when unrelated permission updates omit that field", async () => {

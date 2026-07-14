@@ -41,11 +41,14 @@ function buildContext(
 
 async function createMockGatewayServer(options?: {
   waitPayload?: Record<string, unknown>;
+  resetFailureMessage?: string;
 }) {
   const server = createServer();
   const wss = new WebSocketServer({ server });
 
   let agentPayload: Record<string, unknown> | null = null;
+  let resetPayload: Record<string, unknown> | null = null;
+  const methods: string[] = [];
 
   wss.on("connection", (socket) => {
     socket.send(
@@ -66,6 +69,7 @@ async function createMockGatewayServer(options?: {
       };
 
       if (frame.type !== "req") return;
+      methods.push(frame.method);
 
       if (frame.method === "connect") {
         socket.send(
@@ -77,9 +81,42 @@ async function createMockGatewayServer(options?: {
               type: "hello-ok",
               protocol: 3,
               server: { version: "test", connId: "conn-1" },
-              features: { methods: ["connect", "agent", "agent.wait"], events: ["agent"] },
+              features: {
+                methods: ["connect", "sessions.reset", "agent", "agent.wait"],
+                events: ["agent"],
+              },
               snapshot: { version: 1, ts: Date.now() },
               policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 },
+            },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "sessions.reset") {
+        resetPayload = frame.params ?? null;
+        if (options?.resetFailureMessage) {
+          socket.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: {
+                code: "RESET_FAILED",
+                message: options.resetFailureMessage,
+              },
+            }),
+          );
+          return;
+        }
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: {
+              ok: true,
+              key: frame.params?.key,
             },
           }),
         );
@@ -165,6 +202,8 @@ async function createMockGatewayServer(options?: {
   return {
     url: `ws://127.0.0.1:${address.port}`,
     getAgentPayload: () => agentPayload,
+    getResetPayload: () => resetPayload,
+    getMethods: () => [...methods],
     close: async () => {
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -422,6 +461,9 @@ describe("openclaw gateway adapter execute", () => {
               issueId: "issue-123",
               wakeReason: "issue_assigned",
               issueIds: ["issue-123"],
+              forceFreshSession: false,
+              paperclipSessionHandoffMarkdown: "SESSION_HANDOFF_MARKER",
+              paperclipTaskMarkdown: "Paperclip task context:\nNORMAL_TASK_FIXTURE_MARKER",
               paperclipWorkspace: {
                 cwd: "/tmp/worktrees/pap-123",
                 strategy: "git_worktree",
@@ -493,6 +535,8 @@ describe("openclaw gateway adapter execute", () => {
       expect(String(payload?.message ?? "")).toContain("wake now");
       expect(String(payload?.message ?? "")).toContain("PAPERCLIP_RUN_ID=run-123");
       expect(String(payload?.message ?? "")).toContain("PAPERCLIP_TASK_ID=task-123");
+      expect(String(payload?.message ?? "")).toContain("SESSION_HANDOFF_MARKER");
+      expect(String(payload?.message ?? "")).toContain("NORMAL_TASK_FIXTURE_MARKER");
       expect(String(payload?.message ?? "")).toContain("## Paperclip Wake Payload");
       expect(String(payload?.message ?? "")).toContain(
         "Treat this wake payload as the highest-priority change for the current heartbeat.",
@@ -504,8 +548,145 @@ describe("openclaw gateway adapter execute", () => {
       expect(String(payload?.message ?? "")).toContain("\"commentIds\":[\"comment-1\",\"comment-2\"]");
       expect(payload?.paperclip).toBeUndefined();
       expect(String(payload?.message ?? "")).toContain("\"latestCommentId\":\"comment-2\"");
+      expect(gateway.getMethods()).toEqual(["connect", "agent", "agent.wait"]);
+      expect(gateway.getResetPayload()).toBeNull();
 
       expect(logs.some((entry) => entry.includes("[openclaw-gateway:event] run=run-123 stream=assistant"))).toBe(true);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("uses a lean lifecycle-canary prompt and resets the issue session before agent execution", async () => {
+    const gateway = await createMockGatewayServer();
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: {
+              "x-openclaw-token": "gateway-token",
+            },
+            autoPairOnFirstConnect: false,
+            waitTimeoutMs: 2000,
+          },
+          {
+            context: {
+              taskId: "issue-123",
+              issueId: "issue-123",
+              wakeReason: "lifecycle_pending_canary",
+              issueIds: ["issue-123"],
+              forceFreshSession: true,
+              paperclipSessionHandoffMarkdown: "CANARY_HANDOFF_MARKER",
+              paperclipTaskMarkdown: "Paperclip task context:\nCANARY_INLINE_FIXTURE_MARKER",
+              paperclipWake: {
+                reason: "lifecycle_pending_canary",
+                issue: {
+                  id: "issue-123",
+                  identifier: "PAP-123",
+                  title: "Gateway lifecycle canary",
+                  status: "in_progress",
+                  priority: "medium",
+                },
+                comments: [],
+                commentIds: [],
+                checkedOutByHarness: true,
+                truncated: false,
+                fallbackFetchNeeded: false,
+              },
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(gateway.getMethods()).toEqual(["connect", "sessions.reset", "agent", "agent.wait"]);
+      expect(gateway.getResetPayload()).toEqual({
+        key: "paperclip:issue:issue-123",
+        reason: "reset",
+      });
+
+      const message = String(gateway.getAgentPayload()?.message ?? "");
+      expect(message).toContain("CANARY_INLINE_FIXTURE_MARKER");
+      expect(message).toContain("CANARY_HANDOFF_MARKER");
+      expect(message).not.toContain("PAPERCLIP_API_KEY=<token from");
+      expect(message).not.toContain("Workflow:\n1) GET /api/agents/me");
+      expect(message.endsWith([
+        "PAPERCLIP_LIFECYCLE_CANARY_RESULT_V1",
+        '{"outcome":"passed","evidence":"single-line factual evidence"}',
+      ].join("\n"))).toBe(true);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("fails closed before agent execution when a required fresh-session reset fails", async () => {
+    const gateway = await createMockGatewayServer({
+      resetFailureMessage: "session reset denied",
+    });
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: {
+              "x-openclaw-token": "gateway-token",
+            },
+            waitTimeoutMs: 2000,
+          },
+          {
+            context: {
+              taskId: "issue-123",
+              issueId: "issue-123",
+              wakeReason: "lifecycle_pending_canary",
+              issueIds: ["issue-123"],
+              forceFreshSession: true,
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("openclaw_gateway_request_failed");
+      expect(result.errorMessage).toContain("session reset denied");
+      expect(gateway.getMethods()).toEqual(["connect", "sessions.reset"]);
+      expect(gateway.getAgentPayload()).toBeNull();
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("classifies gateway_draining as an active-run wait timeout", async () => {
+    const gateway = await createMockGatewayServer({
+      waitPayload: {
+        runId: "run-123",
+        status: "timeout",
+        timeoutPhase: "gateway_draining",
+      },
+    });
+
+    try {
+      const result = await execute(
+        buildContext({
+          url: gateway.url,
+          headers: {
+            "x-openclaw-token": "gateway-token",
+          },
+          waitTimeoutMs: 2000,
+        }),
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.timedOut).toBe(true);
+      expect(result.errorCode).toBe("openclaw_gateway_wait_timeout");
+      expect(result.errorMessage).toContain("gateway_draining");
+      expect(result.errorMessage).toContain("still active");
+      expect(result.resultJson).toEqual(expect.objectContaining({
+        status: "timeout",
+        timeoutPhase: "gateway_draining",
+      }));
     } finally {
       await gateway.close();
     }

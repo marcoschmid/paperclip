@@ -20,6 +20,7 @@ import { backfillPrincipalAccessCompatibility } from "../services/principal-acce
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 async function createCompanyWithOwner(db: ReturnType<typeof createDb>) {
   const company = await db
@@ -67,6 +68,329 @@ describeEmbeddedPostgres("access service", () => {
   afterAll(async () => {
     await tempDb?.cleanup();
   });
+
+  it("blocks historical tombstone grant and membership mutations without partial writes", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const member = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: HISTORICAL_TOMBSTONE_ID,
+        status: "suspended",
+        membershipRole: "member",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: HISTORICAL_TOMBSTONE_ID,
+      permissionKey: "tasks:assign",
+      grantedByUserId: owner.principalId,
+    });
+    const access = accessService(db);
+    const denied = {
+      status: 403,
+      details: {
+        code: "historical_agent_tombstone_access_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    };
+
+    await expect(access.ensureMembership(
+      company.id,
+      "agent",
+      HISTORICAL_TOMBSTONE_ID,
+      "member",
+      "active",
+    )).rejects.toMatchObject(denied);
+    await expect(access.setPrincipalGrants(
+      company.id,
+      "agent",
+      HISTORICAL_TOMBSTONE_ID,
+      [{ permissionKey: "agents:create" }],
+      owner.principalId,
+    )).rejects.toMatchObject(denied);
+    await expect(access.setPrincipalPermission(
+      company.id,
+      "agent",
+      HISTORICAL_TOMBSTONE_ID,
+      "tasks:assign",
+      false,
+      owner.principalId,
+    )).rejects.toMatchObject(denied);
+    await expect(access.setMemberPermissions(
+      company.id,
+      member.id,
+      [{ permissionKey: "agents:create" }],
+      owner.principalId,
+    )).rejects.toMatchObject(denied);
+    await expect(access.updateMember(company.id, member.id, { status: "active" }))
+      .rejects.toMatchObject(denied);
+
+    const persistedMember = await db
+      .select()
+      .from(companyMemberships)
+      .where(eq(companyMemberships.id, member.id))
+      .then((rows) => rows[0]);
+    expect(persistedMember).toMatchObject({ status: "suspended", membershipRole: "member" });
+    const persistedGrants = await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.principalId, HISTORICAL_TOMBSTONE_ID));
+    expect(persistedGrants).toHaveLength(1);
+    expect(persistedGrants[0]?.permissionKey).toBe("tasks:assign");
+  });
+
+  it("canonicalizes live agent access and rejects lifecycle-invalid or cross-company principals", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const foreign = await createCompanyWithOwner(db);
+    const [liveAgent, pendingAgent, terminatedAgent, foreignAgent] = await db
+      .insert(agents)
+      .values([
+        {
+          companyId: company.id,
+          name: `Live ${randomUUID()}`,
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+        },
+        {
+          companyId: company.id,
+          name: `Pending ${randomUUID()}`,
+          role: "engineer",
+          status: "pending_approval",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+        },
+        {
+          companyId: company.id,
+          name: `Terminated ${randomUUID()}`,
+          role: "engineer",
+          status: "terminated",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+        },
+        {
+          companyId: foreign.company.id,
+          name: `Foreign ${randomUUID()}`,
+          role: "engineer",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+        },
+      ])
+      .returning();
+    const access = accessService(db);
+
+    const membership = await access.ensureMembership(
+      company.id,
+      "agent",
+      liveAgent!.id.toUpperCase(),
+      "member",
+      "active",
+    );
+    expect(membership?.principalId).toBe(liveAgent!.id);
+    await access.setPrincipalGrants(
+      company.id,
+      "agent",
+      liveAgent!.id.toUpperCase(),
+      [{ permissionKey: "tasks:assign" }],
+      owner.principalId,
+    );
+    await expect(
+      db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, liveAgent!.id)),
+    ).resolves.toHaveLength(1);
+
+    for (const invalidId of [pendingAgent!.id, terminatedAgent!.id]) {
+      await expect(access.ensureMembership(company.id, "agent", invalidId, "member", "active"))
+        .rejects.toMatchObject({
+          status: 409,
+          details: { code: "agent_lifecycle_reference_forbidden" },
+        });
+      await expect(access.setPrincipalGrants(
+        company.id,
+        "agent",
+        invalidId,
+        [{ permissionKey: "tasks:assign" }],
+        owner.principalId,
+      )).rejects.toMatchObject({
+        status: 409,
+        details: { code: "agent_lifecycle_reference_forbidden" },
+      });
+    }
+    await expect(access.ensureMembership(company.id, "agent", foreignAgent!.id, "member", "active"))
+      .rejects.toMatchObject({ status: 404, message: "Agent not found" });
+    await expect(access.ensureMembership(company.id, "agent", randomUUID(), "member", "active"))
+      .rejects.toMatchObject({ status: 404 });
+
+    const pendingOnboardingMembership = await access.ensureMembership(
+      company.id,
+      "agent",
+      pendingAgent!.id.toUpperCase(),
+      "member",
+      "active",
+      { allowPendingApproval: true },
+    );
+    expect(pendingOnboardingMembership?.principalId).toBe(pendingAgent!.id);
+    await expect(access.setPrincipalPermission(
+      company.id,
+      "agent",
+      pendingAgent!.id,
+      "tasks:assign",
+      true,
+      owner.principalId,
+      null,
+      { allowPendingApproval: true },
+    )).resolves.toBeUndefined();
+    await expect(
+      db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, pendingAgent!.id)),
+    ).resolves.toHaveLength(1);
+
+    const invalidMemberships = await db
+      .select()
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, company.id),
+        eq(companyMemberships.principalType, "agent"),
+      ));
+    expect(new Set(invalidMemberships.map((row) => row.principalId))).toEqual(
+      new Set([liveAgent!.id, pendingAgent!.id]),
+    );
+  });
+
+  it("allows cleanup-only access revocation for a generic terminated agent", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const [agent] = await db.insert(agents).values({
+      companyId: company.id,
+      name: `Terminated cleanup ${randomUUID()}`,
+      role: "engineer",
+      status: "terminated",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning();
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent!.id,
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent!.id,
+      permissionKey: "tasks:assign",
+      grantedByUserId: owner.principalId,
+    });
+
+    const access = accessService(db);
+    await expect(access.setPrincipalPermission(
+      company.id,
+      "agent",
+      agent!.id.toUpperCase(),
+      "tasks:assign",
+      false,
+      owner.principalId,
+    )).resolves.toBeUndefined();
+    await expect(access.setPrincipalGrants(
+      company.id,
+      "agent",
+      agent!.id.toUpperCase(),
+      [],
+      owner.principalId,
+    )).resolves.toBeUndefined();
+    await expect(
+      db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, agent!.id)),
+    ).resolves.toHaveLength(0);
+  });
+
+  it("serializes active-reference writes against concurrent agent termination", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const [agent] = await db.insert(agents).values({
+      companyId: company.id,
+      name: `Lifecycle race ${randomUUID()}`,
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning();
+    const blockerDb = createDb(tempDb!.connectionString);
+    const observerDb = createDb(tempDb!.connectionString);
+    let releaseBlocker!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    let reportLocked!: () => void;
+    const lockedGate = new Promise<void>((resolve) => {
+      reportLocked = resolve;
+    });
+    const blocker = blockerDb.transaction(async (tx) => {
+      await tx.execute(sql`select id from agents where id = ${agent!.id} for update`);
+      reportLocked();
+      await releaseGate;
+      await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, agent!.id));
+    });
+
+    try {
+      await lockedGate;
+      let writerSettled = false;
+      const writerOutcome = accessService(db)
+        .setPrincipalGrants(
+          company.id,
+          "agent",
+          agent!.id,
+          [{ permissionKey: "tasks:assign" }],
+          owner.principalId,
+        )
+        .then(
+          (value) => ({ status: "fulfilled" as const, value }),
+          (error: unknown) => ({ status: "rejected" as const, error }),
+        )
+        .finally(() => {
+          writerSettled = true;
+        });
+
+      let observedBlockedLock = false;
+      for (let attempt = 0; attempt < 200 && !writerSettled; attempt += 1) {
+        const [row] = await observerDb.execute<{ blocked: boolean }>(sql`
+          select exists(select 1 from pg_locks where granted = false) as blocked
+        `);
+        if (row?.blocked) {
+          observedBlockedLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(observedBlockedLock).toBe(true);
+      releaseBlocker();
+      await blocker;
+      const outcome = await writerOutcome;
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status === "rejected") {
+        expect(outcome.error).toMatchObject({
+          status: 409,
+          details: { code: "agent_lifecycle_reference_forbidden", reason: "terminated" },
+        });
+      }
+      await expect(
+        db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, agent!.id)),
+      ).resolves.toHaveLength(0);
+    } finally {
+      releaseBlocker();
+      await blocker.catch(() => undefined);
+      await blockerDb.$client.end();
+      await observerDb.$client.end();
+    }
+  }, 15_000);
 
   it("rejects combined access updates that would demote the last active owner", async () => {
     const { company, owner } = await createCompanyWithOwner(db);

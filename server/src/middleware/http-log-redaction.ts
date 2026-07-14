@@ -10,6 +10,7 @@ const SENSITIVE_HEADER_NAMES = new Set([
   "x-api-key",
   "x-paperclip-token",
   "x-paperclip-api-key",
+  "x-paperclip-maintenance-lease",
   "x-board-api-key",
   "x-agent-token",
 ]);

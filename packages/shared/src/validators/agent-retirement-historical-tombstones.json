@@ -1,0 +1,18 @@
+[
+  {
+    "agentId": "8d403783-c4e2-4746-adad-7689cd95ae33",
+    "companyId": "0a7df9a5-299e-4d64-a4d4-0c4c63784425",
+    "name": "Mission Control Builder",
+    "expectedStatus": "terminated",
+    "disposition": "preserve_tombstone",
+    "physicalDelete": false
+  },
+  {
+    "agentId": "dcd3cadb-8203-4048-be1e-77701a3a43a0",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "OpenClaw Gateway",
+    "expectedStatus": "terminated",
+    "disposition": "preserve_tombstone",
+    "physicalDelete": false
+  }
+]

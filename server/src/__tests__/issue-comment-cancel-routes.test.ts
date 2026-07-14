@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -148,12 +148,10 @@ function createApp() {
   return app;
 }
 
-async function installActor(app: express.Express, actor?: Record<string, unknown>) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
+let issueRoutes: typeof import("../routes/issues.js")["issueRoutes"];
+let errorHandler: typeof import("../middleware/index.js")["errorHandler"];
 
+async function installActor(app: express.Express, actor?: Record<string, unknown>) {
   app.use((req, _res, next) => {
     (req as any).actor = actor ?? {
       type: "board",
@@ -197,7 +195,7 @@ function makeComment(overrides: Record<string, unknown> = {}) {
 }
 
 describe.sequential("issue comment cancel routes", () => {
-  beforeEach(() => {
+  beforeAll(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -213,6 +211,14 @@ describe.sequential("issue comment cancel routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
+
+    [{ issueRoutes }, { errorHandler }] = await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
+  });
+
+  beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });

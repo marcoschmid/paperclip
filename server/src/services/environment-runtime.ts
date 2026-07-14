@@ -1,7 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecrets, companySecretVersions, environmentLeases } from "@paperclipai/db";
+import {
+  agents,
+  companySecrets,
+  companySecretVersions,
+  environmentLeases,
+  heartbeatRuns,
+} from "@paperclipai/db";
 import type {
   Environment,
   EnvironmentLease,
@@ -10,6 +16,7 @@ import type {
   PluginEnvironmentConfig,
   SandboxEnvironmentConfig,
 } from "@paperclipai/shared";
+import { normalizeAgentRetirementId } from "@paperclipai/shared";
 import type {
   PluginEnvironmentExecuteResult,
   PluginEnvironmentLease,
@@ -50,6 +57,12 @@ import {
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
+import {
+  assertHistoricalAgentTombstoneActiveReference,
+  isHistoricalAgentTombstoneId,
+} from "./agent-retirement-historical-tombstones.js";
+import { conflict } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 
 export function buildEnvironmentLeaseContext(input: {
   persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
@@ -237,6 +250,215 @@ function toEnvironmentLeaseSnapshot(row: typeof environmentLeases.$inferSelect):
   };
 }
 
+function normalizeLeaseOwnerAgentId(agentId: string | null | undefined): string | null {
+  return normalizeAgentRetirementId(agentId);
+}
+
+async function resolveHeartbeatRunOwners(
+  db: Db,
+  runIds: Iterable<string>,
+): Promise<Map<string, { agentId: string; companyId: string }>> {
+  const ids = [...new Set(runIds)].filter((id) => id.length > 0);
+  if (ids.length === 0) return new Map();
+  const rows = await db
+    .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId })
+    .from(heartbeatRuns)
+    .where(inArray(heartbeatRuns.id, ids));
+  return new Map(rows.map((row) => [row.id, {
+    agentId: normalizeLeaseOwnerAgentId(row.agentId)!,
+    companyId: row.companyId,
+  }] as const));
+}
+
+async function resolveAgentOwnerRecords(
+  db: Db,
+  agentIds: Iterable<string>,
+  options: { lockForUpdate?: boolean } = {},
+): Promise<Map<string, { status: string; companyId: string }>> {
+  const ids = [...new Set(
+    [...agentIds]
+      .map((id) => normalizeLeaseOwnerAgentId(id))
+      .filter((id): id is string => id !== null),
+  )];
+  if (ids.length === 0) return new Map();
+  const query = db
+    .select({ id: agents.id, status: agents.status, companyId: agents.companyId })
+    .from(agents)
+    .where(inArray(agents.id, ids))
+    .orderBy(agents.id);
+  const rows = options.lockForUpdate
+    ? await query.for("update")
+    : await query;
+  return new Map(rows.map((row) => [normalizeLeaseOwnerAgentId(row.id)!, {
+    status: row.status,
+    companyId: row.companyId,
+  }] as const));
+}
+
+function readLeaseMetadataOwners(lease: Pick<EnvironmentLease, "metadata">): {
+  invalid: boolean;
+  agentIds: string[];
+} {
+  if (!lease.metadata) return { invalid: false, agentIds: [] };
+  const rawValues: unknown[] = [];
+  let structurallyInvalid = false;
+  if (Object.prototype.hasOwnProperty.call(lease.metadata, "agentId")) {
+    rawValues.push(lease.metadata.agentId);
+  }
+  const reusableScope = lease.metadata.reusableSandboxLease;
+  if (Object.prototype.hasOwnProperty.call(lease.metadata, "reusableSandboxLease")) {
+    if (!reusableScope || typeof reusableScope !== "object" || Array.isArray(reusableScope)) {
+      structurallyInvalid = true;
+    } else if (!Object.prototype.hasOwnProperty.call(reusableScope, "agentId")) {
+      structurallyInvalid = true;
+    } else {
+      rawValues.push((reusableScope as Record<string, unknown>).agentId);
+    }
+  }
+  const agentIds = rawValues
+    .map((value) => typeof value === "string" ? normalizeLeaseOwnerAgentId(value) : null)
+    .filter((id): id is string => id !== null);
+  return {
+    invalid: structurallyInvalid || agentIds.length !== rawValues.length,
+    agentIds: [...new Set(agentIds)],
+  };
+}
+
+async function resolveTerminatedOwnerLeaseIds(
+  db: Db,
+  leases: readonly EnvironmentLease[],
+): Promise<Set<string>> {
+  const runOwners = await resolveHeartbeatRunOwners(
+    db,
+    leases.flatMap((lease) => lease.heartbeatRunId ? [lease.heartbeatRunId] : []),
+  );
+  const ownersByLeaseId = new Map<string, string[]>();
+  const allOwnerIds: string[] = [];
+  const unsafeLeaseIds = new Set<string>();
+  for (const lease of leases) {
+    const runOwner = lease.heartbeatRunId ? runOwners.get(lease.heartbeatRunId) ?? null : null;
+    const metadataOwners = readLeaseMetadataOwners(lease);
+    const ownerEvidence = [runOwner?.agentId ?? null, ...metadataOwners.agentIds]
+      .filter((id): id is string => id !== null);
+    if (
+      (lease.heartbeatRunId && (!runOwner || runOwner.companyId !== lease.companyId)) ||
+      metadataOwners.invalid ||
+      new Set(ownerEvidence).size > 1
+    ) {
+      unsafeLeaseIds.add(lease.id);
+    }
+    const ownerIds = [...new Set(ownerEvidence)];
+    if (lease.leasePolicy === "reuse_by_environment" && ownerIds.length === 0) {
+      unsafeLeaseIds.add(lease.id);
+    }
+    ownersByLeaseId.set(lease.id, ownerIds);
+    allOwnerIds.push(...ownerIds);
+  }
+  const agentRecords = await resolveAgentOwnerRecords(db, allOwnerIds);
+  for (const lease of leases) {
+    for (const ownerId of ownersByLeaseId.get(lease.id) ?? []) {
+      const owner = agentRecords.get(ownerId);
+      if (
+        isHistoricalAgentTombstoneId(ownerId) ||
+        !owner ||
+        owner.status === "terminated" ||
+        owner.companyId !== lease.companyId
+      ) {
+        unsafeLeaseIds.add(lease.id);
+      }
+    }
+  }
+  return unsafeLeaseIds;
+}
+
+async function assertLeaseOwnerActive(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId?: string | null;
+    heartbeatRunId?: string | null;
+    lease?: EnvironmentLease;
+    lockOwnersForUpdate?: boolean;
+  },
+): Promise<void> {
+  const runIds = [input.heartbeatRunId, input.lease?.heartbeatRunId]
+    .filter((id): id is string => Boolean(id));
+  const runOwners = await resolveHeartbeatRunOwners(db, runIds);
+  const directOwnerId = normalizeLeaseOwnerAgentId(input.agentId);
+  const metadataOwners = input.lease
+    ? readLeaseMetadataOwners(input.lease)
+    : { invalid: false, agentIds: [] };
+  if ((input.agentId && !directOwnerId) || metadataOwners.invalid) {
+    throw conflict("Environment lease owner reference is invalid", {
+      code: "agent_environment_lease_owner_invalid",
+    });
+  }
+  const runOwnerRecords = runIds.map((runId) => runOwners.get(runId) ?? null);
+  if (runOwnerRecords.some((owner) => !owner || owner.companyId !== input.companyId)) {
+    throw conflict("Environment lease run owner is missing or belongs to another company", {
+      code: "agent_environment_lease_owner_invalid",
+    });
+  }
+  const runOwnerIds = runOwnerRecords
+    .map((owner) => owner?.agentId ?? null)
+    .filter((id): id is string => id !== null);
+  const declaredOwnerIds = [directOwnerId, ...metadataOwners.agentIds]
+    .filter((id): id is string => id !== null);
+  if (new Set([...declaredOwnerIds, ...runOwnerIds]).size > 1) {
+    throw conflict("Environment lease owner references disagree", {
+      code: "agent_environment_lease_owner_invalid",
+    });
+  }
+  const ownerIds = [...new Set([...declaredOwnerIds, ...runOwnerIds])];
+  const durableOwnerIds = [...new Set([...metadataOwners.agentIds, ...runOwnerIds])];
+  if (input.lease?.leasePolicy === "reuse_by_environment" && durableOwnerIds.length === 0) {
+    throw conflict("Reusable environment lease has no verifiable owner", {
+      code: "agent_environment_lease_owner_invalid",
+    });
+  }
+  const ownerRecords = await resolveAgentOwnerRecords(db, ownerIds, {
+    lockForUpdate: input.lockOwnersForUpdate ?? false,
+  });
+  for (const ownerId of ownerIds) {
+    assertHistoricalAgentTombstoneActiveReference(ownerId);
+    const owner = ownerRecords.get(ownerId);
+    if (!owner || owner.status === "terminated" || owner.companyId !== input.companyId) {
+      throw conflict("Terminated agents cannot own or resume environment leases", {
+        code: "agent_terminated_active_reference_forbidden",
+        agentId: ownerId,
+      });
+    }
+    if (owner.status === "pending_approval" || owner.status === "paused") {
+      throw conflict("Non-invokable agents cannot own or resume environment leases", {
+        code: "agent_lifecycle_active_reference_forbidden",
+        reason: owner.status,
+        agentId: ownerId,
+      });
+    }
+  }
+}
+
+async function excludeTerminatedOwnerLeases(
+  db: Db,
+  leases: EnvironmentLease[],
+): Promise<EnvironmentLease[]> {
+  const terminatedLeaseIds = await resolveTerminatedOwnerLeaseIds(db, leases);
+  return leases.filter((lease) => !terminatedLeaseIds.has(lease.id));
+}
+
+function assertLeaseEnvironmentBinding(input: {
+  environment: Pick<Environment, "id">;
+  lease: Pick<EnvironmentLease, "environmentId">;
+}): void {
+  if (input.environment.id !== input.lease.environmentId) {
+    throw conflict("Environment lease does not belong to the supplied environment", {
+      code: "environment_lease_binding_mismatch",
+      environmentId: input.environment.id,
+      leaseEnvironmentId: input.lease.environmentId,
+    });
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -249,6 +471,99 @@ function stableStringify(value: unknown): string {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
+}
+
+function readLeaseOwnerEvidenceForComparison(lease: Pick<EnvironmentLease, "metadata">) {
+  const metadata = lease.metadata;
+  const hasTopLevelOwner = Boolean(metadata) && Object.prototype.hasOwnProperty.call(metadata, "agentId");
+  const reusableScope = isRecord(metadata?.reusableSandboxLease)
+    ? metadata.reusableSandboxLease
+    : null;
+  const hasReusableScope = Boolean(metadata) &&
+    Object.prototype.hasOwnProperty.call(metadata, "reusableSandboxLease");
+  const hasReusableOwner = Boolean(reusableScope) &&
+    Object.prototype.hasOwnProperty.call(reusableScope, "agentId");
+  return {
+    hasTopLevelOwner,
+    topLevelOwner: hasTopLevelOwner ? metadata?.agentId : null,
+    hasReusableScope,
+    reusableScopeValid: reusableScope !== null,
+    hasReusableOwner,
+    reusableOwner: hasReusableOwner ? reusableScope?.agentId : null,
+  };
+}
+
+function readLeaseRoutingEvidenceForComparison(lease: Pick<EnvironmentLease, "metadata">) {
+  const metadata = lease.metadata;
+  return {
+    driver: metadata?.driver ?? null,
+    provider: metadata?.provider ?? null,
+    pluginId: metadata?.pluginId ?? null,
+    pluginKey: metadata?.pluginKey ?? null,
+    driverKey: metadata?.driverKey ?? null,
+    sandboxProviderPlugin: metadata?.sandboxProviderPlugin ?? null,
+    executionWorkspaceMode: metadata?.executionWorkspaceMode ?? null,
+  };
+}
+
+function criticalLeasePersistenceIdentity(lease: EnvironmentLease) {
+  return {
+    correlation: leaseCorrelationIdentity(lease),
+    status: lease.status,
+    cleanupStatus: lease.cleanupStatus,
+    failureReason: lease.failureReason,
+    releasedAt: lease.releasedAt?.toISOString() ?? null,
+    resource: leaseResourceIdentity(lease),
+  };
+}
+
+function leaseCorrelationIdentity(lease: EnvironmentLease) {
+  return {
+    id: lease.id,
+    companyId: lease.companyId,
+    environmentId: lease.environmentId,
+    executionWorkspaceId: lease.executionWorkspaceId,
+    issueId: lease.issueId,
+    heartbeatRunId: lease.heartbeatRunId,
+  };
+}
+
+function leaseResourceIdentity(lease: EnvironmentLease) {
+  return {
+    correlation: leaseCorrelationIdentity(lease),
+    leasePolicy: lease.leasePolicy,
+    provider: lease.provider,
+    providerLeaseId: lease.providerLeaseId,
+    ownerEvidence: readLeaseOwnerEvidenceForComparison(lease),
+    routingEvidence: readLeaseRoutingEvidenceForComparison(lease),
+  };
+}
+
+function leaseIdentityMatches(
+  left: EnvironmentLease,
+  right: EnvironmentLease,
+  selector: (lease: EnvironmentLease) => unknown,
+) {
+  return stableStringify(selector(left)) === stableStringify(selector(right));
+}
+
+function assertPersistedLeaseMatchesDriverOrCaller(input: {
+  supplied: EnvironmentLease;
+  persisted: EnvironmentLease | null;
+  operation: string;
+}): EnvironmentLease {
+  if (
+    !input.persisted ||
+    stableStringify(criticalLeasePersistenceIdentity(input.supplied)) !==
+      stableStringify(criticalLeasePersistenceIdentity(input.persisted))
+  ) {
+    throw conflict(`Environment lease persistence mismatch during ${input.operation}`, {
+      code: "environment_lease_persistence_mismatch",
+      leaseId: input.supplied.id,
+      operation: input.operation,
+    });
+  }
+  return input.persisted;
 }
 
 function reusableRuntimeFingerprint(input: {
@@ -801,13 +1116,14 @@ function createSandboxEnvironmentDriver(
           input.heartbeatRunId !== null &&
           input.executionWorkspaceId !== null &&
           input.agentId !== null
-          ? (await environmentsSvc.listLeases(input.environment.id))
-              .filter((lease) =>
+          ? await excludeTerminatedOwnerLeases(db,
+              (await environmentsSvc.listLeases(input.environment.id)).filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 lease.metadata?.agentId === input.agentId,
-              )
+              ),
+            )
           : [];
         const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
           reusableSandboxLeaseScopeMatches({
@@ -984,13 +1300,14 @@ function createSandboxEnvironmentDriver(
         input.heartbeatRunId !== null &&
         input.executionWorkspaceId !== null &&
         input.agentId !== null
-          ? (await environmentsSvc.listLeases(input.environment.id))
-              .filter((lease) =>
+          ? await excludeTerminatedOwnerLeases(db,
+              (await environmentsSvc.listLeases(input.environment.id)).filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 lease.metadata?.agentId === input.agentId,
-              )
+              ),
+            )
           : [];
       const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
         reusableSandboxLeaseScopeMatches({
@@ -1582,8 +1899,9 @@ function createPluginEnvironmentDriver(
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
-      return await environmentsSvc.releaseLease(input.lease.id, "failed", {
+      return await environmentsSvc.releaseLease(input.lease.id, "expired", {
         failureReason: input.failureReason ?? "lease_destroyed",
+        cleanupStatus: "success",
       });
     },
 
@@ -1709,7 +2027,133 @@ export function environmentRuntimeService(
     return driver;
   }
 
-  return {
+  async function loadPersistedLeaseForActiveOperation(
+    input: EnvironmentDriverLeaseInput,
+    operation: string,
+    allowedStatuses: ReadonlySet<EnvironmentLease["status"]>,
+  ): Promise<{ environment: Environment; lease: EnvironmentLease }> {
+    assertLeaseEnvironmentBinding(input);
+    const persisted = assertPersistedLeaseMatchesDriverOrCaller({
+      supplied: input.lease,
+      persisted: await environmentsSvc.getLeaseById(input.lease.id),
+      operation,
+    });
+    if (!allowedStatuses.has(persisted.status)) {
+      throw conflict(`Environment lease cannot be used for ${operation} while ${persisted.status}`, {
+        code: "environment_lease_not_active",
+        leaseId: persisted.id,
+        leaseStatus: persisted.status,
+        operation,
+      });
+    }
+    await assertLeaseOwnerActive(db, { companyId: persisted.companyId, lease: persisted });
+    const environment = await environmentsSvc.getById(persisted.environmentId);
+    if (!environment) {
+      throw conflict(`Environment ${persisted.environmentId} no longer exists`, {
+        code: "environment_lease_binding_mismatch",
+        leaseId: persisted.id,
+        environmentId: persisted.environmentId,
+      });
+    }
+    if (environment.status !== "active") {
+      throw conflict(`Environment ${environment.id} is not active`, {
+        code: "environment_lease_binding_mismatch",
+        leaseId: persisted.id,
+        environmentId: environment.id,
+        environmentStatus: environment.status,
+      });
+    }
+    return { environment, lease: persisted };
+  }
+
+  async function quarantineUnprovenLeaseDestruction(input: {
+    lease: EnvironmentLease;
+    failureReason: string;
+  }): Promise<EnvironmentLease | null> {
+    return await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const currentRow = await txDb
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, input.lease.id))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      const current = currentRow ? toEnvironmentLeaseSnapshot(currentRow) : null;
+      if (!current || !leaseIdentityMatches(input.lease, current, leaseResourceIdentity)) {
+        return null;
+      }
+
+      const now = new Date();
+      await txDb
+        .update(environmentLeases)
+        .set({
+          status: "pending_cleanup",
+          cleanupStatus: "failed",
+          failureReason: input.failureReason,
+          releasedAt: now,
+          lastUsedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(environmentLeases.id, input.lease.id));
+      const quarantinedRow = await txDb
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.id, input.lease.id))
+        .then((rows) => rows[0] ?? null);
+      const quarantined = quarantinedRow ? toEnvironmentLeaseSnapshot(quarantinedRow) : null;
+      return quarantined &&
+        leaseIdentityMatches(input.lease, quarantined, leaseResourceIdentity) &&
+        quarantined.status === "pending_cleanup" &&
+        quarantined.cleanupStatus === "failed"
+        ? quarantined
+        : null;
+    });
+  }
+
+  async function destroyLeaseWithDurableProof(input: {
+    lease: EnvironmentLease;
+    failureReason: string;
+    destroy: () => Promise<EnvironmentLease | null | void>;
+  }): Promise<{
+    lease: EnvironmentLease | null;
+    destroyed: boolean;
+    failureMessage: string | null;
+  }> {
+    let failureMessage: string | null = null;
+    try {
+      await input.destroy();
+    } catch (error) {
+      failureMessage = error instanceof Error ? error.message : String(error);
+    }
+
+    const persisted = await environmentsSvc.getLeaseById(input.lease.id).catch(() => null);
+    if (
+      persisted &&
+      leaseIdentityMatches(input.lease, persisted, leaseResourceIdentity) &&
+      persisted.status === "expired" &&
+      persisted.cleanupStatus === "success"
+    ) {
+      return { lease: persisted, destroyed: true, failureMessage: null };
+    }
+
+    failureMessage ??= persisted
+      ? "Environment driver did not durably persist exact lease destruction"
+      : "Environment lease disappeared before destruction could be durably proven";
+    const quarantined = await quarantineUnprovenLeaseDestruction({
+      lease: input.lease,
+      failureReason: input.failureReason,
+    }).catch((error) => {
+      const quarantineMessage = error instanceof Error ? error.message : String(error);
+      failureMessage = `${failureMessage}; cleanup quarantine failed: ${quarantineMessage}`;
+      return null;
+    });
+    if (!quarantined) {
+      failureMessage = `${failureMessage}; cleanup quarantine was not durably persisted for the exact resource identity`;
+    }
+    return { lease: quarantined, destroyed: false, failureMessage };
+  }
+
+  const runtime = {
     getDriver,
 
     async acquireRunLease(input: {
@@ -1729,17 +2173,32 @@ export function environmentRuntimeService(
        */
       applyCustomImageTemplate?: boolean;
     }): Promise<EnvironmentRuntimeLeaseRecord> {
-      if (input.environment.status !== "active") {
+      const directOwnerId = normalizeLeaseOwnerAgentId(input.agentId ?? null);
+      const runOwners = input.heartbeatRunId
+        ? await resolveHeartbeatRunOwners(db, [input.heartbeatRunId])
+        : new Map<string, { agentId: string; companyId: string }>();
+      const runOwnerId = input.heartbeatRunId
+        ? runOwners.get(input.heartbeatRunId)?.agentId ?? null
+        : null;
+      const requestedOwnerId = directOwnerId ?? runOwnerId;
+
+      const environment = await environmentsSvc.getById(input.environment.id);
+      if (!environment || environment.status !== "active") {
         throw new Error(`Environment "${input.environment.name}" is not active.`);
       }
+      await assertLeaseOwnerActive(db, {
+        companyId: input.companyId,
+        agentId: input.agentId ?? null,
+        heartbeatRunId: input.heartbeatRunId,
+      });
 
       const leaseContext = buildEnvironmentLeaseContext({
         persistedExecutionWorkspace: input.persistedExecutionWorkspace,
       });
-      const driver = requireDriver(input.environment);
+      const driver = requireDriver(environment);
       const lease = await driver.acquireRunLease({
         companyId: input.companyId,
-        environment: input.environment,
+        environment,
         issueId: input.issueId,
         agentId: input.agentId ?? null,
         heartbeatRunId: input.heartbeatRunId,
@@ -1749,10 +2208,318 @@ export function environmentRuntimeService(
         applyCustomImageTemplate: input.applyCustomImageTemplate ?? false,
       });
 
+      try {
+        if (
+          lease.companyId !== input.companyId ||
+          lease.environmentId !== environment.id ||
+          lease.heartbeatRunId !== input.heartbeatRunId ||
+          lease.executionWorkspaceId !== leaseContext.executionWorkspaceId ||
+          lease.issueId !== input.issueId ||
+          lease.status !== "active"
+        ) {
+          throw conflict("Environment driver returned a lease outside the requested binding", {
+            code: "environment_lease_binding_mismatch",
+            leaseId: lease.id,
+          });
+        }
+        if (lease.leasePolicy === "reuse_by_environment" && !requestedOwnerId) {
+          throw conflict("Reusable environment driver output has no lifecycle-fenced owner", {
+            code: "agent_environment_lease_owner_invalid",
+            leaseId: lease.id,
+          });
+        }
+        const persisted = await db.transaction(async (tx) => {
+          const txDb = tx as unknown as Db;
+          const row = await txDb
+            .select()
+            .from(environmentLeases)
+            .where(eq(environmentLeases.id, lease.id))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          const snapshot = assertPersistedLeaseMatchesDriverOrCaller({
+            supplied: lease,
+            persisted: row ? toEnvironmentLeaseSnapshot(row) : null,
+            operation: "acquire",
+          });
+          await assertLeaseOwnerActive(txDb, {
+            companyId: snapshot.companyId,
+            agentId: input.agentId ?? null,
+            heartbeatRunId: snapshot.heartbeatRunId,
+            lease: snapshot,
+            lockOwnersForUpdate: true,
+          });
+          return snapshot;
+        });
+        return {
+          environment,
+          lease: persisted,
+          leaseContext,
+        };
+      } catch (error) {
+        let cleanupError: Error | null = null;
+        const persistedBeforeCleanup = await environmentsSvc.getLeaseById(lease.id).catch(() => null);
+        const correlationMatches = Boolean(
+          persistedBeforeCleanup &&
+          leaseIdentityMatches(lease, persistedBeforeCleanup, leaseCorrelationIdentity),
+        );
+        const criticalIdentityMatches = Boolean(
+          persistedBeforeCleanup &&
+          leaseIdentityMatches(lease, persistedBeforeCleanup, criticalLeasePersistenceIdentity),
+        );
+        // A row that merely shares correlation fields is not enough: a driver
+        // may release persistence by id before targeting the returned provider
+        // resource. Reuse the durable id only for an exact critical identity;
+        // otherwise isolate provider cleanup behind a synthetic id and
+        // quarantine the correlated row ourselves below.
+        const cleanupLease = criticalIdentityMatches ? lease : { ...lease, id: randomUUID() };
+        try {
+          if (driver.destroyRunLease) {
+            await driver.destroyRunLease({
+              environment,
+              lease: cleanupLease,
+              failureReason: "rejected_environment_driver_output",
+            });
+          }
+        } catch (destroyError) {
+          cleanupError = destroyError instanceof Error
+            ? destroyError
+            : new Error(String(destroyError));
+        }
+
+        const originalError = error instanceof Error ? error : new Error(String(error));
+        if (!correlationMatches || !persistedBeforeCleanup) {
+          throw new AggregateError(
+            cleanupError ? [originalError, cleanupError] : [originalError],
+            `Rejected environment lease ${lease.id} is not correlated with a persisted row; persisted state was left untouched`,
+          );
+        }
+
+        let durableLease = await environmentsSvc.getLeaseById(lease.id).catch(() => null);
+        const destructionDurablyProven =
+          criticalIdentityMatches &&
+          durableLease !== null &&
+          leaseIdentityMatches(lease, durableLease, leaseResourceIdentity) &&
+          durableLease.status === "expired" &&
+          durableLease.cleanupStatus === "success";
+        if (!destructionDurablyProven) {
+          const quarantined = await environmentsSvc.releaseLease(lease.id, "pending_cleanup", {
+            failureReason: "rejected_environment_driver_output",
+            cleanupStatus: "failed",
+          }).catch((quarantineError) => {
+            cleanupError = quarantineError instanceof Error
+              ? quarantineError
+              : new Error(String(quarantineError));
+            return null;
+          });
+          durableLease = quarantined ?? await environmentsSvc.getLeaseById(lease.id).catch(() => null);
+          const quarantineDurable =
+            durableLease !== null &&
+            leaseIdentityMatches(persistedBeforeCleanup, durableLease, leaseResourceIdentity) &&
+            durableLease.status === "pending_cleanup" &&
+            durableLease.cleanupStatus === "failed";
+          if (!quarantineDurable) {
+            throw new AggregateError(
+              cleanupError ? [originalError, cleanupError] : [originalError],
+              `Rejected environment lease ${lease.id} could not be durably quarantined`,
+            );
+          }
+        }
+        throw error;
+      }
+    },
+
+    async reconcileEnvironmentLeasesOnStartup(): Promise<{
+      reconciled: number;
+      destroyed: number;
+      failed: number;
+      failures: Array<{ leaseId: string; message: string }>;
+    }> {
+      let destroyed = 0;
+      const failures: Array<{ leaseId: string; message: string }> = [];
+      const terminalRunStatuses = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+      const leaseRows = await db.select().from(environmentLeases);
+      const allLeaseSnapshots = leaseRows
+        .map(toEnvironmentLeaseSnapshot)
+        .filter((lease) => !(lease.status === "expired" && lease.cleanupStatus === "success"));
+      const unsafeOwnerLeaseIds = await resolveTerminatedOwnerLeaseIds(db, allLeaseSnapshots);
+      const unsafeOwnerCandidates = allLeaseSnapshots.filter((lease) =>
+        unsafeOwnerLeaseIds.has(lease.id)
+      );
+      const unsafeOwnerAttemptedLeaseIds = new Set(
+        unsafeOwnerCandidates.map((lease) => lease.id),
+      );
+
+      const reconcileDestroyedLease = async (input: {
+        lease: EnvironmentLease;
+        driverFailureReason: string;
+        quarantineFailureReason: string;
+        logMessage: string;
+      }) => {
+        const environment = await environmentsSvc.getById(input.lease.environmentId);
+        const outcome = await destroyLeaseWithDurableProof({
+          lease: input.lease,
+          failureReason: input.quarantineFailureReason,
+          destroy: async () => {
+            if (!environment) {
+              throw new Error(`Environment ${input.lease.environmentId} is missing`);
+            }
+            const driverKey = getLeaseDriverKey(input.lease, environment);
+            const driver = getDriver(driverKey);
+            if (!driver?.destroyRunLease) {
+              throw new Error(`Environment driver ${driverKey} cannot destroy leases`);
+            }
+            return await driver.destroyRunLease({
+              environment,
+              lease: input.lease,
+              failureReason: input.driverFailureReason,
+            });
+          },
+        });
+        if (outcome.destroyed) {
+          destroyed += 1;
+          return;
+        }
+        const failureMessage = outcome.failureMessage ??
+          "Environment lease destruction was not durably proven";
+        failures.push({ leaseId: input.lease.id, message: failureMessage });
+        logger.error(
+          { leaseId: input.lease.id, environmentId: input.lease.environmentId, err: failureMessage },
+          input.logMessage,
+        );
+      };
+
+      for (const lease of unsafeOwnerCandidates) {
+        const reusable = lease.leasePolicy === "reuse_by_environment";
+        await reconcileDestroyedLease({
+          lease,
+          driverFailureReason: reusable
+            ? "reusable_environment_lease_reconciliation"
+            : "unsafe_environment_lease_owner_reconciliation",
+          quarantineFailureReason: reusable
+            ? "reusable_environment_lease_cleanup_failed"
+            : "unsafe_environment_lease_owner_cleanup_failed",
+          logMessage: "failed to reconcile environment lease with an unsafe owner during startup",
+        });
+      }
+
+      const activeLeaseSnapshots = allLeaseSnapshots.filter((lease) => lease.status === "active");
+      const activeRunIds = [...new Set(
+        activeLeaseSnapshots.flatMap((lease) => lease.heartbeatRunId ? [lease.heartbeatRunId] : []),
+      )];
+      const activeRunRows = activeRunIds.length > 0
+        ? await db
+          .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, activeRunIds))
+        : [];
+      const terminalRunStatusById = new Map(
+        activeRunRows
+          .filter((run) => terminalRunStatuses.has(run.status))
+          .map((run) => [run.id, run.status] as const),
+      );
+      const terminalRunLeaseCandidates = activeLeaseSnapshots.filter((lease) =>
+        lease.heartbeatRunId !== null &&
+        terminalRunStatusById.has(lease.heartbeatRunId) &&
+        !unsafeOwnerAttemptedLeaseIds.has(lease.id)
+      );
+      const terminalRunAttemptedLeaseIds = new Set(
+        terminalRunLeaseCandidates.map((lease) => lease.id),
+      );
+
+      for (const lease of terminalRunLeaseCandidates) {
+        const runStatus = terminalRunStatusById.get(lease.heartbeatRunId!)!;
+        const releaseStatus: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> =
+          runStatus === "cancelled"
+            ? "expired"
+            : runStatus === "failed" || runStatus === "timed_out"
+              ? "failed"
+              : "released";
+        const expectedStatus =
+          lease.leasePolicy === "retain_on_failure" && releaseStatus === "failed"
+            ? "retained"
+            : releaseStatus;
+        let failureMessage: string | null = null;
+        try {
+          const environment = await environmentsSvc.getById(lease.environmentId);
+          const driver = environment ? getDriver(getLeaseDriverKey(lease, environment)) : null;
+          if (!environment) {
+            failureMessage = `Environment ${lease.environmentId} is missing`;
+          } else if (!driver) {
+            failureMessage = `Environment driver ${getLeaseDriverKey(lease, environment)} is unavailable`;
+          } else {
+            const released = await driver.releaseRunLease({
+              environment,
+              lease,
+              status: releaseStatus,
+            });
+            const persisted = await environmentsSvc.getLeaseById(lease.id);
+            if (
+              !released ||
+              !persisted ||
+              !leaseIdentityMatches(lease, persisted, leaseResourceIdentity) ||
+              persisted.status !== expectedStatus ||
+              persisted.cleanupStatus === "failed"
+            ) {
+              failureMessage = "Environment driver did not durably finalize the terminal-run lease";
+            }
+          }
+        } catch (error) {
+          failureMessage = error instanceof Error ? error.message : String(error);
+        }
+
+        if (failureMessage) {
+          const pending = await quarantineUnprovenLeaseDestruction({
+            lease,
+            failureReason: "terminal_run_lease_cleanup_failed",
+          });
+          if (!pending) {
+            failureMessage = `${failureMessage}; failed to durably persist exact cleanup quarantine`;
+          }
+          failures.push({ leaseId: lease.id, message: failureMessage });
+          logger.error(
+            { leaseId: lease.id, heartbeatRunId: lease.heartbeatRunId, err: failureMessage },
+            "failed to finalize environment lease for terminal heartbeat run during startup reconciliation",
+          );
+          continue;
+        }
+        destroyed += 1;
+      }
+
+      const reusableLeaseSnapshots = allLeaseSnapshots.filter((lease) =>
+        lease.leasePolicy === "reuse_by_environment"
+      );
+      const reusableLiveStatuses = new Set<EnvironmentLease["status"]>([
+        "active",
+        "released",
+        "retained",
+      ]);
+      const reusableCandidates = reusableLeaseSnapshots.filter((lease) => {
+        if (
+          unsafeOwnerAttemptedLeaseIds.has(lease.id) ||
+          terminalRunAttemptedLeaseIds.has(lease.id)
+        ) return false;
+        const liveStateIsIntended =
+          reusableLiveStatuses.has(lease.status) &&
+          (lease.cleanupStatus === null || lease.cleanupStatus === "success");
+        return !liveStateIsIntended;
+      });
+      for (const lease of reusableCandidates) {
+        await reconcileDestroyedLease({
+          lease,
+          driverFailureReason: "reusable_environment_lease_reconciliation",
+          quarantineFailureReason: "reusable_environment_lease_cleanup_failed",
+          logMessage: "failed to reconcile reusable environment lease during startup",
+        });
+      }
+
       return {
-        environment: input.environment,
-        lease,
-        leaseContext,
+        reconciled:
+          unsafeOwnerCandidates.length +
+          terminalRunLeaseCandidates.length +
+          reusableCandidates.length,
+        destroyed,
+        failed: failures.length,
+        failures,
       };
     },
 
@@ -1822,28 +2589,48 @@ export function environmentRuntimeService(
           and(
             eq(environmentLeases.companyId, input.companyId),
             eq(environmentLeases.leasePolicy, "reuse_by_environment"),
-            inArray(environmentLeases.status, ["active", "released", "retained", "pending_cleanup"]),
             ...scopeConditions,
           ),
         );
+      const cleanupRows = leaseRows.filter((row) =>
+        !(row.status === "expired" && row.cleanupStatus === "success")
+      );
 
       const destroyed: EnvironmentRuntimeLeaseRecord[] = [];
-      for (const leaseRow of leaseRows) {
-        const environment = await environmentsSvc.getById(leaseRow.environmentId);
-        if (!environment) continue;
+      for (const leaseRow of cleanupRows) {
         const leaseSnapshot = toEnvironmentLeaseSnapshot(leaseRow);
-        const driver = getDriver(getLeaseDriverKey(leaseSnapshot, environment));
-        const lease = driver?.destroyRunLease
-          ? await driver.destroyRunLease({
+        const environment = await environmentsSvc.getById(leaseRow.environmentId);
+        const failureReason = input.failureReason ?? "reusable_lease_destroyed";
+        const outcome = await destroyLeaseWithDurableProof({
+          lease: leaseSnapshot,
+          failureReason,
+          destroy: async () => {
+            if (!environment) {
+              throw new Error(`Environment ${leaseSnapshot.environmentId} is missing`);
+            }
+            const driverKey = getLeaseDriverKey(leaseSnapshot, environment);
+            const driver = getDriver(driverKey);
+            if (!driver?.destroyRunLease) {
+              throw new Error(`Environment driver ${driverKey} cannot destroy leases`);
+            }
+            return await driver.destroyRunLease({
               environment,
               lease: leaseSnapshot,
-              failureReason: input.failureReason ?? "reusable_lease_destroyed",
-            })
-          : await environmentsSvc.releaseLease(leaseSnapshot.id, "pending_cleanup", {
-              failureReason: input.failureReason ?? "reusable_lease_destroyed",
-              cleanupStatus: "failed",
+              failureReason,
             });
-        if (!lease) continue;
+          },
+        });
+        if (!outcome.lease) {
+          throw new Error(
+            `Reusable lease ${leaseSnapshot.id} could not be destroyed or durably quarantined: ${outcome.failureMessage}`,
+          );
+        }
+        if (!environment) {
+          throw new Error(
+            `Reusable lease ${leaseSnapshot.id} was quarantined because environment ${leaseSnapshot.environmentId} is missing`,
+          );
+        }
+        const lease = outcome.lease;
         destroyed.push({
           environment,
           lease,
@@ -1858,38 +2645,92 @@ export function environmentRuntimeService(
     },
 
     async resumeRunLease(input: EnvironmentDriverLeaseInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {
-      const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
+      const current = await loadPersistedLeaseForActiveOperation(
+        input,
+        "resume",
+        new Set(["active", "released", "retained"]),
+      );
+      const driver = requireDriverKey(getLeaseDriverKey(current.lease, current.environment));
       if (!driver.resumeRunLease) {
         throw new Error(`Environment driver "${driver.driver}" does not support lease resume.`);
       }
-      return await driver.resumeRunLease(input);
+      return await driver.resumeRunLease({ ...input, ...current });
     },
 
     async destroyRunLease(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null> {
-      const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
-      if (!driver.destroyRunLease) {
-        throw new Error(`Environment driver "${driver.driver}" does not support lease destroy.`);
+      assertLeaseEnvironmentBinding(input);
+      const persisted = await environmentsSvc.getLeaseById(input.lease.id);
+      if (
+        !persisted ||
+        !leaseIdentityMatches(input.lease, persisted, leaseResourceIdentity)
+      ) {
+        throw conflict("Environment lease cleanup input does not match persisted resource identity", {
+          code: "environment_lease_persistence_mismatch",
+          leaseId: input.lease.id,
+          operation: "destroy",
+        });
       }
-      return await driver.destroyRunLease(input);
+      if (persisted.status === "expired" && persisted.cleanupStatus === "success") {
+        return persisted;
+      }
+      const environment = await environmentsSvc.getById(persisted.environmentId);
+      const outcome = await destroyLeaseWithDurableProof({
+        lease: persisted,
+        failureReason: input.failureReason ?? "lease_destroy_cleanup_failed",
+        destroy: async () => {
+          if (!environment) {
+            throw new Error(`Environment "${persisted.environmentId}" no longer exists.`);
+          }
+          const driverKey = getLeaseDriverKey(persisted, environment);
+          const driver = getDriver(driverKey);
+          if (!driver?.destroyRunLease) {
+            throw new Error(`Environment driver "${driverKey}" does not support lease destroy.`);
+          }
+          return await driver.destroyRunLease({ ...input, environment, lease: persisted });
+        },
+      });
+      if (!outcome.lease) {
+        throw conflict("Environment lease cleanup changed or removed persisted resource identity", {
+          code: "environment_lease_persistence_mismatch",
+          leaseId: persisted.id,
+          operation: "destroy",
+          failureMessage: outcome.failureMessage,
+        });
+      }
+      return outcome.lease;
     },
 
     async realizeWorkspace(
       input: EnvironmentDriverRealizeWorkspaceInput,
     ): Promise<PluginEnvironmentRealizeWorkspaceResult> {
-      const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
+      const current = await loadPersistedLeaseForActiveOperation(
+        input,
+        "workspace realization",
+        new Set(["active"]),
+      );
+      const driver = requireDriverKey(getLeaseDriverKey(current.lease, current.environment));
       if (!driver.realizeWorkspace) {
         throw new Error(`Environment driver "${driver.driver}" does not support workspace realization.`);
       }
-      return await driver.realizeWorkspace(input);
+      return await driver.realizeWorkspace({ ...input, ...current });
     },
 
     async execute(input: EnvironmentDriverExecuteInput): Promise<PluginEnvironmentExecuteResult> {
-      const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
+      const current = await loadPersistedLeaseForActiveOperation(
+        input,
+        "command execution",
+        new Set(["active"]),
+      );
+      const driver = requireDriverKey(getLeaseDriverKey(current.lease, current.environment));
       if (!driver.execute) {
         throw new Error(`Environment driver "${driver.driver}" does not support command execution.`);
       }
-      return await driver.execute(input);
+      return await driver.execute({ ...input, ...current });
     },
+  };
+  return {
+    ...runtime,
+    reconcileTerminatedAgentLeasesOnStartup: runtime.reconcileEnvironmentLeasesOnStartup,
   };
 }
 

@@ -14,6 +14,7 @@ import type {
 } from "@paperclipai/shared";
 import { forbidden, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { assertHistoricalAgentTombstoneAccessMutable } from "./agent-retirement-historical-tombstones.js";
 
 type BoardActor = {
   type: "board" | "agent" | "none";
@@ -326,6 +327,7 @@ export function resourceMembershipService(db: Db, options: ResourceMembershipSer
       starred?: boolean;
       actor: BoardActor;
     }): Promise<MembershipUpdateResult> {
+      assertHistoricalAgentTombstoneAccessMutable(input.agentId);
       const agent = await db.query.agents.findFirst({
         where: and(
           eq(agents.id, input.agentId),

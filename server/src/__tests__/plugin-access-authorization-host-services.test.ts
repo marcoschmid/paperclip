@@ -10,6 +10,7 @@ import {
   principalPermissionGrants,
 } from "@paperclipai/db";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { eq } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -18,6 +19,7 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const pluginId = "plugin-record-id";
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
 
 function createEventBusStub() {
   return {
@@ -317,6 +319,43 @@ describeEmbeddedPostgres("plugin access and authorization host services", () => 
     });
     expect(JSON.stringify(rows[0]!.details)).not.toContain("sk-test-secret");
     expect(JSON.stringify(rows[0]!.details)).not.toContain("should-not-persist");
+    services.dispose();
+  });
+
+  it("blocks plugin policy writes to historical tombstones without changing permissions or audit history", async () => {
+    const company = await createCompany(db, "PAT");
+    await db.insert(agents).values({
+      id: HISTORICAL_TOMBSTONE_ID,
+      companyId: company.id,
+      name: "HistoricalTombstone",
+      role: "engineer",
+      status: "terminated",
+      adapterType: "process",
+      adapterConfig: {},
+      permissions: { marker: "unchanged" },
+    });
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    await expect(services.authorization.updatePolicy({
+      companyId: company.id,
+      resourceType: "agent",
+      resourceId: HISTORICAL_TOMBSTONE_ID,
+      policy: { assignmentPolicy: { mode: "protected" } },
+    })).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "historical_agent_tombstone_access_forbidden",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    const persisted = await db
+      .select({ permissions: agents.permissions })
+      .from(agents)
+      .where(eq(agents.id, HISTORICAL_TOMBSTONE_ID))
+      .then((rows) => rows[0]);
+    expect(persisted?.permissions).toEqual({ marker: "unchanged" });
+    await expect(db.select().from(activityLog)).resolves.toHaveLength(0);
     services.dispose();
   });
 });

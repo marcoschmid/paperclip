@@ -51,6 +51,10 @@ const migrationUpdatedAtUpdateAllowlist = new Map<string, ReadonlySet<string>>([
     "0135_repair_run_responsible_user_updated_at_sweep.sql",
     new Set(["companies", "heartbeat_runs", "issues", "routine_runs", "routines"]),
   ],
+  [
+    "0145_routine_run_deliveries.sql",
+    new Set(["routine_runs"]),
+  ],
 ]);
 
 function findUserVisibleUpdatedAtBackfillViolations(
@@ -167,6 +171,230 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       } finally {
         await verifySql.end();
       }
+    },
+    20_000,
+  );
+
+  it(
+    "rolls back migration 0138 atomically when a later statement fails",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+      const hash = await migrationHash("0138_approval_execution_claims.sql");
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql.unsafe('DROP TABLE "approval_execution_claims"');
+        await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${hash}'`);
+        await sql.unsafe('ALTER TABLE "approvals" RENAME TO "approvals_unavailable"');
+
+        await expect(applyPendingMigrations(connectionString)).rejects.toThrow();
+
+        const afterFailure = await sql.unsafe<{ relation: string | null }[]>(
+          "SELECT to_regclass('public.approval_execution_claims')::text AS relation",
+        );
+        expect(afterFailure[0]?.relation).toBeNull();
+        const historyAfterFailure = await sql.unsafe<{ count: string }[]>(
+          `SELECT count(*)::text AS count FROM "drizzle"."__drizzle_migrations" WHERE hash = '${hash}'`,
+        );
+        expect(historyAfterFailure[0]?.count).toBe("0");
+
+        await sql.unsafe('ALTER TABLE "approvals_unavailable" RENAME TO "approvals"');
+        await applyPendingMigrations(connectionString);
+        expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
+      } finally {
+        const approvals = await sql.unsafe<{ relation: string | null }[]>(
+          "SELECT to_regclass('public.approvals')::text AS relation",
+        );
+        if (approvals[0]?.relation === null) {
+          await sql.unsafe('ALTER TABLE "approvals_unavailable" RENAME TO "approvals"');
+        }
+        await sql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "resumes migration 0140 from the exact partial retirement-claim schema",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const missingConstraintNames = [
+        "agent_retirement_plan_claims_expiry_check",
+        "agent_retirement_execution_claims_cleanup_receipt_check",
+        "agent_retirement_execution_claims_final_preflight_check",
+        "agent_retirement_execution_claims_phase_payload_check",
+        "agent_retirement_execution_claims_expiry_check",
+      ] as const;
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const retirementClaimsHash = await migrationHash("0140_agent_retirement_claims.sql");
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${retirementClaimsHash}'`,
+        );
+
+        await sql.unsafe(
+          `ALTER TABLE "agent_retirement_plan_claims" DROP CONSTRAINT "${missingConstraintNames[0]}"`,
+        );
+        for (const constraintName of missingConstraintNames.slice(1)) {
+          await sql.unsafe(
+            `ALTER TABLE "agent_retirement_execution_claims" DROP CONSTRAINT "${constraintName}"`,
+          );
+        }
+      } finally {
+        await sql.end();
+      }
+
+      const pendingState = await inspectMigrations(connectionString);
+      expect(pendingState).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0140_agent_retirement_claims.sql"],
+        reason: "pending-migrations",
+      });
+
+      await applyPendingMigrations(connectionString);
+
+      const finalState = await inspectMigrations(connectionString);
+      expect(finalState.status).toBe("upToDate");
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const constraints = await verifySql.unsafe<{ conname: string }[]>(
+          `
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid IN (
+              'public.agent_retirement_plan_claims'::regclass,
+              'public.agent_retirement_execution_claims'::regclass
+            )
+              AND conname = ANY(ARRAY[
+                ${missingConstraintNames.map((name) => `'${name}'`).join(",\n                ")}
+              ]::text[])
+            ORDER BY conname
+          `,
+        );
+        expect(constraints.map((row) => row.conname)).toEqual(
+          [...missingConstraintNames].sort(),
+        );
+      } finally {
+        await verifySql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "resumes migration 0141 from existing private tables with missing guards",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const hash = await migrationHash("0141_agent_retirement_private_evidence.sql");
+        await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${hash}'`);
+        await sql.unsafe(`
+          DROP INDEX "agent_retirement_plan_claims_approval_comment_unique";
+          DROP INDEX "agent_retirement_execution_recoveries_request_unique";
+          ALTER TABLE "agent_retirement_plan_claims"
+            DROP CONSTRAINT "agent_retirement_plan_claims_approval_nonce_check";
+          ALTER TABLE "agent_retirement_plan_claims"
+            ALTER COLUMN "approval_nonce" DROP NOT NULL;
+          ALTER TABLE "agent_retirement_plan_evidence_bundles"
+            DROP CONSTRAINT "agent_retirement_plan_evidence_bundles_plan_claim_id_agent_retirement_plan_claims_id_fk";
+        `);
+      } finally {
+        await sql.end();
+      }
+
+      expect(await inspectMigrations(connectionString)).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0141_agent_retirement_private_evidence.sql"],
+      });
+      await applyPendingMigrations(connectionString);
+      expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const columns = await verifySql.unsafe<{ is_nullable: string }[]>(`
+          SELECT is_nullable
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'agent_retirement_plan_claims'
+            AND column_name = 'approval_nonce'
+        `);
+        expect(columns).toEqual([{ is_nullable: "NO" }]);
+        const indexes = await verifySql.unsafe<{ indexname: string }[]>(`
+          SELECT indexname
+          FROM pg_indexes
+          WHERE schemaname = 'public'
+            AND indexname IN (
+              'agent_retirement_plan_claims_approval_comment_unique',
+              'agent_retirement_execution_recoveries_request_unique'
+            )
+          ORDER BY indexname
+        `);
+        expect(indexes.map((row) => row.indexname)).toEqual([
+          "agent_retirement_execution_recoveries_request_unique",
+          "agent_retirement_plan_claims_approval_comment_unique",
+        ]);
+        const constraints = await verifySql.unsafe<{ conname: string }[]>(`
+          SELECT conname
+          FROM pg_constraint
+          WHERE conname IN (
+            'agent_retirement_plan_claims_approval_nonce_check',
+            left('agent_retirement_plan_evidence_bundles_plan_claim_id_agent_retirement_plan_claims_id_fk', 63)
+          )
+          ORDER BY conname
+        `);
+        expect(constraints).toHaveLength(2);
+      } finally {
+        await verifySql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "fails closed when 0141 encounters a legacy claim without one-shot approval binding",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const hash = await migrationHash("0141_agent_retirement_private_evidence.sql");
+        await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${hash}'`);
+        await sql.unsafe(`
+          ALTER TABLE "agent_retirement_plan_claims"
+            ALTER COLUMN "approval_comment_id" DROP NOT NULL,
+            ALTER COLUMN "approval_nonce" DROP NOT NULL,
+            ALTER COLUMN "approval_fingerprint" DROP NOT NULL;
+          INSERT INTO "agent_retirement_plan_claims" (
+            "client_plan_receipt_id", "receipt_id", "plan", "common_artifact_receipt",
+            "issued_by_user_id", "evidence_expires_at", "execution_expires_at", "issued_at"
+          ) VALUES (
+            'v1:sha256:${"a".repeat(64)}',
+            'v1:sha256:${"b".repeat(64)}',
+            '{}'::jsonb,
+            '{}'::jsonb,
+            'legacy-test',
+            now() + interval '1 minute',
+            now() + interval '2 minutes',
+            now()
+          );
+        `);
+      } finally {
+        await sql.end();
+      }
+
+      await expect(applyPendingMigrations(connectionString)).rejects.toThrow(
+        /explicit approval replay migration review/i,
+      );
+      expect(await inspectMigrations(connectionString)).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: ["0141_agent_retirement_private_evidence.sql"],
+      });
     },
     20_000,
   );

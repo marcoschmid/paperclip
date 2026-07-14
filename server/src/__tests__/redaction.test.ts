@@ -62,6 +62,40 @@ describe("redaction", () => {
     expect(result.normal).toBe("plain");
   });
 
+  it("preserves canonical numeric schema versions", () => {
+    const result = sanitizeRecord({
+      lifecycle: { schemaVersion: "1.0.0" },
+      receipt: { schemaVersion: "12.34.56" },
+    });
+
+    expect(result).toEqual({
+      lifecycle: { schemaVersion: "1.0.0" },
+      receipt: { schemaVersion: "12.34.56" },
+    });
+  });
+
+  it("does not exempt token-shaped schema values, aliases, version ids, or credential fields", () => {
+    const result = sanitizeRecord({
+      tokenShaped: { schemaVersion: "aaa.bbb.ccc" },
+      nonCanonical: { schemaVersion: "01.0.0" },
+      alias: { schema_version: "1.0.0" },
+      versionId: "1.0.0",
+      token: "opaque-token",
+      password: "opaque-password",
+      providerSecret: "opaque-provider-secret",
+    });
+
+    expect(result).toEqual({
+      tokenShaped: { schemaVersion: REDACTED_EVENT_VALUE },
+      nonCanonical: { schemaVersion: REDACTED_EVENT_VALUE },
+      alias: { schema_version: REDACTED_EVENT_VALUE },
+      versionId: REDACTED_EVENT_VALUE,
+      token: REDACTED_EVENT_VALUE,
+      password: REDACTED_EVENT_VALUE,
+      providerSecret: REDACTED_EVENT_VALUE,
+    });
+  });
+
   it("redacts payload objects while preserving null", () => {
     expect(redactEventPayload(null)).toBeNull();
     expect(redactEventPayload({ password: "hunter2", safe: "value" })).toEqual({

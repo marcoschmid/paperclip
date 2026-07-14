@@ -11,6 +11,7 @@ export interface IssueAssignmentWakeupDeps {
       triggerDetail?: WakeupTriggerDetail;
       reason?: string | null;
       payload?: Record<string, unknown> | null;
+      idempotencyKey?: string | null;
       requestedByActorType?: "user" | "agent" | "system";
       requestedByActorId?: string | null;
       contextSnapshot?: Record<string, unknown>;
@@ -18,7 +19,11 @@ export interface IssueAssignmentWakeupDeps {
   ) => Promise<unknown>;
 }
 
-export function queueIssueAssignmentWakeup(input: {
+export type IssueAssignmentWakeupReceipt =
+  | { kind: "queued"; wake: unknown }
+  | { kind: "skipped"; reason: "unassigned" | "backlog" | "heartbeat_noop" };
+
+export async function queueIssueAssignmentWakeup(input: {
   heartbeat: IssueAssignmentWakeupDeps;
   issue: { id: string; assigneeAgentId: string | null; status: string };
   reason: string;
@@ -26,16 +31,19 @@ export function queueIssueAssignmentWakeup(input: {
   contextSource: string;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
+  idempotencyKey?: string | null;
   rethrowOnError?: boolean;
-}) {
-  if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
+}): Promise<IssueAssignmentWakeupReceipt> {
+  if (!input.issue.assigneeAgentId) return { kind: "skipped", reason: "unassigned" };
+  if (input.issue.status === "backlog") return { kind: "skipped", reason: "backlog" };
 
-  return input.heartbeat
+  const wake = await input.heartbeat
     .wakeup(input.issue.assigneeAgentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: input.reason,
       payload: { issueId: input.issue.id, mutation: input.mutation },
+      idempotencyKey: input.idempotencyKey ?? null,
       requestedByActorType: input.requestedByActorType,
       requestedByActorId: input.requestedByActorId ?? null,
       contextSnapshot: { issueId: input.issue.id, source: input.contextSource },
@@ -45,4 +53,6 @@ export function queueIssueAssignmentWakeup(input: {
       if (input.rethrowOnError) throw err;
       return null;
     });
+  if (wake === null || wake === undefined) return { kind: "skipped", reason: "heartbeat_noop" };
+  return { kind: "queued", wake };
 }

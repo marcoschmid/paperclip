@@ -26,6 +26,8 @@ import { companyService } from "../services/companies.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const PROTECTED_SOURCE_ID = "007bcd1f-0462-4c9e-b58a-c6c546393f41";
+const PROTECTED_COMPANY_ID = "51eb52b7-49ed-461a-bd67-7384158374e6";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -109,7 +111,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     return { agentId, companyId, issueId, runId };
   }
 
-  it("removes agent-owned issue comments and run-linked activity before deleting the agent", async () => {
+  it("preserves agent-owned issue comments and run-linked activity instead of deleting the agent", async () => {
     const { agentId, companyId, issueId, runId } = await seedFixture();
 
     await db.insert(issueComments).values({
@@ -144,13 +146,20 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       createdByRunId: runId,
     });
 
-    const removed = await agentService(db).remove(agentId);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
 
-    expect(removed?.id).toBe(agentId);
-    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
-    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
-    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
-    await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(agentService(db).remove(agentId)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "agent_delete_history_preserved" },
+    });
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(1);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(1);
+    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(1);
+    await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(1);
+    await expect(db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).resolves.toHaveLength(1);
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {
@@ -257,5 +266,35 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
+  });
+
+  it("blocks physical company deletion while any protected retirement source exists", async () => {
+    await db.insert(companies).values({
+      id: PROTECTED_COMPANY_ID,
+      name: "Casa Marco",
+      issuePrefix: "CAS",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: PROTECTED_SOURCE_ID,
+      companyId: PROTECTED_COMPANY_ID,
+      name: "Calendar und Events Butler",
+      role: "general",
+      status: "paused",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await expect(companyService(db).remove(PROTECTED_COMPANY_ID)).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "retirement_company_delete_forbidden",
+        protectedSourceIds: [PROTECTED_SOURCE_ID],
+      },
+    });
+    await expect(db.select().from(companies).where(eq(companies.id, PROTECTED_COMPANY_ID))).resolves.toHaveLength(1);
+    await expect(db.select().from(agents).where(eq(agents.id, PROTECTED_SOURCE_ID))).resolves.toHaveLength(1);
   });
 });

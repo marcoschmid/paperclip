@@ -7,6 +7,7 @@ import {
   type AgentOrgChainHealth,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { assertHistoricalAgentTombstoneActiveReference } from "./agent-retirement-historical-tombstones.js";
 
 type AgentAssignmentKind = "work" | "routine";
 
@@ -108,6 +109,7 @@ export async function assertAssignableAgent(
   options: { kind?: AgentAssignmentKind } = {},
 ) {
   if (!agentId) return;
+  assertHistoricalAgentTombstoneActiveReference(agentId);
   const kind = options.kind ?? "work";
   const assignee = await getAgent(db, agentId);
   if (!assignee) throw notFound("Assignee agent not found");

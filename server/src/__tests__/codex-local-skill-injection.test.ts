@@ -40,6 +40,59 @@ describe("codex local adapter skill injection", () => {
     cleanupDirs.clear();
   });
 
+  it("rejects a managed skills-home symlink without chmod or external injection", async () => {
+    const currentRepo = await makeTempDir("paperclip-codex-current-");
+    const managedHome = await makeTempDir("paperclip-codex-managed-");
+    const externalSkills = await makeTempDir("paperclip-codex-external-skills-");
+    const skillsHome = path.join(managedHome, "skills");
+    cleanupDirs.add(currentRepo);
+    cleanupDirs.add(managedHome);
+    cleanupDirs.add(externalSkills);
+    await createPaperclipRepoSkill(currentRepo, "paperclip");
+    await fs.writeFile(path.join(externalSkills, "sentinel.txt"), "keep\n", "utf8");
+    await fs.chmod(externalSkills, 0o755);
+    await fs.symlink(externalSkills, skillsHome);
+
+    await expect(
+      ensureCodexSkillsInjected(async () => {}, {
+        skillsHome,
+        managedHome: true,
+        skillsEntries: [{
+          key: paperclipKey,
+          runtimeName: "paperclip",
+          source: path.join(currentRepo, "skills", "paperclip"),
+        }],
+      }),
+    ).rejects.toThrow(/symbolic link/);
+
+    expect((await fs.stat(externalSkills)).mode & 0o777).toBe(0o755);
+    await expect(fs.readdir(externalSkills)).resolves.toEqual(["sentinel.txt"]);
+    await expect(fs.readFile(path.join(externalSkills, "sentinel.txt"), "utf8")).resolves.toBe("keep\n");
+  });
+
+  it("rejects a managed skills-home symlink even when no skills are selected", async () => {
+    const managedHome = await makeTempDir("paperclip-codex-managed-empty-");
+    const externalSkills = await makeTempDir("paperclip-codex-external-empty-");
+    const skillsHome = path.join(managedHome, "skills");
+    cleanupDirs.add(managedHome);
+    cleanupDirs.add(externalSkills);
+    await fs.writeFile(path.join(externalSkills, "sentinel.txt"), "keep\n", "utf8");
+    await fs.chmod(externalSkills, 0o755);
+    await fs.symlink(externalSkills, skillsHome);
+
+    await expect(
+      ensureCodexSkillsInjected(async () => {}, {
+        skillsHome,
+        managedHome: true,
+        skillsEntries: [],
+        desiredSkillNames: [],
+      }),
+    ).rejects.toThrow(/symbolic link/);
+
+    expect((await fs.stat(externalSkills)).mode & 0o777).toBe(0o755);
+    await expect(fs.readdir(externalSkills)).resolves.toEqual(["sentinel.txt"]);
+  });
+
   it("repairs a Codex Paperclip skill symlink that still points at another live checkout", async () => {
     const currentRepo = await makeTempDir("paperclip-codex-current-");
     const oldRepo = await makeTempDir("paperclip-codex-old-");

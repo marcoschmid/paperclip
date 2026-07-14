@@ -288,9 +288,11 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
     expect(res.body.error).toContain("Agent key cannot access another company");
   });
 
-  it("allows same-company route assignment after upgrade but keeps private target assignment grant constrained", async () => {
+  it("requires explicit assignment authority after upgrade and keeps private target scope constrained", async () => {
     const company = await seedCompany(db, "Assignment");
-    const actorAgent = await seedAgent(db, company.id);
+    const actorAgent = await seedAgent(db, company.id, {
+      permissions: { canAssignTasks: true },
+    });
     const openTargetAgent = await seedAgent(db, company.id);
     const privateTargetAgent = await seedAgent(db, company.id, {
       permissions: {
@@ -301,6 +303,13 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
           managedBy: "permissions-extension",
         },
       },
+    });
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      status: "active",
+      membershipRole: "member",
     });
     const app = await createApp(db, agentActor(company.id, actorAgent.id));
 
@@ -315,13 +324,6 @@ describeEmbeddedPostgres("permissions upgrade visibility and route boundaries", 
     expect(deniedPrivateAssignment.status).toBe(403);
     expect(deniedPrivateAssignment.body.error).toContain("private");
 
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "agent",
-      principalId: actorAgent.id,
-      status: "active",
-      membershipRole: "member",
-    });
     await db.insert(principalPermissionGrants).values({
       companyId: company.id,
       principalType: "agent",

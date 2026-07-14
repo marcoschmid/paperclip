@@ -1,4 +1,6 @@
 import fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 type PreparedCodexRuntimeConfig = {
@@ -10,6 +12,38 @@ type ParsedCodexProvidersConfig = {
   providers: Record<string, Record<string, unknown>>;
   modelProvider: string | null;
 };
+
+async function ensurePrivateDirectory(directory: string): Promise<void> {
+  const existing = await fs.lstat(directory).catch(() => null);
+  if (existing?.isSymbolicLink()) throw new Error(`Refusing managed Codex symbolic link directory: ${directory}`);
+  if (existing && !existing.isDirectory()) throw new Error(`Managed Codex path is not a directory: ${directory}`);
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  await fs.chmod(directory, 0o700);
+}
+
+async function writePrivateFile(filePath: string, content: string): Promise<void> {
+  await ensurePrivateDirectory(path.dirname(filePath));
+  const existing = await fs.lstat(filePath).catch(() => null);
+  if (existing?.isSymbolicLink()) throw new Error(`Refusing managed Codex symbolic link file: ${filePath}`);
+  if (existing && !existing.isFile()) throw new Error(`Managed Codex path is not a regular file: ${filePath}`);
+  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.tmp-${process.pid}-${randomUUID()}`);
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(tempPath, "wx", 0o600);
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    const beforeRename = await fs.lstat(filePath).catch(() => null);
+    if (beforeRename?.isSymbolicLink()) {
+      throw new Error(`Refusing managed Codex symbolic link file: ${filePath}`);
+    }
+    await fs.rename(tempPath, filePath);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+  }
+}
 
 // Marker comments delimiting the Paperclip-managed regions of config.toml.
 // TOML requires root-level keys (model_provider) to appear before the first
@@ -301,7 +335,26 @@ function buildMergedConfigToml(base: string, parsed: ParsedCodexProvidersConfig)
 }
 
 async function readFileOrNull(filePath: string): Promise<string | null> {
-  return fs.readFile(filePath, "utf8").catch(() => null);
+  const existing = await fs.lstat(filePath).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (!existing) return null;
+  if (existing.isSymbolicLink()) throw new Error(`Refusing managed Codex symbolic link file: ${filePath}`);
+  if (!existing.isFile()) throw new Error(`Managed Codex path is not a regular file: ${filePath}`);
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  const handle = await fs.open(filePath, fsConstants.O_RDONLY | noFollow).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (!handle) return null;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`Managed Codex path is not a regular file: ${filePath}`);
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 // Pre-run backup of the original config.toml, written before the merged file.
@@ -355,7 +408,7 @@ export async function prepareCodexRuntimeConfig(input: {
       if (backup !== null) {
         // Full-fidelity restore: the backup is the pre-run original, including
         // any user provider sections the crashed run's merge excised.
-        await fs.writeFile(configTomlPath, backup, "utf8");
+        await writePrivateFile(configTomlPath, backup);
         await fs.rm(backupPath, { force: true });
         return {
           notes: [
@@ -370,7 +423,7 @@ export async function prepareCodexRuntimeConfig(input: {
       if (existing !== null) {
         const stripped = stripManagedCodexProviderBlocks(existing);
         if (stripped !== existing) {
-          await fs.writeFile(configTomlPath, stripped, "utf8");
+          await writePrivateFile(configTomlPath, stripped);
           return {
             notes: [
               ...notes,
@@ -405,11 +458,11 @@ export async function prepareCodexRuntimeConfig(input: {
     providerNames,
     parsed.modelProvider !== null,
   );
-  await fs.mkdir(input.codexHome, { recursive: true });
+  await ensurePrivateDirectory(input.codexHome);
   // Persist the original BEFORE writing the merged file so a run that never
   // reaches cleanup() can be restored by the next prepare.
-  await fs.writeFile(backupPath, original ?? "", "utf8");
-  await fs.writeFile(configTomlPath, buildMergedConfigToml(base, parsed), "utf8");
+  await writePrivateFile(backupPath, original ?? "");
+  await writePrivateFile(configTomlPath, buildMergedConfigToml(base, parsed));
 
   return {
     notes: [
@@ -422,7 +475,7 @@ export async function prepareCodexRuntimeConfig(input: {
       if (original === null) {
         await fs.rm(configTomlPath, { force: true });
       } else {
-        await fs.writeFile(configTomlPath, original, "utf8");
+        await writePrivateFile(configTomlPath, original);
       }
       await fs.rm(backupPath, { force: true });
     },

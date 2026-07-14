@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { agentInstructionsService } from "../services/agent-instructions.js";
 
+const HISTORICAL_TOMBSTONE_ID = "8d403783-c4e2-4746-adad-7689cd95ae33";
+
 type TestAgent = {
   id: string;
   companyId: string;
@@ -43,6 +45,140 @@ describe("agent instructions service", () => {
       await fs.rm(dir, { recursive: true, force: true });
       cleanupDirs.delete(dir);
     }));
+  });
+
+  it.each([
+    {
+      operation: "updateBundle",
+      invoke: (svc: ReturnType<typeof agentInstructionsService>, agent: TestAgent, externalRoot: string) =>
+        svc.updateBundle(agent, { mode: "external", rootPath: externalRoot }),
+    },
+    {
+      operation: "writeFile",
+      invoke: (svc: ReturnType<typeof agentInstructionsService>, agent: TestAgent) =>
+        svc.writeFile(agent, "docs/new.md", "must not be written\n"),
+    },
+    {
+      operation: "deleteFile",
+      invoke: (svc: ReturnType<typeof agentInstructionsService>, agent: TestAgent) =>
+        svc.deleteFile(agent, "docs/delete.md"),
+    },
+    {
+      operation: "materializeManagedBundle",
+      invoke: (svc: ReturnType<typeof agentInstructionsService>, agent: TestAgent) =>
+        svc.materializeManagedBundle(agent, { "AGENTS.md": "must not replace\n" }, { replaceExisting: true }),
+    },
+    {
+      operation: "ensureManagedBundle",
+      invoke: (svc: ReturnType<typeof agentInstructionsService>, agent: TestAgent) =>
+        svc.ensureManagedBundle(agent),
+    },
+  ])("blocks $operation for historical tombstones before touching the filesystem", async ({ invoke }) => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-tombstone-");
+    const externalRoot = await makeTempDir("paperclip-agent-instructions-tombstone-external-");
+    cleanupDirs.add(paperclipHome);
+    cleanupDirs.add(externalRoot);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+
+    const managedRoot = path.join(
+      paperclipHome,
+      "instances",
+      "test-instance",
+      "companies",
+      "company-1",
+      "agents",
+      HISTORICAL_TOMBSTONE_ID,
+      "instructions",
+    );
+    await fs.mkdir(path.join(managedRoot, "docs"), { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(managedRoot, "AGENTS.md"), "# Immutable history\n", { mode: 0o600 });
+    await fs.writeFile(path.join(managedRoot, "docs", "delete.md"), "preserve me\n", { mode: 0o600 });
+    const agent = {
+      ...makeAgent({
+        instructionsBundleMode: "managed",
+        instructionsRootPath: managedRoot,
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: path.join(managedRoot, "AGENTS.md"),
+      }),
+      id: HISTORICAL_TOMBSTONE_ID,
+    };
+
+    await expect(invoke(agentInstructionsService(), agent, externalRoot)).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "historical_agent_tombstone_immutable",
+        agentId: HISTORICAL_TOMBSTONE_ID,
+      },
+    });
+
+    await expect(fs.readFile(path.join(managedRoot, "AGENTS.md"), "utf8"))
+      .resolves.toBe("# Immutable history\n");
+    await expect(fs.readFile(path.join(managedRoot, "docs", "delete.md"), "utf8"))
+      .resolves.toBe("preserve me\n");
+    await expect(fs.stat(path.join(managedRoot, "docs", "new.md"))).rejects.toThrow();
+    expect(await fs.readdir(externalRoot)).toEqual([]);
+  });
+
+  it.each([
+    {
+      operation: "getBundle",
+      invoke: async (svc: ReturnType<typeof agentInstructionsService>, agent: TestAgent) => {
+        const result = await svc.getBundle(agent);
+        return result.files.map((file) => file.path);
+      },
+    },
+    {
+      operation: "exportFiles",
+      invoke: async (svc: ReturnType<typeof agentInstructionsService>, agent: TestAgent) => {
+        const result = await svc.exportFiles(agent);
+        return Object.keys(result.files);
+      },
+    },
+  ])("keeps historical tombstone files read-only during $operation", async ({ invoke }) => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-tombstone-read-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+
+    const managedRoot = path.join(
+      paperclipHome,
+      "instances",
+      "test-instance",
+      "companies",
+      "company-1",
+      "agents",
+      HISTORICAL_TOMBSTONE_ID,
+      "instructions",
+    );
+    const entryPath = path.join(managedRoot, "AGENTS.md");
+    await fs.mkdir(managedRoot, { recursive: true });
+    await fs.writeFile(entryPath, "# Immutable history\n", "utf8");
+    await fs.chmod(managedRoot, 0o755);
+    await fs.chmod(entryPath, 0o644);
+    const fixedMtime = new Date("2026-07-13T07:00:00.000Z");
+    await fs.utimes(managedRoot, fixedMtime, fixedMtime);
+    await fs.utimes(entryPath, fixedMtime, fixedMtime);
+    const beforeRoot = await fs.stat(managedRoot);
+    const beforeEntry = await fs.stat(entryPath);
+    const agent = {
+      ...makeAgent({
+        instructionsBundleMode: "managed",
+        instructionsRootPath: managedRoot,
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: entryPath,
+      }),
+      id: HISTORICAL_TOMBSTONE_ID,
+    };
+
+    await expect(invoke(agentInstructionsService(), agent)).resolves.toEqual(["AGENTS.md"]);
+
+    const afterRoot = await fs.stat(managedRoot);
+    const afterEntry = await fs.stat(entryPath);
+    expect(permissionBits(afterRoot.mode)).toBe(permissionBits(beforeRoot.mode));
+    expect(permissionBits(afterEntry.mode)).toBe(permissionBits(beforeEntry.mode));
+    expect(afterRoot.mtimeMs).toBe(beforeRoot.mtimeMs);
+    expect(afterEntry.mtimeMs).toBe(beforeEntry.mtimeMs);
   });
 
   it("copies the existing bundle into the managed root when switching to managed mode", async () => {
@@ -201,6 +337,115 @@ describe("agent instructions service", () => {
     expect(exported.files).toEqual({ "AGENTS.md": "# Recovered Agent\n" });
     expect(permissionBits((await fs.stat(managedRoot)).mode)).toBe(0o700);
     expect(permissionBits((await fs.stat(path.join(managedRoot, "AGENTS.md"))).mode)).toBe(0o600);
+  });
+
+  it("exports a managed bundle read-only without changing modes or mtimes", async () => {
+    const paperclipHome = await makeTempDir("paperclip-agent-instructions-read-only-");
+    cleanupDirs.add(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+
+    const managedRoot = path.join(
+      paperclipHome,
+      "instances",
+      "test-instance",
+      "companies",
+      "company-1",
+      "agents",
+      "agent-1",
+      "instructions",
+    );
+    const entryPath = path.join(managedRoot, "AGENTS.md");
+    await fs.mkdir(managedRoot, { recursive: true, mode: 0o755 });
+    await fs.writeFile(entryPath, "# Read only\n", { mode: 0o644 });
+    await fs.chmod(managedRoot, 0o755);
+    await fs.chmod(entryPath, 0o644);
+    const fixedMtime = new Date("2026-07-13T07:00:00.000Z");
+    await fs.utimes(entryPath, fixedMtime, fixedMtime);
+    const beforeRoot = await fs.stat(managedRoot);
+    const beforeEntry = await fs.stat(entryPath);
+
+    const exported = await agentInstructionsService().exportFilesReadOnly(makeAgent({
+      instructionsBundleMode: "managed",
+      instructionsRootPath: managedRoot,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: entryPath,
+    }));
+
+    const afterRoot = await fs.stat(managedRoot);
+    const afterEntry = await fs.stat(entryPath);
+    expect(exported.files).toEqual({ "AGENTS.md": "# Read only\n" });
+    expect(permissionBits(afterRoot.mode)).toBe(permissionBits(beforeRoot.mode));
+    expect(permissionBits(afterEntry.mode)).toBe(permissionBits(beforeEntry.mode));
+    expect(afterEntry.mtimeMs).toBe(beforeEntry.mtimeMs);
+  });
+
+  it("fails closed when a declared read-only bundle root is a symlink", async () => {
+    const realRoot = await makeTempDir("paperclip-agent-instructions-real-root-");
+    const linkParent = await makeTempDir("paperclip-agent-instructions-link-root-");
+    cleanupDirs.add(realRoot);
+    cleanupDirs.add(linkParent);
+    await fs.writeFile(path.join(realRoot, "AGENTS.md"), "# Outside\n", "utf8");
+    const linkedRoot = path.join(linkParent, "bundle");
+    await fs.symlink(realRoot, linkedRoot, "dir");
+
+    await expect(agentInstructionsService().exportFilesReadOnly(makeAgent({
+      instructionsBundleMode: "external",
+      instructionsRootPath: linkedRoot,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: path.join(linkedRoot, "AGENTS.md"),
+      promptTemplate: "must-not-fallback",
+    }))).rejects.toThrow("agent_instructions_root_not_directory");
+  });
+
+  it("detects an intermediate-directory symlink swap before reading from the file descriptor", async () => {
+    const bundleRoot = await makeTempDir("paperclip-agent-instructions-swap-root-");
+    const outsideRoot = await makeTempDir("paperclip-agent-instructions-swap-outside-");
+    cleanupDirs.add(bundleRoot);
+    cleanupDirs.add(outsideRoot);
+    const docsPath = path.join(bundleRoot, "docs");
+    const parkedDocsPath = path.join(bundleRoot, "docs.original");
+    await fs.mkdir(docsPath);
+    await fs.writeFile(path.join(docsPath, "AGENTS.md"), "# Trusted\n", "utf8");
+    await fs.writeFile(path.join(outsideRoot, "AGENTS.md"), "SECRET-OUTSIDE\n", "utf8");
+    let swapped = false;
+    const svc = agentInstructionsService({
+      beforeReadOnlyFileOpen: async (absolutePath) => {
+        if (swapped || absolutePath !== path.join(docsPath, "AGENTS.md")) return;
+        await fs.rename(docsPath, parkedDocsPath);
+        await fs.symlink(outsideRoot, docsPath, "dir");
+        swapped = true;
+      },
+    });
+
+    try {
+      await expect(svc.exportFilesReadOnly(makeAgent({
+        instructionsBundleMode: "external",
+        instructionsRootPath: bundleRoot,
+        instructionsEntryFile: "docs/AGENTS.md",
+        instructionsFilePath: path.join(docsPath, "AGENTS.md"),
+      }))).rejects.toThrow(/agent_instructions_(?:file|directory|path_boundary)_changed/);
+      expect(swapped).toBe(true);
+    } finally {
+      if (swapped) {
+        await fs.rm(docsPath, { force: true });
+        await fs.rename(parkedDocsPath, docsPath);
+      }
+    }
+  });
+
+  it("does not fall back to promptTemplate when a declared bundle root is missing", async () => {
+    const parent = await makeTempDir("paperclip-agent-instructions-missing-root-");
+    cleanupDirs.add(parent);
+    const missingRoot = path.join(parent, "missing");
+
+    await expect(agentInstructionsService().exportFilesReadOnly(makeAgent({
+      instructionsBundleMode: "external",
+      instructionsRootPath: missingRoot,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: path.join(missingRoot, "AGENTS.md"),
+      promptTemplate: "must-not-fallback",
+    }))).rejects.toThrow("agent_instructions_root_missing");
   });
 
   it("never hardens a stale configured root outside the canonical managed root", async () => {

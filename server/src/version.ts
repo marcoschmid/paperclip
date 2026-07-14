@@ -75,4 +75,9 @@ export function resolveServerVersion(
   return packageVersion;
 }
 
-export const serverVersion = resolveServerVersion();
+// Test workers run in short-lived, often heavily parallelized processes. A
+// synchronous `git describe` there adds no coverage (resolveServerVersion has
+// dedicated tests) and can consume an entire per-test timeout on a busy host.
+export const serverVersion = process.env.NODE_ENV === "test"
+  ? pkg.version ?? "0.0.0"
+  : resolveServerVersion();

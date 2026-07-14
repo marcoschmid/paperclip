@@ -70,9 +70,16 @@ export function projectDocumentRoutes(db: Db) {
       assertCompanyAccess(req, companyId);
       await assertProjectInCompany(companyId, projectId);
 
-      const result = await svc.upsert(companyId, { projectId, key, ...req.body });
-
       const actor = getActorInfo(req);
+      const result = await svc.upsert(companyId, {
+        projectId,
+        key,
+        ...req.body,
+        createdByAgentId: actor.agentId,
+        createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        createdByRunId: actor.runId,
+      });
+
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
