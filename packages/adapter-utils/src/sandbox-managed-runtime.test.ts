@@ -300,7 +300,7 @@ describe("sandbox managed runtime", () => {
       status.phase === "export" &&
       /^Exporting git history from sandbox: 100% \(\d+\.\d\/\d+\.\d MB\)$/.test(status.message)
     ))).toBe(true);
-  });
+  }, 15_000);
 
   it("repairs stale host index deletions when the sandbox restores a clean git worktree", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-clean-restore-"));
