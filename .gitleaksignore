@@ -1,0 +1,9 @@
+
+# Sweep 2026-07-16: verifizierte Test-Fixtures (redaction/invite/smoke-Tests)
+ce89f94de8bd4ca4319cbe3e8715a14f5892ad7e:server/src/__tests__/redaction.test.ts:private-key:191
+8d9f9fd24086a3ae8ee7edc83f8368084be81277:server/src/__tests__/environment-custom-images-service.test.ts:generic-api-key:456
+d77fab6aae3146ab5957c4d4d54d634f22545707:server/src/__tests__/invite-accept-gateway-defaults.test.ts:generic-api-key:203
+d77fab6aae3146ab5957c4d4d54d634f22545707:server/src/__tests__/invite-accept-gateway-defaults.test.ts:generic-api-key:233
+fd2f82ac5bba6ce2db0c5d17c573733af5f2bbb8:server/src/__tests__/invite-accept-gateway-defaults.test.ts:generic-api-key:155
+fd2f82ac5bba6ce2db0c5d17c573733af5f2bbb8:server/src/__tests__/invite-accept-gateway-defaults.test.ts:generic-api-key:178
+fd2f82ac5bba6ce2db0c5d17c573733af5f2bbb8:scripts/smoke/hermes-gateway-e2e.sh:curl-auth-header:610
