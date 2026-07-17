@@ -1029,7 +1029,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issues.originKind, "stranded_issue_recovery"),
         eq(issues.originId, input.issueId),
       ));
-    expect(recoveryIssues).toHaveLength(0);
+    if (input.kind === "missing_disposition") {
+      // Missing-Disposition treibt seit dem Deadlock-Fix zusaetzlich ein
+      // dediziertes, dispatchbares Recovery-Issue als First-Class-Blocker;
+      // der Assignment-Wake kann es hier bereits in Bearbeitung gezogen haben.
+      expect(recoveryIssues).toHaveLength(1);
+      expect(["todo", "in_progress"]).toContain(recoveryIssues[0]!.status);
+    } else {
+      expect(recoveryIssues).toHaveLength(0);
+    }
 
     const recoveryWakeup = await waitForValue(async () => {
       const wakeups = await db
@@ -1046,7 +1054,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(recoveryWakeup).toMatchObject({
       companyId: input.companyId,
-      reason: "source_scoped_recovery_action",
+      // Seit dem Missing-Disposition-Fix traegt das Source-Issue einen
+      // First-Class-Blocker (das Recovery-Issue); der Source-Wake wird dann
+      // als dependencies-blocked reklassifiziert, die aktionable Arbeit
+      // laeuft ueber den Assignment-Wake des Recovery-Issues.
+      reason: input.kind === "missing_disposition"
+        ? "issue_dependencies_blocked"
+        : "source_scoped_recovery_action",
       source: "assignment",
       payload: expect.objectContaining({
         modelProfile: "cheap",
@@ -1056,25 +1070,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }),
     });
 
-    const recoveryRun = recoveryWakeup?.runId
-      ? await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, recoveryWakeup.runId))
-        .then((rows) => rows[0] ?? null)
-      : null;
-    expect(recoveryRun?.contextSnapshot).toMatchObject({
-      issueId: input.issueId,
-      taskId: input.issueId,
-      source: "issue_recovery_action",
-      recoveryActionId: action.id,
-      sourceIssueId: input.issueId,
-      strandedRunId: input.runId,
-      modelProfile: "cheap",
-      allowDeliverableWork: false,
-      allowDocumentUpdates: false,
-      resumeRequiresNormalModel: true,
-    });
+    if (input.kind === "missing_disposition") {
+      // Der dependencies-blocked-Source-Wake spawnt keinen eigenen Run;
+      // gearbeitet wird auf dem dispatchbaren Recovery-Issue.
+      expect(recoveryWakeup?.runId ?? null).toBeNull();
+    } else {
+      const recoveryRun = recoveryWakeup?.runId
+        ? await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, recoveryWakeup.runId))
+          .then((rows) => rows[0] ?? null)
+        : null;
+      expect(recoveryRun?.contextSnapshot).toMatchObject({
+        issueId: input.issueId,
+        taskId: input.issueId,
+        source: "issue_recovery_action",
+        recoveryActionId: action.id,
+        sourceIssueId: input.issueId,
+        strandedRunId: input.runId,
+        modelProfile: "cheap",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      });
+    }
     await waitForHeartbeatIdle(db);
     const sourceIssue = await db
       .select()
@@ -2167,7 +2187,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(sourceIssue?.status).toBe("blocked");
-    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    // Seit dem Deadlock-Fix blockiert das dispatchbare Recovery-Issue das
+    // Source-Issue erster Klasse statt es blockerlos zu parken.
+    const blockerIds = await sourceBlockerIssueIds(companyId, issueId);
+    expect(blockerIds).toHaveLength(1);
+    const [dispositionRecoveryIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, blockerIds[0]!));
+    expect(dispositionRecoveryIssue).toMatchObject({ originKind: "stranded_issue_recovery" });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments[0]?.body).toBe(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY);

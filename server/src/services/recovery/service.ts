@@ -2904,7 +2904,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
-    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // Missing-Disposition darf das Source-Issue nicht ohne First-Class-Blocker
+    // in `blocked` parken: der One-Shot-Owner-Wake wertet `blocked` als
+    // terminal, Auto-Resolve und Reconcile schliessen blockerlose blocked-
+    // Issues aus — Issue und Action verwaisen dauerhaft. Stattdessen treibt
+    // ein dediziertes Recovery-Issue (todo, dispatchbar) die Disposition und
+    // blockiert das Source-Issue erster Klasse, bis sie gesetzt ist.
+    let missingDispositionRecoveryIssue: Awaited<ReturnType<typeof ensureStrandedIssueRecoveryIssue>> = null;
+    if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON) {
+      // Kann null liefern (kein invokabler Owner / Tombstone): dann greift
+      // bewusst der bisherige Pfad mit Board-Eskalation im Notice-Kommentar —
+      // ohne Owner koennte auch ein Recovery-Issue niemand bearbeiten.
+      missingDispositionRecoveryIssue = await ensureStrandedIssueRecoveryIssue({
+        issue: input.issue,
+        latestRun: input.latestRun,
+        previousStatus: input.previousStatus,
+        recoveryCause,
+        successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      });
+    }
+    const existingBlockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const blockerIds = missingDispositionRecoveryIssue &&
+        !existingBlockerIds.includes(missingDispositionRecoveryIssue.id)
+      ? [...existingBlockerIds, missingDispositionRecoveryIssue.id]
+      : existingBlockerIds;
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
@@ -2924,7 +2947,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           : null,
         correctiveRun: input.latestRun ? { id: input.latestRun.id, status: input.latestRun.status } : null,
         sourceAssignee,
-        recoveryIssue: null,
+        recoveryIssue: missingDispositionRecoveryIssue
+          ? {
+            id: missingDispositionRecoveryIssue.id,
+            identifier: missingDispositionRecoveryIssue.identifier ?? null,
+            title: missingDispositionRecoveryIssue.title,
+            status: missingDispositionRecoveryIssue.status,
+          }
+          : null,
         recoveryActionId: recoveryAction.id,
         recoveryOwner,
         latestIssueStatus: input.issue.status,

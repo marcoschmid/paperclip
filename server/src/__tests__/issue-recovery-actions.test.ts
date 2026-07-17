@@ -1437,4 +1437,72 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  it("missing-disposition escalation drives a dispatchable recovery issue and first-class blocker", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const correctiveRunId = randomUUID();
+    const sourceRunId = randomUUID();
+    const latestRun = {
+      id: correctiveRunId,
+      agentId: coderId,
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      contextSnapshot: {},
+      livenessState: "needs_followup",
+    } as const;
+    const evidence = {
+      sourceRunId,
+      correctiveRunId,
+      missingDisposition: "clear_next_step",
+      handoffAttempt: 1,
+      maxHandoffAttempts: 1,
+    };
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      recoveryCause: "successful_run_missing_state",
+      successfulRunHandoffEvidence: evidence,
+    });
+    // Idempotenz: zweite Eskalation erzeugt kein zweites Recovery-Issue.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      recoveryCause: "successful_run_missing_state",
+      successfulRunHandoffEvidence: evidence,
+    });
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, "stranded_issue_recovery"),
+      ));
+    expect(recoveryIssues).toHaveLength(1);
+    expect(recoveryIssues[0]).toMatchObject({
+      status: "todo",
+      parentId: sourceIssue.id,
+      assigneeAgentId: managerId,
+    });
+    expect(recoveryIssues[0]!.title).toContain("Recover missing next step");
+
+    const [sourceAfter] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(sourceAfter?.status).toBe("blocked");
+
+    const blockerRelations = await db
+      .select()
+      .from(issueRelations)
+      .where(and(
+        eq(issueRelations.relatedIssueId, sourceIssue.id),
+        eq(issueRelations.type, "blocks"),
+      ));
+    expect(blockerRelations.map((relation) => relation.issueId))
+      .toContain(recoveryIssues[0]!.id);
+  });
 });
