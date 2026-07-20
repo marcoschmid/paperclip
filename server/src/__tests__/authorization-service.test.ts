@@ -1578,4 +1578,69 @@ describeEmbeddedPostgres("authorization service", () => {
       reason: "deny_scope",
     });
   });
+
+  it("allows a manager with a tasks:assign grant to comment on and mutate another agent's non-locked issue (HAP-569)", async () => {
+    const company = await createCompany(db, "ManagerCommentBoundary");
+    const managerAgent = await createAgent(db, company.id);
+    const assigneeAgent = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, managerAgent.id, "tasks:assign");
+    const issue = await createIssue(db, company.id, { assigneeAgentId: assigneeAgent.id });
+
+    const authz = authorizationService(db);
+    const actor = { type: "agent" as const, agentId: managerAgent.id, companyId: company.id, source: "agent_key" as const };
+
+    await expect(authz.decide({
+      actor,
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: assigneeAgent.id,
+        status: "blocked",
+      },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+
+    await expect(authz.decide({
+      actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: assigneeAgent.id,
+        status: "blocked",
+      },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
+  it("still denies issue:comment/issue:mutate for agents without task-assignment authority over the assignee", async () => {
+    const company = await createCompany(db, "NoAuthorityBoundary");
+    const bystanderAgent = await createAgent(db, company.id);
+    const assigneeAgent = await createAgent(db, company.id);
+    const issue = await createIssue(db, company.id, { assigneeAgentId: assigneeAgent.id });
+
+    const authz = authorizationService(db);
+    const actor = { type: "agent" as const, agentId: bystanderAgent.id, companyId: company.id, source: "agent_key" as const };
+
+    await expect(authz.decide({
+      actor,
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: assigneeAgent.id,
+        status: "blocked",
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
+    });
+  });
 });

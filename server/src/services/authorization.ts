@@ -1586,6 +1586,30 @@ export function authorizationService(db: Db) {
       ) {
         return allowIssueMentionGrant(input.action);
       }
+      // An agent that already holds authority to reassign this issue away
+      // from its current assignee (CEO, canAssignTasks manifest, an explicit
+      // tasks:assign/tasks:assign_scope grant, or reporting-chain management)
+      // must also be able to read/comment/mutate it — otherwise the
+      // documented manager-reassignment workflow (SPEC-implementation
+      // "Worked Example: Manager Heartbeat") is unreachable: a manager could
+      // never comment on or PATCH a non-locked issue assigned to someone
+      // else in order to reassign it.
+      if (resource) {
+        const assignmentAuthority = await decideBase({
+          actor: input.actor,
+          action: "tasks:assign",
+          resource,
+          scope: input.scope,
+        });
+        if (assignmentAuthority.allowed) {
+          return allow({
+            action: input.action,
+            reason: "allow_manager_chain",
+            explanation:
+              "Allowed because the actor holds task-assignment authority over the issue's current assignee.",
+          });
+        }
+      }
     }
     if (
       input.action === "agent_config:update" &&
