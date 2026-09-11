@@ -1,13 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentLifecycle, AgentLifecycleGate } from "@paperclipai/shared";
 import * as lifecycleService from "./agent-lifecycle.js";
 
 const NOW = new Date("2026-07-13T12:00:00.000Z");
-// TOL-257 renewal cases are evaluated against the real wall clock, because the
-// lifecycle validator resolves "review overdue" against Date.now().
-const TOL257_DAY_MS = 24 * 60 * 60 * 1_000;
-const OVERDUE_REVIEW_AT = new Date(Date.now() - 7 * TOL257_DAY_MS).toISOString();
-const RENEWED_REVIEW_AT = new Date(Date.now() + 30 * TOL257_DAY_MS).toISOString();
+// The lifecycle validator resolves "review overdue" and "canary timestamp in the
+// future" against Date.now(), so the suite pins the system clock to NOW. Without
+// the pin every fixed fixture date below rots once NOW passes in real time.
+const DAY_MS = 24 * 60 * 60 * 1_000;
+const OVERDUE_REVIEW_AT = new Date(NOW.getTime() - 7 * DAY_MS).toISOString();
+const RENEWED_REVIEW_AT = new Date(NOW.getTime() + 30 * DAY_MS).toISOString();
+
+beforeAll(() => {
+  vi.useFakeTimers({ now: NOW });
+});
+
+afterAll(() => {
+  vi.useRealTimers();
+});
 
 function lifecycle(overrides: Partial<AgentLifecycle> = {}): AgentLifecycle {
   return {

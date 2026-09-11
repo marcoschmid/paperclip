@@ -96,11 +96,11 @@ function validEvidence() {
 }
 
 describe("agent retirement validators", () => {
-  it("publishes an external exact 33-agent retained identity contract", () => {
+  it("publishes an external exact 34-agent retained identity contract", () => {
     const retainedAgents = (retirementContract as unknown as Record<string, unknown>)
       .AGENT_RETIREMENT_RETAINED_AGENTS as Array<Record<string, unknown>> | undefined;
-    expect(retainedAgents).toHaveLength(33);
-    expect(new Set(retainedAgents?.map((row) => row.agentId))).toHaveProperty("size", 33);
+    expect(retainedAgents).toHaveLength(34);
+    expect(new Set(retainedAgents?.map((row) => row.agentId))).toHaveProperty("size", 34);
     expect(retainedAgents?.every((row) => (
       typeof row.agentId === "string"
       && typeof row.companyId === "string"
