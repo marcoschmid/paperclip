@@ -1217,6 +1217,7 @@ export {
   agentLifecyclePauseSchema,
   agentLifecyclePermissionExceptionSchema,
   agentLifecycleSchema,
+  agentLifecycleStoredSchema,
   agentLifecycleTransitionSchema,
   agentLifecycleGateSchema,
   agentLifecycleCanaryGateSchema,

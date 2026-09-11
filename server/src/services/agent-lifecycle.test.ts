@@ -3,6 +3,11 @@ import type { AgentLifecycle, AgentLifecycleGate } from "@paperclipai/shared";
 import * as lifecycleService from "./agent-lifecycle.js";
 
 const NOW = new Date("2026-07-13T12:00:00.000Z");
+// TOL-257 renewal cases are evaluated against the real wall clock, because the
+// lifecycle validator resolves "review overdue" against Date.now().
+const TOL257_DAY_MS = 24 * 60 * 60 * 1_000;
+const OVERDUE_REVIEW_AT = new Date(Date.now() - 7 * TOL257_DAY_MS).toISOString();
+const RENEWED_REVIEW_AT = new Date(Date.now() + 30 * TOL257_DAY_MS).toISOString();
 
 function lifecycle(overrides: Partial<AgentLifecycle> = {}): AgentLifecycle {
   return {
@@ -500,6 +505,61 @@ describe("agent lifecycle service", () => {
       ok: false,
       reason: "revalidation_fingerprint_mutation",
     });
+  });
+
+  it("renews an overdue stored review through preserved passed evidence", () => {
+    const previous = lifecycle({ reviewAt: OVERDUE_REVIEW_AT });
+    const next = lifecycle({ reviewAt: RENEWED_REVIEW_AT });
+    expect(lifecycleService.validateAgentLifecyclePatchTransition({
+      previousLifecycle: previous,
+      nextLifecycle: next,
+      transition: undefined,
+      currentAgentUpdatedAt: NOW,
+    })).toEqual({ ok: true, mode: "preserved_passed_evidence" });
+  });
+
+  it("evaluates reviewed revalidation rules instead of rejecting an overdue stored review", () => {
+    const previous = lifecycle({ reviewAt: OVERDUE_REVIEW_AT });
+    const transition = {
+      mode: "reviewed_passed_revalidation" as const,
+      canaryIssueId: previous.canaryIssueId!,
+      decisionIssueId: previous.decisionIssueId,
+      reasonCode: "runtime_evidence_invalidated" as const,
+      expectedAgentUpdatedAt: NOW.toISOString(),
+    };
+    const validate = (nextLifecycle: AgentLifecycle) =>
+      lifecycleService.validateAgentLifecyclePatchTransition({
+        previousLifecycle: previous,
+        nextLifecycle,
+        transition,
+        currentAgentUpdatedAt: NOW,
+        nextAgentStatus: "paused",
+        fingerprintRelevantChange: false,
+      });
+
+    // The stored overdue review no longer short-circuits as previous_lifecycle_invalid;
+    // the transition now fails on its own immutable-policy rule instead.
+    expect(validate(pendingLifecycle({ reviewAt: RENEWED_REVIEW_AT })))
+      .toMatchObject({ ok: false, reason: "revalidation_policy_mismatch" });
+    // Renewing the review first (preserved_passed_evidence) and revalidating afterwards
+    // keeps the policy identical and is accepted.
+    expect(lifecycleService.validateAgentLifecyclePatchTransition({
+      previousLifecycle: lifecycle({ reviewAt: RENEWED_REVIEW_AT }),
+      nextLifecycle: pendingLifecycle({ reviewAt: RENEWED_REVIEW_AT }),
+      transition,
+      currentAgentUpdatedAt: NOW,
+      nextAgentStatus: "paused",
+      fingerprintRelevantChange: false,
+    })).toEqual({ ok: true, mode: "reviewed_passed_revalidation" });
+  });
+
+  it("still refuses a next lifecycle whose review deadline has already passed", () => {
+    expect(lifecycleService.validateAgentLifecyclePatchTransition({
+      previousLifecycle: lifecycle({ reviewAt: OVERDUE_REVIEW_AT }),
+      nextLifecycle: lifecycle({ reviewAt: OVERDUE_REVIEW_AT }),
+      transition: undefined,
+      currentAgentUpdatedAt: NOW,
+    })).toMatchObject({ ok: false, reason: "next_lifecycle_invalid" });
   });
 
   it("allows failed to pending only with exact reviewed repair CAS and issue binding", () => {

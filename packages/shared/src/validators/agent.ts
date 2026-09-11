@@ -134,7 +134,7 @@ export const agentLifecyclePermissionExceptionSchema = z.union([
   approvedLifecyclePermissionExceptionSchema,
 ]);
 
-export const agentLifecycleSchema = z.object({
+const agentLifecycleBaseSchema = z.object({
   schemaVersion: z.literal(LIFECYCLE_SCHEMA_VERSION),
   owner: agentLifecycleOwnerSchema,
   purpose: lifecycleNonEmptyStringSchema,
@@ -153,7 +153,17 @@ export const agentLifecycleSchema = z.object({
   replacementAgentId: z.string().uuid().optional(),
   replacementSystemRef: lifecycleNonEmptyStringSchema.optional(),
   pause: agentLifecyclePauseSchema.optional(),
-}).strict().superRefine((lifecycle, ctx) => {
+}).strict();
+
+/**
+ * Shared lifecycle invariants that hold for stored and freshly submitted
+ * lifecycles alike. The "review is overdue" rule is intentionally excluded
+ * here so that an expired review can still be read back and renewed.
+ */
+function refineStoredAgentLifecycle(
+  lifecycle: z.infer<typeof agentLifecycleBaseSchema>,
+  ctx: z.RefinementCtx,
+) {
   addUniqueArrayIssue(lifecycle.acceptedTaskTypes, ctx, "acceptedTaskTypes");
   addUniqueArrayIssue(lifecycle.rejectedTaskTypes, ctx, "rejectedTaskTypes");
   addUniqueArrayIssue(lifecycle.taskSources, ctx, "taskSources");
@@ -203,15 +213,29 @@ export const agentLifecycleSchema = z.object({
   if (lifecycle.lastCanaryAt && new Date(lifecycle.lastCanaryAt).getTime() > Date.now()) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Canary timestamp cannot be in the future", path: ["lastCanaryAt"] });
   }
-  if (new Date(lifecycle.reviewAt).getTime() <= Date.now()) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Lifecycle review is overdue", path: ["reviewAt"] });
-  }
   if (lifecycle.replacementAgentId && lifecycle.replacementSystemRef) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: "Use exactly one replacement reference",
       path: ["replacementAgentId"],
     });
+  }
+}
+
+/**
+ * Validates an already stored lifecycle. Every invariant of
+ * {@link agentLifecycleSchema} applies except the future-dated review
+ * deadline: a stored lifecycle whose reviewAt has passed must stay readable
+ * so the overdue review can be renewed. Never use this for newly submitted
+ * or next-state lifecycles.
+ */
+export const agentLifecycleStoredSchema = agentLifecycleBaseSchema
+  .superRefine(refineStoredAgentLifecycle);
+
+export const agentLifecycleSchema = agentLifecycleBaseSchema.superRefine((lifecycle, ctx) => {
+  refineStoredAgentLifecycle(lifecycle, ctx);
+  if (new Date(lifecycle.reviewAt).getTime() <= Date.now()) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Lifecycle review is overdue", path: ["reviewAt"] });
   }
 });
 

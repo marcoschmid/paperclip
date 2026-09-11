@@ -10,6 +10,7 @@ import {
   agentLifecycleCanaryGateSchema,
   agentLifecyclePermissionExceptionSchema,
   agentLifecycleSchema,
+  agentLifecycleStoredSchema,
 } from "@paperclipai/shared";
 import {
   createAgentConfigurationFingerprint,
@@ -235,9 +236,11 @@ export function validateAgentLifecyclePatchTransition(input: {
   const next = nextResult.data;
 
   const previousAbsent = input.previousLifecycle === undefined || input.previousLifecycle === null;
+  // The stored lifecycle is read with the overdue-review rule relaxed so an
+  // expired review can still be renewed; nextLifecycle stays strict above.
   const previousResult = previousAbsent
     ? null
-    : agentLifecycleSchema.safeParse(input.previousLifecycle);
+    : agentLifecycleStoredSchema.safeParse(input.previousLifecycle);
   if (previousResult && !previousResult.success) {
     return { ok: false, reason: "previous_lifecycle_invalid" };
   }

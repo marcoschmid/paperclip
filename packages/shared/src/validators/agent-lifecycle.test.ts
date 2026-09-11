@@ -78,6 +78,37 @@ describe("agent lifecycle contract", () => {
     expect(agentValidators.agentLifecycleSchema.safeParse(validLifecycle({ shadowMode: "standby" })).success).toBe(false);
   });
 
+  it("relaxes only the overdue review rule for a stored lifecycle", () => {
+    const overdue = validLifecycle({ reviewAt: isoFromNow(-1) });
+
+    const strict = agentValidators.agentLifecycleSchema.safeParse(overdue);
+    expect(strict.success).toBe(false);
+    expect(strict.success === false && strict.error.issues.some(
+      (issue) => issue.path.join(".") === "reviewAt" && issue.message === "Lifecycle review is overdue",
+    )).toBe(true);
+
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(overdue).success).toBe(true);
+    expect((shared as Record<string, unknown>).agentLifecycleStoredSchema).toBeDefined();
+
+    // Every other invariant stays fail-closed in the stored variant.
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      validLifecycle({ reviewAt: isoFromNow(-1), shadowMode: "standby" }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      validLifecycle({ reviewAt: isoFromNow(-1), lastCanaryResult: "passed", lastCanaryAt: null }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      validLifecycle({ reviewAt: isoFromNow(-1), lastCanaryAt: isoFromNow(1) }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      validLifecycle({ reviewAt: isoFromNow(-1), acceptedTaskTypes: ["dup", "dup"] }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(validLifecycle({
+      reviewAt: isoFromNow(-1),
+      operatingMode: "manual_assignment_only",
+    })).success).toBe(false);
+  });
+
   it("enforces exactly one typed owner reference", () => {
     expect(agentValidators.agentLifecycleSchema.safeParse(validLifecycle({
       owner: {
