@@ -7,7 +7,7 @@
   {
     "agentId": "e274b636-6754-40ca-8b6c-fe312c8a627d",
     "companyId": "0a7df9a5-299e-4d64-a4d4-0c4c63784425",
-    "name": "Claude Tooling Reviewer"
+    "name": "Tooling Reviewer"
   },
   {
     "agentId": "6b647702-ada4-4a59-8746-2be6a32ce2a6",
@@ -17,7 +17,7 @@
   {
     "agentId": "caf44c1d-ab4f-41fd-aaef-db5d1a97ffa0",
     "companyId": "0a7df9a5-299e-4d64-a4d4-0c4c63784425",
-    "name": "Paperclip Builder"
+    "name": "Paperclip Engineer"
   },
   {
     "agentId": "af5fb376-42ea-47fb-a526-dd0dcdfc73ef",
@@ -42,7 +42,7 @@
   {
     "agentId": "3f6988bb-049c-439c-9304-846f87224e9c",
     "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
-    "name": "Bildkuenstler"
+    "name": "Image Artist"
   },
   {
     "agentId": "f2d13771-5596-4419-a81d-5a86113bc0a7",
@@ -62,32 +62,32 @@
   {
     "agentId": "a59d7246-d6db-420c-b9c9-c96827ca0e49",
     "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
-    "name": "Senior Copywriter"
+    "name": "German Copywriter"
   },
   {
     "agentId": "70fb1a71-cbc0-49f2-a63f-3c3a43701a84",
     "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
-    "name": "Projektmanager"
+    "name": "Project Manager"
   },
   {
     "agentId": "76ef255c-fc24-49a3-ab97-b4328fbbbd71",
     "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
-    "name": "Researcher"
+    "name": "Research Analyst"
   },
   {
     "agentId": "c1eeff0b-e655-488b-8902-9fe25e2b74e7",
     "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
-    "name": "Codex Engineer"
+    "name": "Software Engineer"
   },
   {
     "agentId": "78936621-89fc-4981-bd32-7ac21ef42c52",
     "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
-    "name": "Codex Intake Runner"
+    "name": "Intake Runner"
   },
   {
     "agentId": "f1b618e7-7724-4107-928d-6d35d52ccaa8",
     "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
-    "name": "Fullstack Developer"
+    "name": "Fullstack Engineer"
   },
   {
     "agentId": "f923bc63-a703-43b1-9af9-c38d7ca9a508",
@@ -107,7 +107,7 @@
   {
     "agentId": "8a8e52c9-62d5-4168-b267-30e97e3c67f2",
     "companyId": "51eb52b7-49ed-461a-bd67-7384158374e6",
-    "name": "Casa Fullstack Developer"
+    "name": "Casa Fullstack Engineer"
   },
   {
     "agentId": "c41d7f42-d424-4615-ad71-0f4c5b9762fa",
@@ -127,7 +127,7 @@
   {
     "agentId": "3bd9d164-93be-4d8f-a5d7-f1da9719a9b8",
     "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
-    "name": "TechOps Security Hardening Lead"
+    "name": "Security Reviewer"
   },
   {
     "agentId": "04c5ffc3-7eb8-428f-8225-0c50063667e9",
@@ -137,7 +137,7 @@
   {
     "agentId": "065b5034-3acc-49a9-b728-857673111bde",
     "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
-    "name": "Backup und Disaster Recovery"
+    "name": "Backup and Recovery Engineer"
   },
   {
     "agentId": "f62a426d-ff14-4fd1-91ec-9ae5c8927a53",
@@ -147,7 +147,7 @@
   {
     "agentId": "873c1703-dcd2-4abf-8771-2f89c2d3fd4d",
     "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
-    "name": "Docker und Container Ops"
+    "name": "Container Operations Engineer"
   },
   {
     "agentId": "7f84a9d1-5751-4427-853f-b85851f945d1",
@@ -157,11 +157,16 @@
   {
     "agentId": "3f169b0b-f743-4ce1-9127-b6c8de214fd4",
     "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
-    "name": "Monitoring und Alerting Ops"
+    "name": "Monitoring Engineer"
   },
   {
     "agentId": "271a40cc-fdfa-4aeb-a25e-61bd61467071",
     "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
-    "name": "TechOps Service Integration Engineer"
+    "name": "Service Integration Engineer"
+  },
+  {
+    "agentId": "994ff3fc-13f9-457c-a895-4e822d573e89",
+    "companyId": "0d49d45f-63d7-4dd3-9b1e-90992eb45226",
+    "name": "HAPPYGANG Inbox Concierge"
   }
 ]
