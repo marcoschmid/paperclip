@@ -411,10 +411,13 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
       type: "array",
       items: zodToOpenApiSchema(def.element as z.ZodTypeAny),
     };
-    const minLength = (def as { minLength?: { value?: number } }).minLength?.value;
-    if (minLength !== undefined) jsonSchema.minItems = minLength;
-    const maxLength = (def as { maxLength?: { value?: number } }).maxLength?.value;
-    if (maxLength !== undefined) jsonSchema.maxItems = maxLength;
+    // Zod 4 legt Laengenregeln als checks ab (min_length/max_length).
+    const checks = ((def as { checks?: Array<{ _zod?: { def?: { check?: string; minimum?: number; maximum?: number } } }> }).checks) ?? [];
+    for (const check of checks) {
+      const checkDef = check?._zod?.def;
+      if (checkDef?.check === "min_length" && typeof checkDef.minimum === "number") jsonSchema.minItems = checkDef.minimum;
+      if (checkDef?.check === "max_length" && typeof checkDef.maximum === "number") jsonSchema.maxItems = checkDef.maximum;
+    }
     return jsonSchema;
   }
 
@@ -671,38 +674,6 @@ const importRequestBody = (schema: z.ZodTypeAny) => ({
 });
 
 const r = responses;
-
-const upsertDecisionSchema = z
-  .object({
-    sourceProjectSlug: z.string().min(1),
-    sourceKey: z.string().min(1).max(200),
-    sourceHash: z.string().min(1),
-    title: z.string().min(1),
-    decision: z.string().min(1),
-    context: z.string().nullable().optional(),
-    consequences: z.string().nullable().optional(),
-    status: z.enum(["proposed", "accepted", "deprecated", "superseded"]).optional(),
-    metadata: z.record(z.string(), z.unknown()).optional(),
-    supersededBy: z.string().uuid().nullable().optional(),
-    decidedAt: z.coerce.date().nullable().optional(),
-    createdByAgentId: z.string().uuid().nullable().optional(),
-    createdByUserId: z.string().nullable().optional(),
-  })
-  .strict();
-
-const upsertProjectDocumentSchema = z
-  .object({
-    body: z.string(),
-    title: z.string().nullable().optional(),
-    format: z.string().min(1).optional(),
-    changeSummary: z.string().nullable().optional(),
-    tags: z.array(z.unknown()).optional(),
-    metadata: z.record(z.string(), z.unknown()).optional(),
-    createdByAgentId: z.string().uuid().nullable().optional(),
-    createdByUserId: z.string().nullable().optional(),
-    createdByRunId: z.string().uuid().nullable().optional(),
-  })
-  .strict();
 
 const externalObjectSummariesBodySchema = z.object({
   issueIds: z.array(z.string().guid()).max(1000),
@@ -3382,66 +3353,6 @@ registry.registerPath({
   summary: "Delete a project",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
-});
-
-registry.registerPath({
-  method: "get",
-  path: "/api/companies/{companyId}/projects/{projectId}/decisions",
-  tags: ["projects"],
-  summary: "List project decisions",
-  request: { params: z.object({ companyId: z.string(), projectId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
-});
-
-registry.registerPath({
-  method: "get",
-  path: "/api/companies/{companyId}/projects/{projectId}/decisions/{sourceKey}",
-  tags: ["projects"],
-  summary: "Get a project decision by source key",
-  request: { params: z.object({ companyId: z.string(), projectId: z.string(), sourceKey: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
-});
-
-registry.registerPath({
-  method: "post",
-  path: "/api/companies/{companyId}/projects/{projectId}/decisions",
-  tags: ["projects"],
-  summary: "Upsert a project decision",
-  request: {
-    params: z.object({ companyId: z.string(), projectId: z.string() }),
-    body: jsonBody(upsertDecisionSchema),
-  },
-  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
-});
-
-registry.registerPath({
-  method: "get",
-  path: "/api/companies/{companyId}/projects/{projectId}/documents",
-  tags: ["projects"],
-  summary: "List project-memory documents",
-  request: { params: z.object({ companyId: z.string(), projectId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
-});
-
-registry.registerPath({
-  method: "get",
-  path: "/api/companies/{companyId}/projects/{projectId}/documents/{key}",
-  tags: ["projects"],
-  summary: "Get a project-memory document by key",
-  request: { params: z.object({ companyId: z.string(), projectId: z.string(), key: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
-});
-
-registry.registerPath({
-  method: "put",
-  path: "/api/companies/{companyId}/projects/{projectId}/documents/{key}",
-  tags: ["projects"],
-  summary: "Upsert a project-memory document",
-  request: {
-    params: z.object({ companyId: z.string(), projectId: z.string(), key: z.string() }),
-    body: jsonBody(upsertProjectDocumentSchema),
-  },
-  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({

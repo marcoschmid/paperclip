@@ -1137,12 +1137,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !isClaudeImageProcessingError(parsed);
     const resultExitCode = controlledTerminalResultCleanup ? 0 : proc.exitCode;
     const resultSignal = controlledTerminalResultCleanup ? null : proc.signal;
-    const processFailed = (resultExitCode ?? 0) !== 0 || resultSignal !== null;
-    // Upstream: ein sauberes Ergebnis mit subtype=success gilt nicht als Fehlschlag,
-    // auch wenn der Prozess mit einem Exitcode endet.
+    // Upstream: ein sauberes Ergebnis mit subtype=success gilt trotz Exitcode
+    // ungleich 0 als Erfolg. Fork: ein echtes Signal nach dem Ergebnis bleibt
+    // ein Fehlschlag (fail-closed); nur die kontrollierte Bereinigung ist erlaubt.
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
     const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
-    const failed = !parsedSucceeded && (processFailed || parsedIsError);
+    const exitCodeFailed = (resultExitCode ?? 0) !== 0 && !parsedSucceeded;
+    const processFailed = exitCodeFailed || resultSignal !== null;
+    const failed = processFailed || parsedIsError;
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed

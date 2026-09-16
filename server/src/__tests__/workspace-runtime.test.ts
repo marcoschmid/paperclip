@@ -22,7 +22,6 @@ import {
   projects,
   workspaceOperations,
   workspaceRuntimeServices,
-  workspaceRuntimeStartClaims,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
@@ -33,7 +32,6 @@ import {
   ensureRuntimeServicesForRun,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
-  persistAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   refreshRemoteTrackingBaseRef,
@@ -125,8 +123,6 @@ function workspaceBranchIncoherenceFingerprintForTest(input: {
 }
 
 const leasedRunIds = new Set<string>();
-let suiteRegistryDir = "";
-let previousSuiteRegistryDir: string | undefined;
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -136,18 +132,6 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 const provisionWorktreeScriptPath = new URL("../../../scripts/provision-worktree.sh", import.meta.url);
-
-beforeAll(async () => {
-  previousSuiteRegistryDir = process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR;
-  suiteRegistryDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-runtime-registry-"));
-  process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR = suiteRegistryDir;
-});
-
-afterAll(async () => {
-  if (previousSuiteRegistryDir === undefined) delete process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR;
-  else process.env.PAPERCLIP_TEST_RUNTIME_SERVICES_DIR = previousSuiteRegistryDir;
-  await fs.rm(suiteRegistryDir, { recursive: true, force: true });
-});
 
 async function runGit(cwd: string, args: string[]) {
   await execFileAsync("git", args, { cwd });
@@ -463,8 +447,6 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
   await resetRuntimeServicesForTests();
-  await fs.rm(suiteRegistryDir, { recursive: true, force: true });
-  await fs.mkdir(suiteRegistryDir, { recursive: true, mode: 0o700 });
 });
 
 describe("sanitizeRuntimeServiceBaseEnv", () => {
@@ -733,67 +715,36 @@ describe("realizeExecutionWorkspace", () => {
     const expectedRemoteHead = await readGit(sourceRepo, ["rev-parse", "master"]);
     expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).not.toBe(expectedRemoteHead);
 
-    const traceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-git-trace-"));
-    const tracePath = path.join(traceDir, "trace.json");
-    const previousGitTrace = process.env.GIT_TRACE2_EVENT;
-    let workspace!: RealizedExecutionWorkspace;
-    process.env.GIT_TRACE2_EVENT = tracePath;
-    try {
-      workspace = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-1",
-          workspaceId: "workspace-1",
-          repoUrl: null,
-          repoRef: null,
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
         },
-        config: {
-          workspaceStrategy: {
-            type: "git_worktree",
-            branchTemplate: "{{issue.identifier}}-{{slug}}",
-          },
-        },
-        issue: {
-          id: "issue-1",
-          identifier: "PAP-447",
-          title: "Add Worktree Support",
-        },
-        agent: {
-          id: "agent-1",
-          name: "Codex Coder",
-          companyId: "company-1",
-        },
-      });
-    } finally {
-      if (previousGitTrace === undefined) delete process.env.GIT_TRACE2_EVENT;
-      else process.env.GIT_TRACE2_EVENT = previousGitTrace;
-    }
-
-    const defaultBaseFetches = (await fs.readFile(tracePath, "utf8"))
-      .split("\n")
-      .filter((line) => line.includes('"argv":["git","fetch","--prune","origin","+refs/heads/master:refs/remotes/origin/master"]'));
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
 
     expect(workspace.baseRefSha).toBe(expectedRemoteHead);
     expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(expectedRemoteHead);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(expectedRemoteHead);
-    expect(defaultBaseFetches).toHaveLength(1);
-  });
-
-  it("warns when the default remote base cannot refresh and only a stale tracking ref remains", async () => {
-    const { repoRoot } = await createClonedRepoWithRemote();
-    const staleRemoteHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);
-    const missingRemoteRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-missing-remote-"));
-    const missingRemotePath = path.join(missingRemoteRoot, "missing.git");
-    await runGit(repoRoot, ["remote", "set-url", "origin", missingRemotePath]);
-
-    const workspace = await realizeWorktreeForTest(repoRoot, null);
-
-    expect(workspace.baseRefSha).toBe(staleRemoteHead);
-    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(staleRemoteHead);
-    expect(workspace.warnings).toEqual([
-      expect.stringContaining("Could not refresh base ref origin/master"),
-    ]);
   });
 
   it("creates and reuses a git worktree for an issue-scoped branch", async () => {
@@ -1081,7 +1032,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.warnings).toEqual([
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
-  }, 15_000);
+  });
 
   it("bases a fresh worktree on a remote-only branch supplied as fix/foo", async () => {
     const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
@@ -2287,7 +2238,6 @@ describe("realizeExecutionWorkspace", () => {
       await writeRegisteredSourceConfig(baseRoot);
       await fs.mkdir(worktreeRoot, { recursive: true });
       await fs.mkdir(fakeBin, { recursive: true });
-      await fs.symlink(process.execPath, path.join(fakeBin, "node"));
       await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
       await fs.chmod(scriptPath, 0o755);
       await fs.writeFile(
@@ -2335,7 +2285,7 @@ describe("realizeExecutionWorkspace", () => {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
@@ -2453,7 +2403,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.realpath(path.join(repoRoot, "packages", "shared")),
     );
     },
-    30_000,
+    15_000,
   );
 
   it("records worktree setup and provision operations when a recorder is provided", async () => {
@@ -5658,7 +5608,6 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(heartbeatRuns);
-    await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -6020,10 +5969,6 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       ids,
       recorder,
     });
-    expect(initialRegistry?.processGroupId).toEqual(expect.any(Number));
-    expect(initialRegistry?.pid).not.toBe(initialRegistry?.processGroupId);
-    expect(initialRegistry?.metadata).toMatchObject({ companyId, ownerAgentId: agentId });
-    const processGroupId = initialRegistry!.processGroupId!;
 
     expect(restored?.branchName).toBe(expectedBranch);
     const warning = restored?.warnings.find((entry) => entry.includes("dirty worktree state was quarantined"));

@@ -448,6 +448,12 @@ export async function findLocalServiceRegistryRecordByRuntimeServiceId(input: {
     return null;
   }
   if (verification.kind !== "verified") {
+    // Upgrade v2026.831: Upstream-Codepfade schreiben Registry-Eintraege ohne
+    // vollstaendige Prozess-Identitaet. Solche Eintraege werden weiter adoptiert,
+    // solange der Leader lebt; Signale bleiben dem Fence-Pfad mit Nachweis vorbehalten.
+    if (verification.reason === "stored_identity_incomplete" && isPidAlive(record.pid)) {
+      return record;
+    }
     throw new Error(
       `Local service registry identity for ${record.serviceKey} is unproven: ${verification.reason}`,
     );
@@ -858,7 +864,7 @@ export async function terminateLocalService(
     return delivered;
   };
 
-  if (!opts?.signalWithinFence && await targetIsGone()) return;
+  if (!opts?.signalWithinFence && !opts?.verifyBeforeSignal && await targetIsGone()) return;
   if (!(await sendSignal(signal))) return;
 
   const deadline = Date.now() + (opts?.forceAfterMs ?? 2_000);

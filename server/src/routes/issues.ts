@@ -9386,8 +9386,6 @@ export function issueRoutes(
       await denyIssueWrite(req, res, existing, "issue_write_attribution_spoof_rejected");
       return;
     }
-    assertCompanyAccess(req, existing.companyId);
-    assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,

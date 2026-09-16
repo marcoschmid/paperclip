@@ -1466,13 +1466,18 @@ async function validateProjectSkillImportPath(
   workspaceRoot: string,
   inventoryMode: LocalSkillInventoryMode,
 ) {
-  const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+  const requestedWorkspaceRoot = path.resolve(workspaceRoot);
   const resolvedSkillDir = path.resolve(skillDir);
+  const canonicalWorkspaceRoot = await fs.realpath(requestedWorkspaceRoot);
+  // Kandidaten koennen bereits kanonisch aufgeloest sein (z. B. /var -> /private/var
+  // unter macOS oder symlinkte Workspace-Pfade). Dann gilt die kanonische Wurzel.
+  const resolvedWorkspaceRoot = pathIsContained(requestedWorkspaceRoot, resolvedSkillDir)
+    ? requestedWorkspaceRoot
+    : canonicalWorkspaceRoot;
   if (!pathIsContained(resolvedWorkspaceRoot, resolvedSkillDir)) {
-    throw unprocessable(`Project skill candidate ${resolvedSkillDir} is outside workspace root ${resolvedWorkspaceRoot}.`);
+    throw unprocessable(`Project skill candidate ${resolvedSkillDir} is outside workspace root ${requestedWorkspaceRoot}.`);
   }
 
-  const canonicalWorkspaceRoot = await fs.realpath(resolvedWorkspaceRoot);
   let currentPath = resolvedWorkspaceRoot;
   const relativeSkillDir = path.relative(resolvedWorkspaceRoot, resolvedSkillDir);
   for (const segment of relativeSkillDir.split(path.sep).filter(Boolean)) {

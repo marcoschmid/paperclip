@@ -1396,7 +1396,8 @@ export function agentRoutes(
     req: Request,
     existing: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
   ) {
-    assertCompanyAccess(req, existing.companyId);
+    // Fremde Mandanten erhalten 404 statt 403, damit keine Existenz verraten wird.
+    if (!hasCompanyAccess(req, existing.companyId)) throw notFound("Agent not found");
     if (req.actor.type === "agent") {
       const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
       if (!actorAgent || actorAgent.companyId !== existing.companyId) {
