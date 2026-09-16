@@ -124,8 +124,7 @@ describe("project workspace skill discovery", () => {
     expect(normalizeGitHubSkillDirectory("", "fallback-skill")).toBe("fallback-skill");
   });
 
-  // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath).
-  it.skip("finds bounded skill roots under supported workspace paths", async () => {
+  it("finds bounded skill roots under supported workspace paths", async () => {
     const workspace = await makeTempDir("paperclip-skill-workspace-");
     await writeSkillDir(workspace, "Workspace Root");
     await writeSkillDir(path.join(workspace, "skills", "find-skills"), "Find Skills");
@@ -141,22 +140,25 @@ describe("project workspace skill discovery", () => {
       workspaceCwd: workspace,
     });
 
+    // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath),
+    // z.B. weil macOS /var/folders (os.tmpdir()) ein Symlink auf /private/var ist.
+    const canonicalWorkspace = await fs.realpath(workspace);
     expect(discovered).toEqual([
-      { skillDir: path.resolve(workspace), directoryRoot: ".", relativePath: ".", inventoryMode: "project_root" },
+      { skillDir: canonicalWorkspace, directoryRoot: ".", relativePath: ".", inventoryMode: "project_root" },
       {
-        skillDir: path.resolve(workspace, ".agents", "skills", "release"),
+        skillDir: path.join(canonicalWorkspace, ".agents", "skills", "release"),
         directoryRoot: ".agents/skills",
         relativePath: ".agents/skills/release",
         inventoryMode: "full",
       },
       {
-        skillDir: path.resolve(workspace, "skills", ".system", "paperclip"),
+        skillDir: path.join(canonicalWorkspace, "skills", ".system", "paperclip"),
         directoryRoot: "skills/.system",
         relativePath: "skills/.system/paperclip",
         inventoryMode: "full",
       },
       {
-        skillDir: path.resolve(workspace, "skills", "find-skills"),
+        skillDir: path.join(canonicalWorkspace, "skills", "find-skills"),
         directoryRoot: "skills",
         relativePath: "skills/find-skills",
         inventoryMode: "full",
@@ -367,8 +369,7 @@ describe("project workspace skill discovery", () => {
 
     expect(imported.description).toBe("First line second line");
   });
-  // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath).
-  it.skip("includes explicitly selected skills from non-standard folders", async () => {
+  it("includes explicitly selected skills from non-standard folders", async () => {
     const workspace = await makeTempDir("paperclip-skill-workspace-");
     await writeSkillDir(path.join(workspace, "content", "specialists", "editorial"), "Editorial");
 
@@ -380,9 +381,11 @@ describe("project workspace skill discovery", () => {
       workspaceCwd: workspace,
     }, ["content/specialists/editorial"]);
 
+    // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath).
+    const canonicalWorkspace = await fs.realpath(workspace);
     expect(discovered).toEqual([
       {
-        skillDir: path.resolve(workspace, "content", "specialists", "editorial"),
+        skillDir: path.join(canonicalWorkspace, "content", "specialists", "editorial"),
         directoryRoot: "content/specialists",
         relativePath: "content/specialists/editorial",
         inventoryMode: "full",

@@ -2380,9 +2380,11 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(versions).toHaveLength(2);
   });
 
-  // Upgrade v2026.831: Fork-Haertung loest Skill-Pfade kanonisch auf (realpath) und begruendet
-  // Symlink-Ausschluesse anders; Import-Semantik bleibt erhalten.
-  it.skip("browses project folders and imports a selected non-standard skill", async () => {
+  // Upstream test, unrelated to the fork's realpath handling: on macOS's default
+  // case-insensitive APFS, fs.stat("content/SKILL.md") also matches the fixture's
+  // lowercase "content/skill.md", so isSkill resolves true instead of false.
+  // Passes on case-sensitive filesystems (Linux CI).
+  it.skipIf(process.platform === "darwin")("browses project folders and imports a selected non-standard skill", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
@@ -2607,9 +2609,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     ]);
   });
 
-  // Upgrade v2026.831: Fork-Haertung loest Skill-Pfade kanonisch auf (realpath) und begruendet
-  // Symlink-Ausschluesse anders; Import-Semantik bleibt erhalten.
-  it.skip("imports a conflicting project skill under a selected replacement slug", async () => {
+  it("imports a conflicting project skill under a selected replacement slug", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
@@ -2670,19 +2670,20 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       }],
     });
 
+    // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath),
+    // z.B. weil macOS /var/folders (os.tmpdir()) ein Symlink auf /private/var ist.
+    const canonicalSkillDir = await fs.realpath(skillDir);
     expect(result.conflicts).toEqual([]);
     expect(result.imported).toEqual([
       expect.objectContaining({
         slug: "shared-skill-project",
         key: expect.stringMatching(/^local\/[a-f0-9]+\/shared-skill-project$/),
-        sourceLocator: skillDir,
+        sourceLocator: canonicalSkillDir,
       }),
     ]);
   });
 
-  // Upgrade v2026.831: Fork-Haertung loest Skill-Pfade kanonisch auf (realpath) und begruendet
-  // Symlink-Ausschluesse anders; Import-Semantik bleibt erhalten.
-  it.skip("imports only selections rediscovered inside project workspaces", async () => {
+  it("imports only selections rediscovered inside project workspaces", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
@@ -2728,11 +2729,14 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       ],
     });
 
+    // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath),
+    // z.B. weil macOS /var/folders (os.tmpdir()) ein Symlink auf /private/var ist.
+    const canonicalSelectedSkillDir = await fs.realpath(selectedSkillDir);
     expect(result.imported).toHaveLength(1);
     expect(result.imported[0]).toMatchObject({
       name: "Selected Skill",
       sourceType: "local_path",
-      sourceLocator: selectedSkillDir,
+      sourceLocator: canonicalSelectedSkillDir,
       metadata: expect.objectContaining({ sourceKind: "project_scan", workspaceId, projectId }),
     });
     expect(result.candidates).toEqual([
@@ -2754,12 +2758,10 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const persisted = await db.select().from(companySkills).where(eq(companySkills.companyId, companyId));
     const projectScanSkills = persisted.filter((skill) => skill.metadata?.sourceKind === "project_scan");
     expect(projectScanSkills).toHaveLength(1);
-    expect(projectScanSkills[0]?.sourceLocator).toBe(selectedSkillDir);
+    expect(projectScanSkills[0]?.sourceLocator).toBe(canonicalSelectedSkillDir);
   });
 
-  // Upgrade v2026.831: Fork-Haertung loest Skill-Pfade kanonisch auf (realpath) und begruendet
-  // Symlink-Ausschluesse anders; Import-Semantik bleibt erhalten.
-  it.skip("treats out-of-scope workspace selections as unmatched without leaking workspace metadata", async () => {
+  it("treats out-of-scope workspace selections as unmatched without leaking workspace metadata", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
@@ -2825,6 +2827,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       ],
     });
 
+    // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath),
+    // z.B. weil macOS /var/folders (os.tmpdir()) ein Symlink auf /private/var ist.
+    const canonicalSelectedSkillDir = await fs.realpath(selectedSkillDir);
     expect(result.scannedProjects).toBe(1);
     expect(result.scannedWorkspaces).toBe(1);
     expect(result.discovered).toBe(1);
@@ -2832,7 +2837,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(result.imported[0]).toMatchObject({
       name: "Selected Skill",
       sourceType: "local_path",
-      sourceLocator: selectedSkillDir,
+      sourceLocator: canonicalSelectedSkillDir,
       metadata: expect.objectContaining({ sourceKind: "project_scan", workspaceId, projectId }),
     });
     expect(result.candidates).toEqual([
@@ -2855,9 +2860,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     ]));
   });
 
-  // Upgrade v2026.831: Fork-Haertung loest Skill-Pfade kanonisch auf (realpath) und begruendet
-  // Symlink-Ausschluesse anders; Import-Semantik bleibt erhalten.
-  it.skip("skips a selected project skill whose SKILL.md is a symlink outside the workspace", async () => {
+  it("skips a selected project skill whose SKILL.md is a symlink outside the workspace", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
@@ -2897,6 +2900,9 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       ],
     });
 
+    // Upgrade v2026.831: Fork-Haertung liefert kanonische Skill-Pfade (realpath),
+    // z.B. weil macOS /var/folders (os.tmpdir()) ein Symlink auf /private/var ist.
+    const canonicalLinkedSkillDir = await fs.realpath(linkedSkillDir);
     expect(result.imported).toEqual([]);
     expect(result.candidates).toEqual([
       expect.objectContaining({
@@ -2908,7 +2914,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(result.skipped).toEqual(expect.arrayContaining([
       expect.objectContaining({
         workspaceId,
-        path: linkedSkillDir,
+        path: canonicalLinkedSkillDir,
         reason: expect.stringContaining("symbolic link"),
       }),
       expect.objectContaining({
