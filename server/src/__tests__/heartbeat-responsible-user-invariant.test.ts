@@ -57,6 +57,19 @@ async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
   return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
 }
 
+async function waitForRunStatus(
+  db: ReturnType<typeof createDb>,
+  runId: string,
+  expectedStatus: string,
+) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    if (run?.status === expectedStatus) return run;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+}
+
 describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -64,7 +77,11 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-responsible-user-");
-    db = createDb(tempDb.connectionString);
+    db = createDb(tempDb.connectionString, {
+      max: 1,
+      idleInTransactionSessionTimeoutMs: 1_000,
+      applicationName: "paperclip-heartbeat-responsible-user-test",
+    });
     heartbeat = heartbeatService(db);
   }, 20_000);
 
@@ -94,6 +111,7 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   });
 
   afterAll(async () => {
+    await db?.$client.end();
     await tempDb?.cleanup();
   });
 
@@ -130,7 +148,7 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     return { companyId, ownerUserId, agentId };
   }
 
-  it("uses the issue responsible user for comment, mention, and dependency wakes", async () => {
+  it("uses the issue responsible user for comment, mention, and dependency wakes with a max-1 DB pool", async () => {
     const { companyId, agentId } = await seedCompany();
     const issueResponsibleUserId = `issue-owner-${randomUUID()}`;
     const commenterUserId = `commenter-${randomUUID()}`;
@@ -160,7 +178,193 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     }
   });
 
-  it("uses the triggering user for manual UI/API runs", async () => {
+  it("promotes a deferred issue wake without pool re-entry with a max-1 DB pool", async () => {
+    const { companyId, agentId } = await seedCompany();
+    const issueResponsibleUserId = `issue-owner-${randomUUID()}`;
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Deferred follow-up",
+      status: "todo",
+      assigneeAgentId: agentId,
+      responsibleUserId: issueResponsibleUserId,
+    });
+
+    let finishFirstRun: (() => void) | null = null;
+    mockAdapterExecute.mockImplementationOnce(() => new Promise((resolve) => {
+      finishFirstRun = () => resolve({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "First run completed.",
+        provider: "test",
+        model: "test-model",
+      });
+    }));
+
+    const firstRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, commentId: randomUUID() },
+      requestedByActorType: "user",
+      requestedByActorId: `commenter-${randomUUID()}`,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+    });
+    expect(firstRun).not.toBeNull();
+    expect((await waitForRunStatus(db, firstRun!.id, "running"))?.status).toBe("running");
+    for (let attempt = 0; attempt < 80 && !finishFirstRun; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(finishFirstRun).not.toBeNull();
+
+    const deferred = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, commentId: randomUUID() },
+      requestedByActorType: "user",
+      requestedByActorId: `commenter-${randomUUID()}`,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+    });
+    expect(deferred).toBeNull();
+
+    finishFirstRun!();
+    expect((await waitForRun(db, firstRun!.id))?.status).toBe("succeeded");
+
+    let promotedRun: typeof heartbeatRuns.$inferSelect | null = null;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+      promotedRun = runs.find((run) => run.id !== firstRun!.id) ?? null;
+      if (promotedRun) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    expect(promotedRun).not.toBeNull();
+    const completedPromotion = await waitForRun(db, promotedRun!.id);
+    expect(completedPromotion?.status).toBe("succeeded");
+    expect(completedPromotion?.responsibleUserId).toBe(issueResponsibleUserId);
+  });
+
+  it("reopens a completed issue while promoting a deferred human comment with a max-1 DB pool", async () => {
+    const { companyId, agentId } = await seedCompany();
+    const issueResponsibleUserId = `issue-owner-${randomUUID()}`;
+    const commenterUserId = `commenter-${randomUUID()}`;
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Completed issue with a human follow-up",
+      status: "todo",
+      assigneeAgentId: agentId,
+      responsibleUserId: issueResponsibleUserId,
+    });
+    const initialComment = await db
+      .insert(issueComments)
+      .values({
+        companyId,
+        issueId,
+        authorUserId: commenterUserId,
+        body: "Initial request",
+      })
+      .returning()
+      .then((rows) => rows[0]);
+
+    let finishFirstRun: (() => void) | null = null;
+    mockAdapterExecute.mockImplementationOnce(() => new Promise((resolve) => {
+      finishFirstRun = () => resolve({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "First run completed.",
+        provider: "test",
+        model: "test-model",
+      });
+    }));
+
+    const firstRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, commentId: initialComment.id },
+      requestedByActorType: "user",
+      requestedByActorId: commenterUserId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        commentId: initialComment.id,
+        wakeReason: "issue_commented",
+      },
+    });
+    expect(firstRun).not.toBeNull();
+    expect((await waitForRunStatus(db, firstRun!.id, "running"))?.status).toBe("running");
+    for (let attempt = 0; attempt < 80 && !finishFirstRun; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(finishFirstRun).not.toBeNull();
+
+    const followUpComment = await db
+      .insert(issueComments)
+      .values({
+        companyId,
+        issueId,
+        authorUserId: commenterUserId,
+        body: "Human follow-up after completion",
+      })
+      .returning()
+      .then((rows) => rows[0]);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+
+    const deferred = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, commentId: followUpComment.id },
+      requestedByActorType: "user",
+      requestedByActorId: commenterUserId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        commentId: followUpComment.id,
+        wakeReason: "issue_commented",
+      },
+    });
+    expect(deferred).toBeNull();
+
+    finishFirstRun!();
+    expect((await waitForRun(db, firstRun!.id))?.status).toBe("succeeded");
+
+    let promotedRun: typeof heartbeatRuns.$inferSelect | null = null;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+      promotedRun = runs.find((run) => run.id !== firstRun!.id) ?? null;
+      if (promotedRun) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    expect(promotedRun).not.toBeNull();
+    const completedPromotion = await waitForRun(db, promotedRun!.id);
+    expect(completedPromotion?.status).toBe("succeeded");
+    expect(completedPromotion?.responsibleUserId).toBe(issueResponsibleUserId);
+    expect(completedPromotion?.contextSnapshot).toMatchObject({ reopenedFrom: "done" });
+    const reopenedIssue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(["todo", "in_progress"]).toContain(reopenedIssue?.status);
+  });
+
+  it("uses the triggering user for non-issue manual UI/API runs with a max-1 DB pool", async () => {
     const { agentId } = await seedCompany();
     const triggeringUserId = `manual-${randomUUID()}`;
     const run = await heartbeat.wakeup(agentId, {
