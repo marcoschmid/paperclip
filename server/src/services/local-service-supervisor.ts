@@ -839,17 +839,26 @@ export async function terminateLocalService(
     };
 
     if (opts?.signalWithinFence) {
+      // Fence-Pfad (Fork): Identitaet ist bewiesen, ein fehlgeschlagenes Signal ist ein Fehler.
       await opts.signalWithinFence(nextSignal, send);
       if (!attempted) {
         throw new Error("Local service signal fence returned without sending its authorized signal");
       }
     } else {
       await opts?.verifyBeforeSignal?.();
-      send();
+      try {
+        send();
+      } catch (error) {
+        // Ohne Fence (Upstream-Aufrufer): ein bereits beendeter Prozess ist kein Fehler.
+        const code = ((error as Error & { cause?: NodeJS.ErrnoException }).cause)?.code;
+        if (code === "ESRCH") return false;
+        throw error;
+      }
     }
     return delivered;
   };
 
+  if (!opts?.signalWithinFence && await targetIsGone()) return;
   if (!(await sendSignal(signal))) return;
 
   const deadline = Date.now() + (opts?.forceAfterMs ?? 2_000);

@@ -2138,9 +2138,8 @@ export function authorizationService(db: Db) {
           explanation: "Allowed by the agent's explicit canAssignTasks permission manifest.",
         });
       }
-      // Erst das explizite Fork-Manifest, danach die Upstream-Regel fuer
-      // Standard-Trust; Low-Trust faellt weiter auf Grants und Policy zurueck.
-      if (trustResolution.kind === "standard") return decideVisibleIssueWrite();
+      // Fork-Richtlinie: Agenten weisen nur mit explizitem Manifest oder Grant zu.
+      // Die Upstream-Regel "sichtbares Issue genuegt" gilt hier bewusst nicht.
       const grantDecision = await decideWithTaskAssignmentGrants("agent", actorAgentId);
       if (grantDecision.allowed) return grantDecision;
       if (policyEffect.kind === "restricted") return denyRestrictedAssignmentPolicy(policyEffect);
@@ -2197,7 +2196,9 @@ export function authorizationService(db: Db) {
           });
         }
       }
-      if (visibleIssueWriteDecision) return visibleIssueWriteDecision;
+      // Fork-Richtlinie (HAP-569): Sichtbarkeit allein berechtigt einen Agenten
+      // nicht, fremde Issues zu kommentieren oder zu aendern. Die Upstream-
+      // Sichtbarkeitspruefung wirkt oben nur als zusaetzliche Sperre.
     }
     if (
       input.action === "agent_config:update" &&
