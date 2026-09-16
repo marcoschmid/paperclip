@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  createPostgresCliConnection,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -49,6 +54,53 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping embedded Postgres backup tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+describe("createPostgresCliConnection", () => {
+  it("moves the database password out of process arguments", () => {
+    const connectionString =
+      "postgresql://paperclip:pa%24%24word@[::1]:5433/paperclip?sslmode=require&application_name=backup-test";
+    const result = createPostgresCliConnection(connectionString, {
+      PATH: "/usr/bin:/bin",
+      DATABASE_URL: connectionString,
+      PGPASSWORD: "stale-password",
+      PGHOSTADDR: "203.0.113.10",
+      PGSERVICE: "stale-service",
+      PGSERVICEFILE: "/tmp/stale-service.conf",
+    });
+
+    expect(result.databaseArgument).toBe(
+      "postgresql://paperclip@[::1]:5433/paperclip?sslmode=require&application_name=backup-test",
+    );
+    expect(result.databaseArgument).not.toContain("pa%24%24word");
+    expect(result.environment.PGPASSWORD).toBe("pa$$word");
+    expect(result.environment.DATABASE_URL).toBeUndefined();
+    expect(result.environment.PGHOSTADDR).toBeUndefined();
+    expect(result.environment.PGSERVICE).toBeUndefined();
+    expect(result.environment.PGSERVICEFILE).toBeUndefined();
+    expect(result.environment.PATH).toBe("/usr/bin:/bin");
+  });
+
+  it("does not inherit an unrelated database password", () => {
+    const result = createPostgresCliConnection("postgresql://paperclip@localhost/paperclip", {
+      PGPASSWORD: "stale-password",
+    });
+
+    expect(result.environment.PGPASSWORD).toBeUndefined();
+  });
+
+  it("moves a query-string password out of process arguments", () => {
+    const result = createPostgresCliConnection(
+      "postgresql://paperclip@localhost/paperclip?password=query%24secret&sslmode=require",
+      {},
+    );
+
+    expect(result.databaseArgument).toBe(
+      "postgresql://paperclip@localhost/paperclip?sslmode=require",
+    );
+    expect(result.databaseArgument).not.toContain("query%24secret");
+    expect(result.environment.PGPASSWORD).toBe("query$secret");
+  });
+});
 
 describe("createBufferedTextFileWriter", () => {
   it("preserves line boundaries across buffered flushes", async () => {

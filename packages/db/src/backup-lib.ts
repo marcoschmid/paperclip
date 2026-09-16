@@ -320,16 +320,49 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+export function createPostgresCliConnection(
+  connectionString: string,
+  baseEnvironment: NodeJS.ProcessEnv = process.env,
+): { databaseArgument: string; environment: NodeJS.ProcessEnv } {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    throw new Error("PostgreSQL connection string must be a valid URL");
+  }
+  if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+    throw new Error("PostgreSQL connection string must use postgres:// or postgresql://");
+  }
+
+  const queryPassword = url.searchParams.get("password");
+  const password = queryPassword ?? decodeURIComponent(url.password);
+  url.password = "";
+  url.searchParams.delete("password");
+
+  const environment = { ...baseEnvironment };
+  delete environment.DATABASE_URL;
+  delete environment.PGPASSWORD;
+  delete environment.PGHOSTADDR;
+  delete environment.PGSERVICE;
+  delete environment.PGSERVICEFILE;
+  if (password.length > 0) {
+    environment.PGPASSWORD = password;
+  }
+
+  return { databaseArgument: url.toString(), environment };
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const connection = createPostgresCliConnection(opts.connectionString);
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connection.databaseArgument}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -339,7 +372,7 @@ async function runPgDumpBackup(opts: {
     {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
-        ...process.env,
+        ...connection.environment,
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
     },
@@ -357,10 +390,11 @@ async function runPgDumpBackup(opts: {
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
+  const connection = createPostgresCliConnection(opts.connectionString);
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${connection.databaseArgument}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -368,7 +402,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
     {
       stdio: ["pipe", "ignore", "pipe"],
       env: {
-        ...process.env,
+        ...connection.environment,
         PGCONNECT_TIMEOUT: String(connectTimeout),
       },
     },
