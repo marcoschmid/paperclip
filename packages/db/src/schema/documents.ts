@@ -1,5 +1,4 @@
 import { pgTable, uuid, text, integer, timestamp, index, jsonb } from "drizzle-orm/pg-core";
-import { sql } from "drizzle-orm";
 import type { SourceTrustMetadata } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -22,8 +21,6 @@ export const documents = pgTable(
     lockedByAgentId: uuid("locked_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
     lockedByUserId: text("locked_by_user_id"),
     sourceTrust: jsonb("source_trust").$type<SourceTrustMetadata | null>(),
-    tags: jsonb("tags").notNull().default(sql`'[]'::jsonb`),
-    metadata: jsonb("metadata").notNull().default(sql`'{}'::jsonb`),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

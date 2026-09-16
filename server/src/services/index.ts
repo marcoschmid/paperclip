@@ -7,8 +7,6 @@ export { agentService, deduplicateAgentName } from "./agents.js";
 export { agentInstructionsService, syncInstructionsBundleConfigFromFilePath } from "./agent-instructions.js";
 export { assetService } from "./assets.js";
 export { documentService, extractLegacyPlanBody } from "./documents.js";
-export { decisionService } from "./decisions.js";
-export { projectDocumentService } from "./project-documents.js";
 export { documentAnnotationService } from "./document-annotations.js";
 export {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,

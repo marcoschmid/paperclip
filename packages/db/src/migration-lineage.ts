@@ -1,10 +1,5 @@
 export const FORK_MIGRATION_LINEAGE = [
   {
-    legacyFile: "0136_phase6_memory_tables.sql",
-    canonicalFile: "9000_phase6_memory_tables.sql",
-    sha256: "c3f263f82587d20cbac45991c27e68b069eb0f2151e098274568158234843e3c",
-  },
-  {
     legacyFile: "0137_agent_portfolio_maintenance_gates.sql",
     canonicalFile: "9001_agent_portfolio_maintenance_gates.sql",
     sha256: "55abbde4d01b3c429fad5cfab45e2043b868230e74ea8fc18dc4c48c362c69f7",
@@ -106,6 +101,11 @@ export const FORK_MIGRATION_HISTORY_TOMBSTONES = [
     historicalFile: "0140_agent_retirement_claims.pre_pin.sql",
     sha256: "9103550d587fdf5d58a43016f6144480de33b18e6f9671500a49fa4e2f93ef97",
     createdAt: 1783965600000,
+  },
+  {
+    historicalFile: "0136_phase6_memory_tables.sql",
+    sha256: "c3f263f82587d20cbac45991c27e68b069eb0f2151e098274568158234843e3c",
+    createdAt: 1783034621000,
   },
 ] as const;
 
