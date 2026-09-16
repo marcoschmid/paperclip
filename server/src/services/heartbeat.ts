@@ -1,3 +1,4 @@
+import { agentMaintenanceLeaseService } from "./agent-maintenance-leases.js";
 import {
   verifyStoredLocalProcessIdentity,
 } from "./local-process-identity.js";
@@ -333,6 +334,7 @@ import {
   writePaperclipSkillSyncPreference,
   PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
   parsePaperclipLifecycleCanaryResult,
+  extractPaperclipLifecycleCanaryResultFromFinalSummary,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
@@ -7052,6 +7054,39 @@ function restoreDeterministicPaperclipSessionKey(input: {
   return input.sanitizedParams;
 }
 
+function createPersistedLifecycleCanaryResultProof(input: {
+  summary: unknown;
+  companyId: string;
+  agentId: string;
+  runId: string;
+  canaryIssueId: string;
+  receiptHash: string;
+  configFingerprint: string;
+}): PersistedLifecycleCanaryResultProof | null {
+  const parsed = extractPaperclipLifecycleCanaryResultFromFinalSummary(input.summary);
+  if (!parsed || typeof input.summary !== "string") return null;
+  const evidence = redactSensitiveText(parsed.evidence);
+  if (evidence !== parsed.evidence) return null;
+  const sanitized = parsePaperclipLifecycleCanaryResult([
+    PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
+    JSON.stringify({ outcome: "passed", evidence }),
+  ].join("\n"));
+  if (!sanitized) return null;
+  return {
+    schemaVersion: "1.0.0",
+    source: "adapter_final_summary",
+    outcome: "passed",
+    evidence: sanitized.evidence,
+    companyId: input.companyId,
+    agentId: input.agentId,
+    runId: input.runId,
+    canaryIssueId: input.canaryIssueId,
+    receiptHash: input.receiptHash,
+    configFingerprint: input.configFingerprint,
+    finalSummarySha256: `sha256:${createHash("sha256").update(input.summary, "utf8").digest("hex")}`,
+  };
+}
+
 function parsePersistedLifecycleCanaryResultProof(
   value: unknown,
   expected: {
@@ -8640,6 +8675,7 @@ export async function satisfyLifecycleFreshSessionAfterSuccessfulRun(
 
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const maintenanceLeases = agentMaintenanceLeaseService(db);
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -9220,8 +9256,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getIssueExecutionContext(companyId: string, issueId: string) {
-    return db
+  async function getIssueExecutionContext(
+    companyId: string,
+    issueId: string,
+    dbOrTx: Pick<Db, "select"> = db,
+  ) {
+    return dbOrTx
       .select({
         id: issues.id,
         identifier: issues.identifier,
@@ -9304,13 +9344,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: Awaited<ReturnType<typeof getIssueExecutionContext>> | null,
+    dbOrTx: Pick<Db, "select"> = db,
   ) {
     if (!issueContext || issueContext.originKind !== "routine_execution" || !issueContext.originId) {
       return { routineId: null, env: null, responsibleUserId: null };
     }
 
     const routineRun = issueContext.originRunId
-      ? await db
+      ? await dbOrTx
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
             responsibleUserId: routineRuns.responsibleUserId,
@@ -9327,7 +9368,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : null;
 
     if (routineRun?.routineRevisionId) {
-      const revision = await db
+      const revision = await dbOrTx
         .select({
           snapshot: routineRevisions.snapshot,
           responsibleUserId: routineRevisions.responsibleUserId,
@@ -9351,7 +9392,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const routine = await db
+    const routine = await dbOrTx
       .select({ env: routines.env, responsibleUserId: routines.responsibleUserId })
       .from(routines)
       .where(and(eq(routines.id, issueContext.originId), eq(routines.companyId, companyId)))
@@ -9363,8 +9404,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
-    const company = await db
+  async function resolveCompanyDefaultResponsibleUserId(
+    companyId: string,
+    dbOrTx: Pick<Db, "select"> = db,
+  ) {
+    const company = await dbOrTx
       .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -9372,7 +9416,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const explicitDefault = readNonEmptyString(company?.defaultResponsibleUserId);
     if (explicitDefault) return explicitDefault;
 
-    const owner = await db
+    const owner = await dbOrTx
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -9388,7 +9432,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
+    const firstUser = await dbOrTx
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -9404,9 +9448,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return firstUser?.userId ?? null;
   }
 
-  async function resolveParentIssueResponsibleUserId(companyId: string, parentId: string | null | undefined) {
+  async function resolveParentIssueResponsibleUserId(
+    companyId: string,
+    parentId: string | null | undefined,
+    dbOrTx: Pick<Db, "select"> = db,
+  ) {
     if (!parentId) return null;
-    const parent = await db
+    const parent = await dbOrTx
       .select({
         responsibleUserId: issues.responsibleUserId,
         createdByUserId: issues.createdByUserId,
@@ -9439,7 +9487,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     source?: WakeupOptions["source"] | null;
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
-  }) {
+  }, dbOrTx: Pick<Db, "select"> = db) {
     const contextResponsibleUserId = readNonEmptyString(input.contextSnapshot.responsibleUserId);
     const requestedUserId = input.requestedByActorType === "user"
       ? readNonEmptyString(input.requestedByActorId)
@@ -9449,11 +9497,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (input.routineEnvContext.responsibleUserId) return input.routineEnvContext.responsibleUserId;
     if (isManualUserRun(input) && requestedUserId) return requestedUserId;
     if (input.issueContext?.responsibleUserId) return input.issueContext.responsibleUserId;
-    const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(input.companyId, input.issueContext?.parentId);
+    const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(
+      input.companyId,
+      input.issueContext?.parentId,
+      dbOrTx,
+    );
     if (parentResponsibleUserId) return parentResponsibleUserId;
-    if (input.issueContext) return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    if (input.issueContext) return resolveCompanyDefaultResponsibleUserId(input.companyId, dbOrTx);
     if (requestedUserId) return requestedUserId;
-    return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    return resolveCompanyDefaultResponsibleUserId(input.companyId, dbOrTx);
   }
 
   async function resolveResponsibleUserIdForRun(input: {
@@ -9500,8 +9552,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
-  async function getRuntimeState(agentId: string) {
-    return db
+  async function getRuntimeState(
+    agentId: string,
+    dbOrTx: Pick<Db, "select"> = db,
+  ) {
+    return dbOrTx
       .select()
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
@@ -9527,8 +9582,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     adapterType: string,
     taskKey: string,
+    dbOrTx: Pick<Db, "select"> = db,
   ) {
-    return db
+    return dbOrTx
       .select()
       .from(agentTaskSessions)
       .where(
@@ -10465,6 +10521,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
+    dbOrTx: Pick<Db, "select"> = db,
   ) {
     if (taskKey) {
       const codec = getAdapterSessionCodec(agent.adapterType);
@@ -10473,6 +10530,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent.id,
         agent.adapterType,
         taskKey,
+        dbOrTx,
       );
       const parsedParams = normalizeSessionParams(
         codec.deserialize(existingTaskSession?.sessionParamsJson ?? null),
@@ -10484,7 +10542,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
-    const runtimeForRun = await getRuntimeState(agent.id);
+    const runtimeForRun = await getRuntimeState(agent.id, dbOrTx);
     return runtimeForRun?.sessionId ?? null;
   }
 
@@ -12824,6 +12882,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(run.agentId, "interrupted", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
       });
       interruptedRunIds.push(interrupted.id);
     }
@@ -14093,6 +14152,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     await finalizeAgentStatus(run.agentId, "cancelled", null, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
     }).catch(() => undefined);
   }
 
@@ -14592,9 +14652,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
+    if (await maintenanceLeases.isAgentLeased(run.agentId)) return null;
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
+      return null;
+    }
+    const lifecycleCanaryAuthorization = authorizePendingLifecycleCanaryRun({ agent, run });
+    const lifecycleCanaryBoundRun = hasLifecycleCanaryRunBinding({ agent, run });
+    if (!(await portfolioGateAllowsRun(agent, run))) return null;
+    if (!lifecycleCanaryAuthorization.ok) {
+      await finalizePendingLifecycleCanaryFailure(
+        db,
+        run.id,
+        "claim_authorization_invalid",
+        `Claim authorization failed: ${lifecycleCanaryAuthorization.reason}`,
+      );
+      await cancelRunInternal(
+        run.id,
+        "Cancelled because the pending lifecycle canary authorization is invalid",
+        { errorCode: "agent_lifecycle_canary_authorization_invalid" },
+      );
       return null;
     }
     const invokability = companyAgents
@@ -14686,17 +14764,74 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
       routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const lifecycleCanaryClaim = lifecycleCanaryAuthorization.pending || lifecycleCanaryBoundRun;
+    const claimed = lifecycleCanaryClaim
+      ? await revalidatePendingLifecycleCanaryBoundary(db, {
+        companyId: run.companyId,
+        agentId: run.agentId,
+        runId: run.id,
+        phase: "claim",
+        now: claimedAt,
+        claim: { responsibleUserId, claimedAt },
+      }).then((result) =>
+        result.ok === true && result.pending === true && result.reason === "authorized"
+          ? result.run
+          : null,
+      )
+      : await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        // The maintenance triggers on heartbeat_runs/agent_wakeup_requests
+        // lock the owning agent. Pre-lock it before either dependent row so
+        // concurrent cancellation keeps the canonical Agent -> Run order.
+        const currentAgent = await txDb
+          .select()
+          .from(agents)
+          .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!currentAgent || await hasPortfolioMaintenanceGate(run.agentId, run.companyId, txDb)) {
+          return null;
+        }
+        const currentInvokability = await evaluateAgentInvokabilityFromDb(txDb, currentAgent);
+        if (!currentInvokability.invokable) return null;
+
+        const currentRun = await txDb
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.agentId, run.agentId),
+          ))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!currentRun || currentRun.status !== "queued") return null;
+
+        const updated = await txDb
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            responsibleUserId,
+            startedAt: currentRun.startedAt ?? claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(and(eq(heartbeatRuns.id, currentRun.id), eq(heartbeatRuns.status, "queued")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return null;
+
+        if (updated.wakeupRequestId) {
+          await txDb
+            .update(agentWakeupRequests)
+            .set({ status: "claimed", claimedAt, updatedAt: claimedAt })
+            .where(and(
+              eq(agentWakeupRequests.id, updated.wakeupRequestId),
+              eq(agentWakeupRequests.companyId, updated.companyId),
+              eq(agentWakeupRequests.agentId, updated.agentId),
+            ));
+        }
+        return updated;
+      });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -14716,7 +14851,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     publishRunLifecyclePluginEvent(claimed);
 
-    await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
+    if (lifecycleCanaryClaim) {
+      await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
+    }
 
     // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
     // not at queue time. Guard is idempotent — safe if called more than once.
@@ -15051,8 +15188,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
     failureReason?: string | null,
-    options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean },
+    options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean; runId?: string },
   ) {
+    if (isHistoricalAgentTombstoneId(agentId)) return;
+    if (outcome !== "succeeded" && options?.runId) {
+      await finalizePendingLifecycleCanaryFailure(
+        db,
+        options.runId,
+        outcome,
+        failureReason ?? `Lifecycle canary ended with ${outcome}.`,
+      );
+    }
     const existing = await getAgent(agentId);
     if (!existing) return;
 
@@ -15077,11 +15223,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        errorReason: nextStatus === "error"
+          ? truncateAgentErrorReason(failureReason ? redactSensitiveText(failureReason) : failureReason)
+          : null,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(eq(agents.id, agentId), notInArray(agents.status, ["paused", "terminated"])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -15780,6 +15928,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
       });
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
@@ -16117,6 +16266,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const failedRun = await getRun(runId);
       if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
+      return;
+    }
+
+    const lifecycleCanaryAuthorization = authorizePendingLifecycleCanaryRun({ agent, run });
+    const lifecycleCanaryBoundRun = hasLifecycleCanaryRunBinding({ agent, run });
+    if (!(await portfolioGateAllowsRun(agent, run))) return;
+    if (!lifecycleCanaryAuthorization.ok) {
+      await finalizePendingLifecycleCanaryFailure(
+        db,
+        run.id,
+        "execute_authorization_invalid",
+        `Runtime authorization failed: ${lifecycleCanaryAuthorization.reason}`,
+      );
+      await cancelRunInternal(
+        run.id,
+        "Cancelled because the pending lifecycle canary runtime binding is invalid",
+        { errorCode: "agent_lifecycle_canary_authorization_invalid" },
+      );
       return;
     }
 
@@ -17601,6 +17768,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         taskSessionReused: taskSessionForRun != null,
         storedFingerprintPresent: Boolean(sessionConfigFreshness.storedFingerprint),
         nextFingerprint: sessionConfigFreshness.nextFingerprint,
+        agentConfigurationFingerprint: createAgentConfigurationFingerprint({
+          adapterType: agent.adapterType,
+          adapterConfig: parseObject(agent.adapterConfig),
+          runtimeConfig: parseObject(agent.runtimeConfig),
+        }),
       },
       workspace: {
         fingerprintVersion: latestWorkspaceConfigMetadata.version,
@@ -18147,8 +18319,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
+      if (lifecycleCanaryAuthorization.pending || lifecycleCanaryBoundRun) {
+        const boundary = await revalidatePendingLifecycleCanaryBoundary(db, {
+          companyId: run.companyId,
+          agentId: run.agentId,
+          runId: run.id,
+          phase: "execute",
+        });
+        if (
+          boundary.ok !== true
+          || boundary.pending !== true
+          || boundary.reason !== "authorized"
+        ) return;
+      }
+
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
+        // Fork: unmittelbar vor dem Adapter erneut pruefen, ob ein Portfolio-
+        // Maintenance-Gate oder ein ungueltiger Canary-Zustand den Run sperrt.
+        const [dispatchAgent, dispatchRun] = await Promise.all([
+          getAgent(run.agentId),
+          getRun(run.id, { unsafeFullResultJson: true }),
+        ]);
+        if (
+          !dispatchAgent
+          || !dispatchRun
+          || dispatchRun.status !== "running"
+          || !(await portfolioGateAllowsRun(dispatchAgent, dispatchRun))
+        ) return;
         const onSpawn = async (meta: {
           pid: number;
           processGroupId: number | null;
@@ -18479,12 +18677,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
+      const pendingCanaryReceipt =
+        lifecycleCanaryAuthorization.ok && lifecycleCanaryAuthorization.pending
+          ? lifecycleCanaryAuthorization.receipt
+          : null;
+      const lifecycleCanaryResultProof =
+        outcome === "succeeded" && pendingCanaryReceipt
+          ? createPersistedLifecycleCanaryResultProof({
+              summary: adapterResult.summary,
+              companyId: run.companyId,
+              agentId: run.agentId,
+              runId: run.id,
+              canaryIssueId: pendingCanaryReceipt.canaryIssueId,
+              receiptHash: pendingCanaryReceipt.receiptHash,
+              configFingerprint: pendingCanaryReceipt.configFingerprint,
+            })
+          : null;
+      const adapterResultJsonForStorage: Record<string, unknown> = {
+        ...parseObject(adapterResult.resultJson),
+      };
+      // Dieser Namensraum gehoert dem Server. Ein Adapter darf keinen Nachweis
+      // fuer ein Canary-Endergebnis vortaeuschen, auch nicht im Fehlerpfad.
+      delete adapterResultJsonForStorage[LIFECYCLE_CANARY_RESULT_PROOF_KEY];
+      if (pendingCanaryReceipt) {
+        adapterResultJsonForStorage[LIFECYCLE_CANARY_RESULT_PROOF_KEY] = lifecycleCanaryResultProof;
+      }
+
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
               resultJson: {
-                ...parseObject(adapterResult.resultJson),
+                ...adapterResultJsonForStorage,
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
@@ -18552,10 +18776,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
 
+      if (outcome === "succeeded") {
+        try {
+          await satisfyLifecycleFreshSessionAfterSuccessfulRun(db, {
+            id: run.id,
+            companyId: run.companyId,
+            agentId: run.agentId,
+            status: "succeeded",
+            freshSession: runtimeForAdapter.sessionId == null && runtimeForAdapter.sessionDisplayId == null,
+            agentConfigurationFingerprint: configFreshnessResultMetadata.session.agentConfigurationFingerprint,
+          });
+        } catch (err) {
+          logger.warn(
+            { err, runId: run.id, agentId: run.agentId },
+            "failed to reconcile lifecycle fresh-session receipt after successful run",
+          );
+        }
+      }
+
       await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
         finishedAt: new Date(),
         error: runErrorMessage,
       });
+      if (outcome !== "succeeded") {
+        await finalizePendingLifecycleCanaryFailure(
+          db,
+          run.id,
+          outcome,
+          runErrorMessage ?? `Lifecycle canary ended with ${outcome}.`,
+        );
+      }
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
@@ -18711,6 +18961,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ((finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota") ||
               isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
         },
       );
     } catch (err) {
@@ -18788,6 +19039,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: new Date(),
         error: message,
       });
+      await finalizePendingLifecycleCanaryFailure(db, run.id, "failed", message);
 
       if (failedRun) {
         await appendRunEvent(failedRun, seq++, {
@@ -18848,6 +19100,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(agent.id, "failed", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
         keepIdleOnFailure: isWorkspaceSyncConflictFailure(message),
       });
     }
@@ -18922,6 +19175,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               finishedAt: new Date(),
               error: message,
             }).catch(() => undefined);
+            await finalizePendingLifecycleCanaryFailure(db, run.id, "failed", message).catch((canaryError) => {
+              logger.error(
+                { err: canaryError, runId },
+                "failed to quarantine lifecycle canary after heartbeat setup failure",
+              );
+            });
           }
           const failedRun = await getRun(runId).catch(() => null);
           if (setupFailureWrite.updated && failedRun) {
@@ -18980,6 +19239,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (setupFailureWrite.updated) {
             await finalizeAgentStatus(run.agentId, "failed", message, {
               wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
             }).catch(() => undefined);
           }
           }
@@ -19065,7 +19325,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; suppressDeferredPromotion?: boolean } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
@@ -19082,6 +19342,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const txIssuesSvc = issueService(txDb);
+      const txTreeControlSvc = issueTreeControlService(txDb);
       // Lock the context issue (if any) AND every issue that still references this run.
       //
       // A single run can hold execution locks on multiple issues: the caller's context
@@ -19180,6 +19443,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+      if (options.suppressDeferredPromotion) return null;
 
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.
@@ -19261,7 +19525,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const deferredPayload = parseObject(deferred.payload);
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
-        const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
+        const activePauseHold = await txTreeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
         const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
           companyId: issue.companyId,
           issueId: issue.id,
@@ -19333,7 +19597,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         if (shouldReopenDeferredCommentWake) {
           const reopenedFromStatus = issue.status;
-          const reopenedIssue = await issuesSvc.update(
+          const reopenedIssue = await txIssuesSvc.update(
             issue.id,
             {
               status: "todo",
@@ -19392,7 +19656,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const sessionBefore =
           readNonEmptyString(promotedContextSnapshot.resumeSessionDisplayId) ??
-          await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey);
+          await resolveSessionBeforeForWakeup(deferredAgent, promotedTaskKey, tx);
         const promotedContinuationAttempt = readContinuationAttempt(
           promotedContextSnapshot.livenessContinuationAttempt,
         );
@@ -19400,13 +19664,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           companyId: deferredAgent.companyId,
           contextSnapshot: promotedContextSnapshot,
           issueContext: issue,
-          routineEnvContext: await getRoutineEnvForExecutionIssue(deferredAgent.companyId, issue),
+          routineEnvContext: await getRoutineEnvForExecutionIssue(deferredAgent.companyId, issue, tx),
           requestedByActorType: deferred.requestedByActorType as "user" | "agent" | "system" | null,
           requestedByActorId: deferred.requestedByActorId,
           source: promotedSource,
           triggerDetail: promotedTriggerDetail,
           existingRunResponsibleUserId: run.responsibleUserId,
-        });
+        }, tx);
         if (!promotedResponsibleUserId) {
           throw new HttpError(422, "Unable to resolve responsible user for promoted heartbeat run", {
             code: "responsible_user_unresolved",
@@ -19520,7 +19784,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
           issueHasPersistedMonitor ||
-          await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
+          await isAutomaticRecoverySuppressedByPauseHold(txDb, issue.companyId, issue.id, txTreeControlSvc)
         ) {
           return { kind: "released" as const };
         }
@@ -19648,7 +19912,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "released" as const };
       }
 
-      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+      if (await isAutomaticRecoverySuppressedByPauseHold(txDb, issue.companyId, issue.id, txTreeControlSvc)) {
         return { kind: "released" as const };
       }
 
@@ -19706,13 +19970,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: issue.companyId,
         contextSnapshot: recoveryContextSnapshot,
         issueContext: issue,
-        routineEnvContext: await getRoutineEnvForExecutionIssue(issue.companyId, issue),
+        routineEnvContext: await getRoutineEnvForExecutionIssue(issue.companyId, issue, tx),
         requestedByActorType: "system",
         requestedByActorId: null,
         source: "automation",
         triggerDetail: "system",
         existingRunResponsibleUserId: run.responsibleUserId,
-      });
+      }, tx);
       if (!responsibleUserId) {
         throw new HttpError(422, "Unable to resolve responsible user for recovery heartbeat run", {
           code: "responsible_user_unresolved",
@@ -21276,12 +21540,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
     });
     await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
   }
 
-  async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause", errorCode = "cancelled") {
+  async function cancelActiveForAgentInternal(
+    agentId: string,
+    reason = "Cancelled due to agent pause",
+    errorCode = "cancelled",
+    options: { suppressDeferredPromotion?: boolean } = {},
+  ) {
     const agent = await getAgent(agentId);
     const runs = await db
       .select()
@@ -21321,7 +21591,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
+      await releaseIssueExecutionAndPromote(run, {
+        suppressDeferredPromotion: options.suppressDeferredPromotion,
+      });
     }
 
     return runs.length;
@@ -21429,11 +21701,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { terminatedRunIds: terminatedRunIds.sort() };
   }
 
-  async function cancelInvocationsForAgentsInternal(agentIds: string[], reason: string) {
+  async function cancelInvocationsForAgentsInternal(
+    agentIds: string[],
+    reason: string,
+    options: { errorCode?: string; suppressDeferredPromotion?: boolean } = {},
+  ) {
     const uniqueAgentIds = [...new Set(agentIds)].filter((agentId) => agentId.length > 0);
     let runsCancelled = 0;
     for (const agentId of uniqueAgentIds) {
-      runsCancelled += await cancelActiveForAgentInternal(agentId, reason);
+      runsCancelled += await cancelActiveForAgentInternal(agentId, reason, options.errorCode ?? "cancelled", {
+        suppressDeferredPromotion: options.suppressDeferredPromotion,
+      });
     }
     const wakeupsCancelled = await cancelPendingWakeupsForAgentsInternal(uniqueAgentIds, reason);
     return {
@@ -21870,8 +22148,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      */
     cancelActiveForAgent: (agentId: string, reason?: string) => cancelActiveForAgentInternal(agentId, reason, "agent_paused"),
 
-    cancelInvocationsForAgents: (agentIds: string[], reason: string) =>
-      cancelInvocationsForAgentsInternal(agentIds, reason),
+    cancelInvocationsForAgents: (
+      agentIds: string[],
+      reason: string,
+      options?: { errorCode?: string; suppressDeferredPromotion?: boolean },
+    ) => cancelInvocationsForAgentsInternal(agentIds, reason, options),
     terminateTerminalOrphanProcesses: (runIds: string[]) =>
       terminateTerminalOrphanProcessesInternal(runIds),
 

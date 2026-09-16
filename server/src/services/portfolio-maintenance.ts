@@ -84,6 +84,8 @@ const LIFECYCLE_CANARY_CONTEXT_KEYS = new Set([
   "paperclipRuntimePrimaryUrl",
   "paperclipRuntimeServiceIntents",
   "paperclipRuntimeServices",
+  // Seit v2026.831: serverseitig gesetztes Scratch-Verzeichnis des Runs.
+  "paperclipScratch",
   "paperclipSecrets",
   "paperclipSessionHandoffMarkdown",
   "paperclipSessionRotationReason",
@@ -1382,6 +1384,10 @@ export function portfolioMaintenanceService(db: Db, options: PortfolioMaintenanc
               const cancellation = await heartbeatService(txDb).cancelInvocationsForAgents(
                 input.agentIds,
                 "Cancelled by portfolio maintenance",
+                {
+                  errorCode: "portfolio_maintenance_quiesced",
+                  suppressDeferredPromotion: true,
+                },
               );
               if (cancellation.runsCancelled !== activeRunIds.length) {
                 throw conflict("Portfolio maintenance run coverage changed during cleanup", {
