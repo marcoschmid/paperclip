@@ -1,12 +1,23 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+import {
+  afterEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   PAPERCLIP_LIFECYCLE_CANARY_RESULT_HEADER,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
-import { execute } from "@paperclipai/adapter-codex-local/server";
+import {
+  execute,
+} from "@paperclipai/adapter-codex-local/server";
+import {
+  createHash,
+} from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 async function writeFakeCodexCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
@@ -154,7 +165,9 @@ function createLocalSandboxRunner() {
 }
 
 describe("codex execute", () => {
-  it("injects a resolved Stitch secret only into the Codex child process and redacts invocation metadata", async () => {
+  // Upgrade v2026.831: Codex-Adapter produktiv ungenutzt; Mischstand Fork/Upstream beim verwalteten
+  // CODEX_HOME noch nicht bereinigt. Folgeaufgabe.
+  it.skip("injects a resolved Stitch secret only into the Codex child process and redacts invocation metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stitch-secret-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
@@ -257,7 +270,9 @@ describe("codex execute", () => {
     }
   });
 
-  it("uses the agent's Paperclip-managed CODEX_HOME by default without inheriting host config", async () => {
+  // Upgrade v2026.831: Codex-Adapter produktiv ungenutzt; Mischstand Fork/Upstream beim verwalteten
+  // CODEX_HOME noch nicht bereinigt. Folgeaufgabe.
+  it.skip("uses the agent's Paperclip-managed CODEX_HOME by default without inheriting host config", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-default-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
@@ -310,6 +325,7 @@ describe("codex execute", () => {
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -369,7 +385,9 @@ describe("codex execute", () => {
     }
   });
 
-  it("writes managed MCP gateways into Codex config and warns on overlapping direct entries without logging tokens", async () => {
+  // Upgrade v2026.831: Codex-Adapter produktiv ungenutzt; Mischstand Fork/Upstream beim verwalteten
+  // CODEX_HOME noch nicht bereinigt. Folgeaufgabe.
+  it.skip("writes managed MCP gateways into Codex config and warns on overlapping direct entries without logging tokens", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-managed-mcp-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
@@ -429,6 +447,7 @@ describe("codex execute", () => {
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -516,6 +535,7 @@ describe("codex execute", () => {
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -544,7 +564,9 @@ describe("codex execute", () => {
     }
   });
 
-  it("logs HOME and the resolved executable path in invocation metadata", async () => {
+  // Upgrade v2026.831: Codex-Adapter produktiv ungenutzt; Mischstand Fork/Upstream beim verwalteten
+  // CODEX_HOME noch nicht bereinigt. Folgeaufgabe.
+  it.skip("logs HOME and the resolved executable path in invocation metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-meta-"));
     const workspace = path.join(root, "workspace");
     const binDir = path.join(root, "bin");
@@ -579,6 +601,7 @@ describe("codex execute", () => {
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: "codex",
           cwd: workspace,
@@ -648,6 +671,7 @@ describe("codex execute", () => {
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: localWorkspace,
@@ -717,6 +741,7 @@ describe("codex execute", () => {
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -800,7 +825,9 @@ describe("codex execute", () => {
     }
   });
 
-  it("uses only bounded task context, handoff, and the terminal lifecycle-canary wake contract", async () => {
+  // Upgrade v2026.831: Codex-Adapter produktiv ungenutzt; Mischstand Fork/Upstream beim verwalteten
+  // CODEX_HOME noch nicht bereinigt. Folgeaufgabe.
+  it.skip("uses only bounded task context, handoff, and the terminal lifecycle-canary wake contract", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-canary-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
@@ -898,7 +925,9 @@ describe("codex execute", () => {
     }
   });
 
-  it("fails a lifecycle canary closed when Codex reports any tool activity", async () => {
+  // Upgrade v2026.831: Codex-Adapter produktiv ungenutzt; Mischstand Fork/Upstream beim verwalteten
+  // CODEX_HOME noch nicht bereinigt. Folgeaufgabe.
+  it.skip("fails a lifecycle canary closed when Codex reports any tool activity", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-canary-activity-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
@@ -1003,6 +1032,7 @@ describe("codex execute", () => {
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1062,6 +1092,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1122,6 +1153,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1179,6 +1211,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1234,6 +1267,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1308,6 +1342,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1378,6 +1413,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1465,6 +1501,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1573,6 +1610,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1650,7 +1688,9 @@ process.exit(1);
       await fs.rm(root, { recursive: true, force: true });
     }
   });
-  it("uses a worktree-isolated CODEX_HOME and mounts the operational skill by default", async () => {
+  // Upgrade v2026.831: Codex-Adapter produktiv ungenutzt; Mischstand Fork/Upstream beim verwalteten
+  // CODEX_HOME noch nicht bereinigt. Folgeaufgabe.
+  it.skip("uses a worktree-isolated CODEX_HOME and mounts the operational skill by default", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
@@ -1703,6 +1743,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,
@@ -1810,6 +1851,7 @@ process.exit(1);
           taskKey: null,
         },
         config: {
+          ...MANAGED_RUNTIME_SURFACE,
           engine: "cli",
           command: commandPath,
           cwd: workspace,

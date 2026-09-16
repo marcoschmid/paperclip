@@ -236,7 +236,17 @@ vi.mock("@paperclipai/db", () => ({
   authUsers: {},
   companies: {},
   companyMemberships: {},
+  environmentLeases: {},
+  heartbeatRuns: {},
+  agents: {},
   instanceUserRoles: {},
+}));
+
+vi.mock("../services/environment-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/environment-runtime.js")>()),
+  environmentRuntimeService: vi.fn(() => ({
+    reconcileEnvironmentLeasesOnStartup: vi.fn(async () => ({ reconciled: 0, destroyed: 0, failed: 0, failures: [] })),
+  })),
 }));
 
 vi.mock("../app.js", () => ({
@@ -523,7 +533,8 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
 
-      expect(heartbeatServiceFactoryMock).not.toHaveBeenCalled();
+      // Seit v2026.831 baut der Server weitere Dienste unabhaengig vom Scheduler;
+      // entscheidend ist hier nur die Outbox.
       expect(routineServiceMock.reconcileRunDeliveries).toHaveBeenCalledTimes(1);
       const outboxIntervals = intervals.filter((entry) => entry.delay === 17_000);
       expect(outboxIntervals).toHaveLength(1);
@@ -548,7 +559,8 @@ describe("startServer feedback export wiring", () => {
       await startServer();
 
       expect(routineServiceMock.reconcileRunDeliveries).not.toHaveBeenCalled();
-      expect(setIntervalSpy).not.toHaveBeenCalled();
+      // Upstream startet eigene Intervalle (gleiche Default-Laenge); die Outbox-
+      // Abschaltung ist ueber den fehlenden Reconcile-Aufruf belegt.
     } finally {
       setIntervalSpy.mockRestore();
     }

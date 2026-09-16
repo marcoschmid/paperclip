@@ -801,7 +801,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     });
   });
 
-  it("preserves direct-parent reporting while default-opening visible standard-trust writes", async () => {
+  // Upgrade v2026.831: Fork-Richtlinie HAP-569, kein Default-open-Schreibrecht fuer sichtbare Peer-Issues.
+  it.skip("preserves direct-parent reporting while default-opening visible standard-trust writes", async () => {
     const fixture = await seedLowTrustFixture(db);
     const standardApp = createApp(db, standardReportActor(fixture));
     const lowTrustApp = createApp(db, agentActor(fixture));

@@ -99,6 +99,9 @@ const mockSecretService = vi.hoisted(() => ({
 }));
 
 vi.mock("../services/index.js", () => ({
+  builtInAgentService: () => ({
+    ensureCompanyDefaultAgentGrants: vi.fn(async () => undefined),
+  }),
   agentService: () => mockAgentService,
   agentRetirementService: () => mockAgentRetirementService,
   agentInstructionsService: () => mockAgentInstructionsService,

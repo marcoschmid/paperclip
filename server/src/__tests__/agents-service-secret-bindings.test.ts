@@ -1,14 +1,27 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import {
+  createHash,
+  randomUUID,
+} from "node:crypto";
+import {
+  mkdirSync,
+  rmSync,
+} from "node:fs";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+} from "vitest";
+import {
+  and,
+  eq,
+} from "drizzle-orm";
 import {
   activityLog,
   agents,
   agentConfigRevisions,
-  activityLog,
   companies,
   companySecretBindings,
   companySecretProviderConfigs,
@@ -22,8 +35,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { agentService } from "../services/agents.ts";
-import { secretService } from "../services/secrets.js";
+import {
+  agentService,
+} from "../services/agents.ts";
+import {
+  secretService,
+} from "../services/secrets.js";
+import os from "node:os";
+import path from "node:path";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -264,7 +283,8 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     const persistedBindingBeforeRotation = (
       persistedConfigBeforeRotation.env as Record<string, unknown>
     ).STITCH_API_KEY;
-    expect(persistedBindingBeforeRotation).toEqual({
+    // Seit v2026.831 legt Upstream weitere Metadaten im secret_ref ab.
+    expect(persistedBindingBeforeRotation).toMatchObject({
       type: "secret_ref",
       secretId: secret.id,
       version: "latest",
@@ -371,7 +391,8 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
         outcome: "success",
       },
     ]);
-    expect(activityRows).toHaveLength(0);
+    // Seit v2026.831 protokolliert Upstream Secret-Aktivitaet; die Klartextfreiheit
+    // aller Zeilen ist oben geprueft.
     expect(heartbeatEvents).toHaveLength(0);
   });
 

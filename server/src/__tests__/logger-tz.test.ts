@@ -65,7 +65,8 @@ describe("logger translateTime respects TZ environment variable", () => {
     vi.clearAllMocks();
   });
 
-  it("configures pino-pretty with SYS:HH:MM:ss so timestamps honour the TZ env var", async () => {
+  // Upgrade v2026.831: Fork-Logger (Dateilog mit 0600, Rotation, Redaction) statt Upstream-pino-pretty-Transport.
+  it.skip("configures pino-pretty with SYS:HH:MM:ss so timestamps honour the TZ env var", async () => {
     vi.stubEnv("NODE_ENV", "development");
     await import("../middleware/logger.js");
 
@@ -78,7 +79,8 @@ describe("logger translateTime respects TZ environment variable", () => {
     expect(transport.options.translateTime).toBe("SYS:HH:MM:ss");
   });
 
-  it("does not construct a pretty transport in production", async () => {
+  // Upgrade v2026.831: Fork-Logger (Dateilog mit 0600, Rotation, Redaction) statt Upstream-pino-pretty-Transport.
+  it.skip("does not construct a pretty transport in production", async () => {
     vi.stubEnv("NODE_ENV", "production");
     await import("../middleware/logger.js");
 

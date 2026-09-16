@@ -2326,7 +2326,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(actionRow?.status).toBe("active");
   });
 
-  it("missing-disposition escalation drives a dispatchable recovery issue and first-class blocker", async () => {
+  // Upgrade v2026.831: Fork-Recovery-Pfad ueber eigenes Recovery-Issue durch Upstream-Disposition-Repair ersetzt.
+  it.skip("missing-disposition escalation drives a dispatchable recovery issue and first-class blocker", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });

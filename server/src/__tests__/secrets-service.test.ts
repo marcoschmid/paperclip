@@ -1,9 +1,23 @@
-import { randomUUID } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import {
+  randomUUID,
+} from "node:crypto";
+import {
+  mkdirSync,
+  rmSync,
+} from "node:fs";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import {
+  and,
+  eq,
+} from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -19,12 +33,27 @@ import {
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
-import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
-import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
-import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
-import { SecretProviderClientError } from "../secrets/types.js";
-import { secretService } from "../services/secrets.js";
+import {
+  LOW_TRUST_REVIEW_PRESET,
+} from "@paperclipai/shared";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import {
+  awsSecretsManagerProvider,
+} from "../secrets/aws-secrets-manager-provider.js";
+import {
+  localEncryptedProvider,
+} from "../secrets/local-encrypted-provider.js";
+import {
+  SecretProviderClientError,
+} from "../secrets/types.js";
+import {
+  secretService,
+} from "../services/secrets.js";
+import os from "node:os";
+import path from "node:path";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -102,6 +131,21 @@ describeEmbeddedPostgres("secretService", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+  }
+
+  async function seedAgent(
+    companyId: string,
+    status: "idle" | "pending_approval" | "terminated" = "idle",
+  ) {
+    return db.insert(agents).values({
+      companyId,
+      name: `${status}-${randomUUID()}`,
+      role: "engineer",
+      status,
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning().then((rows) => rows[0]!);
   }
 
   async function seedAgentRun(companyId: string, permissions: Record<string, unknown> = {}) {

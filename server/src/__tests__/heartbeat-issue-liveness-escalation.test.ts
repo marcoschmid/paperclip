@@ -1,6 +1,20 @@
-import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  randomUUID,
+} from "node:crypto";
+import {
+  and,
+  eq,
+  sql,
+} from "drizzle-orm";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   activityLog,
   agents,
@@ -28,6 +42,28 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  heartbeatService,
+} from "../services/heartbeat.ts";
+import {
+  attentionService,
+} from "../services/attention.ts";
+import {
+  instanceSettingsService,
+} from "../services/instance-settings.ts";
+import {
+  issueService,
+} from "../services/issues.ts";
+import {
+  runningProcesses,
+} from "../adapters/index.ts";
+import {
+  DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS,
+} from "../services/recovery/service.ts";
+import {
+  buildIssueBlockersResolvedWakeStateKey,
+  buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
+} from "../services/issue-dependency-wakeups.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -66,16 +102,6 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-import { heartbeatService } from "../services/heartbeat.ts";
-import { attentionService } from "../services/attention.ts";
-import { instanceSettingsService } from "../services/instance-settings.ts";
-import { issueService } from "../services/issues.ts";
-import { runningProcesses } from "../adapters/index.ts";
-import { DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS } from "../services/recovery/service.ts";
-import {
-  buildIssueBlockersResolvedWakeStateKey,
-  buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
-} from "../services/issue-dependency-wakeups.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;

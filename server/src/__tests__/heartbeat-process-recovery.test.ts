@@ -1,10 +1,26 @@
-import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { and, eq, or, inArray, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  randomUUID,
+} from "node:crypto";
+import {
+  spawn,
+  type ChildProcess,
+} from "node:child_process";
+import {
+  and,
+  eq,
+  or,
+  inArray,
+  sql,
+} from "drizzle-orm";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import {
   activityLog,
   agents,
@@ -42,13 +58,48 @@ import {
   projects,
   projectWorkspaces,
   workspaceOperations,
+  approvalExecutionClaims,
+  approvals,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { runningProcesses } from "../adapters/index.ts";
-import { inspectLocalProcessIdentity } from "../services/local-process-identity.js";
+import {
+  runningProcesses,
+} from "../adapters/index.ts";
+import {
+  INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+  INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+  heartbeatService,
+  redactDetectedSuccessfulRunProgressSummaryForBoard,
+  redactSuccessfulRunHandoffEvidence,
+} from "../services/heartbeat.ts";
+import {
+  readHotRestartIntent,
+  resolveLegacyHotRestartIntentPath,
+  resolveHotRestartReportPath,
+  writeHotRestartIntent,
+} from "../services/hot-restart.ts";
+import {
+  secretService,
+} from "../services/secrets.ts";
+import {
+  SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
+  SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
+  SUCCESSFUL_RUN_MISSING_STATE_REASON,
+  noticeMetadataReferencesRecoveryAction,
+} from "../services/recovery/index.ts";
+import {
+  collectDispositionRepairSourceState,
+} from "../services/recovery/disposition-repair.ts";
+import {
+  UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+  UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+} from "@paperclipai/adapter-utils/server-utils";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
@@ -100,31 +151,6 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-import {
-  INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
-  INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
-  heartbeatService,
-  redactDetectedSuccessfulRunProgressSummaryForBoard,
-  redactSuccessfulRunHandoffEvidence,
-} from "../services/heartbeat.ts";
-import {
-  readHotRestartIntent,
-  resolveLegacyHotRestartIntentPath,
-  resolveHotRestartReportPath,
-  writeHotRestartIntent,
-} from "../services/hot-restart.ts";
-import { secretService } from "../services/secrets.ts";
-import {
-  SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
-  SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
-  SUCCESSFUL_RUN_MISSING_STATE_REASON,
-  noticeMetadataReferencesRecoveryAction,
-} from "../services/recovery/index.ts";
-import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.ts";
-import {
-  UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-  UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-} from "@paperclipai/adapter-utils/server-utils";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -153,6 +179,15 @@ function isPidAlive(pid: number | null | undefined) {
   } catch {
     return false;
   }
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !isPidAlive(pid);
 }
 
 async function waitForRunToSettle(
@@ -3981,7 +4016,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activityDetailsText).not.toContain(apiKeySecret);
   });
 
-  it("escalates an exhausted failed successful-run handoff without using generic continuation recovery first", async () => {
+  // Upgrade v2026.831: Fork-Recovery-Pfad (Missing-Disposition ueber eigenes Recovery-Issue) durch Upstream ersetzt.
+  it.skip("escalates an exhausted failed successful-run handoff without using generic continuation recovery first", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4072,7 +4108,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_escalated")).toBe(true);
   });
 
-  it("escalates an exhausted successful handoff run that still leaves no disposition", async () => {
+  // Upgrade v2026.831: Fork-Recovery-Pfad (Missing-Disposition ueber eigenes Recovery-Issue) durch Upstream ersetzt.
+  it.skip("escalates an exhausted successful handoff run that still leaves no disposition", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
