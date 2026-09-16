@@ -143,7 +143,8 @@ describeEmbeddedPostgres("actorMiddleware agent API key activity logging", () =>
       .get("/actor")
       .set("authorization", "Bearer not-a-real-token");
 
-    expect(res.status).toBe(200);
+    // Upstream v2026.831 weist unbekannte Bearer-Tokens mit 401 ab statt anonym weiterzureichen.
+    expect(res.status).toBe(401);
 
     const rows = await db.select().from(activityLog);
     const authEvents = rows.filter((row) => row.action === "auth.agent_token_used");
@@ -184,8 +185,9 @@ describeEmbeddedPostgres("actorMiddleware agent API key activity logging", () =>
 
     const res = await request(buildApp()).get("/actor").set("authorization", `Bearer ${token}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ type: "none" });
+    // Upstream v2026.831 lehnt ungueltige Agent-Keys mit 401 ab; entscheidend bleibt,
+    // dass weder lastUsedAt noch das Activity-Log beruehrt werden.
+    expect(res.status).toBe(401);
     const persisted = await db
       .select()
       .from(agentApiKeys)
@@ -239,8 +241,9 @@ describeEmbeddedPostgres("actorMiddleware agent API key activity logging", () =>
 
     const res = await request(buildApp()).get("/actor").set("authorization", `Bearer ${token}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ type: "none" });
+    // Upstream v2026.831 lehnt ungueltige Agent-Keys mit 401 ab; entscheidend bleibt,
+    // dass weder lastUsedAt noch das Activity-Log beruehrt werden.
+    expect(res.status).toBe(401);
     const persisted = await db
       .select()
       .from(agentApiKeys)

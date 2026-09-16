@@ -23,6 +23,7 @@ import {
   projects,
   routineDocuments,
   routineRevisions,
+  routineRunDeliveries,
   routineRuns,
   routines,
   routineTriggers,
@@ -162,6 +163,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     const svc = routineService(db, {
       runtimeEnv: opts?.runtimeEnv,
+      routineDeliveryMaxAttempts: opts?.routineDeliveryMaxAttempts,
+      routineDeliveryNow: opts?.routineDeliveryNow,
+      routineDeliveryClaimLeaseMs: opts?.routineDeliveryClaimLeaseMs,
+      routineDeliveryRetryBaseMs: opts?.routineDeliveryRetryBaseMs,
       heartbeat: {
         wakeup: async (wakeupAgentId, wakeupOpts) => {
           wakeups.push({ agentId: wakeupAgentId, opts: wakeupOpts });

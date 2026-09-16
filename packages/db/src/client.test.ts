@@ -44,6 +44,11 @@ const userVisibleUpdatedAtTables = new Set([
 
 const migrationUpdatedAtUpdateAllowlist = new Map<string, ReadonlySet<string>>([
   [
+    // Fork-Migration (frueher 0145), produktiv appliziert; Backfill ist gewollt.
+    "9009_routine_run_deliveries.sql",
+    new Set(["routine_runs"]),
+  ],
+  [
     "0105_instance_scoped_environments.sql",
     new Set(["issues"]),
   ],
@@ -56,7 +61,7 @@ const migrationUpdatedAtUpdateAllowlist = new Map<string, ReadonlySet<string>>([
     new Set(["companies", "heartbeat_runs", "issues", "routine_runs", "routines"]),
   ],
   [
-    "0145_routine_run_deliveries.sql",
+    "9009_routine_run_deliveries.sql",
     new Set(["routine_runs"]),
   ],
 ]);
@@ -212,7 +217,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
     async () => {
       const connectionString = await createTempDatabase();
       await applyPendingMigrations(connectionString);
-      const hash = await migrationHash("0138_approval_execution_claims.sql");
+      const hash = await migrationHash("9002_approval_execution_claims.sql");
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
         await sql.unsafe('DROP TABLE "approval_execution_claims"');
@@ -262,7 +267,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       ] as const;
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        const retirementClaimsHash = await migrationHash("0140_agent_retirement_claims.sql");
+        const retirementClaimsHash = await migrationHash("9004_agent_retirement_claims.sql");
         await sql.unsafe(
           `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${retirementClaimsHash}'`,
         );
@@ -282,7 +287,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       const pendingState = await inspectMigrations(connectionString);
       expect(pendingState).toMatchObject({
         status: "needsMigrations",
-        pendingMigrations: ["0140_agent_retirement_claims.sql"],
+        pendingMigrations: ["9004_agent_retirement_claims.sql"],
         reason: "pending-migrations",
       });
 
@@ -324,7 +329,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       await applyPendingMigrations(connectionString);
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        const hash = await migrationHash("0141_agent_retirement_private_evidence.sql");
+        const hash = await migrationHash("9005_agent_retirement_private_evidence.sql");
         await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${hash}'`);
         await sql.unsafe(`
           DROP INDEX "agent_retirement_plan_claims_approval_comment_unique";
@@ -342,7 +347,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
 
       expect(await inspectMigrations(connectionString)).toMatchObject({
         status: "needsMigrations",
-        pendingMigrations: ["0141_agent_retirement_private_evidence.sql"],
+        pendingMigrations: ["9005_agent_retirement_private_evidence.sql"],
       });
       await applyPendingMigrations(connectionString);
       expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
@@ -395,7 +400,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       await applyPendingMigrations(connectionString);
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        const hash = await migrationHash("0141_agent_retirement_private_evidence.sql");
+        const hash = await migrationHash("9005_agent_retirement_private_evidence.sql");
         await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = '${hash}'`);
         await sql.unsafe(`
           ALTER TABLE "agent_retirement_plan_claims"
@@ -425,7 +430,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       );
       expect(await inspectMigrations(connectionString)).toMatchObject({
         status: "needsMigrations",
-        pendingMigrations: ["0141_agent_retirement_private_evidence.sql"],
+        pendingMigrations: ["9005_agent_retirement_private_evidence.sql"],
       });
     },
     20_000,
@@ -877,7 +882,10 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
     20_000,
   );
 
-  it(
+  // Fork: Die Migrationshistorie ist hier bewusst fail-closed (migration-lineage.ts).
+  // Dieses Upstream-Szenario setzt voraus, dass ein unbekannter Legacy-Hash still
+  // toleriert wird. Die produktive Fork-Datenbank hatte diesen Upstream-Hash nie.
+  it.skip(
     "replays the built-in managed resources migration after the legacy 0136 journal entry",
     async () => {
       const connectionString = await createTempDatabase();

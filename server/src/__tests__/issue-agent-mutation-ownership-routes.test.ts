@@ -1060,8 +1060,10 @@ describe("agent issue mutation checkout ownership", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ assigneeAgentId: peerAgentId, title: "Unauthorized rewrite" });
 
+    // Seit v2026.831 greift zuerst die Upstream-Sichtbarkeitspruefung. Entscheidend
+    // bleibt: kein Schreibzugriff, keine Mutation.
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(res.body.error).toMatch(/outside this actor's (authorization boundary|visibility)/);
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 

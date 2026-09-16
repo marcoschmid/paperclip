@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { createLocalFileRunLogStore } from "../services/run-log-store.js";
+import { createDurableRunLogStore } from "../services/run-log-store.js";
 import { createLocalFileWorkspaceOperationLogStore } from "../services/workspace-operation-log-store.js";
 
 function permissionBits(mode: number) {
@@ -13,7 +13,7 @@ function permissionBits(mode: number) {
 describe("local log-store permissions", () => {
   it("creates heartbeat run-log directories as 0700 and files as 0600", async () => {
     const basePath = await mkdtemp(path.join(tmpdir(), "paperclip-run-log-"));
-    const store = createLocalFileRunLogStore(basePath);
+    const store = createDurableRunLogStore({ basePath });
 
     const handle = await store.begin({ companyId: "company", agentId: "agent", runId: "run" });
     const secret = "pcp_run_log_store_secret";
