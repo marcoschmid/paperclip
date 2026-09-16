@@ -7,3 +7,14 @@ d77fab6aae3146ab5957c4d4d54d634f22545707:server/src/__tests__/invite-accept-gate
 fd2f82ac5bba6ce2db0c5d17c573733af5f2bbb8:server/src/__tests__/invite-accept-gateway-defaults.test.ts:generic-api-key:155
 fd2f82ac5bba6ce2db0c5d17c573733af5f2bbb8:server/src/__tests__/invite-accept-gateway-defaults.test.ts:generic-api-key:178
 fd2f82ac5bba6ce2db0c5d17c573733af5f2bbb8:scripts/smoke/hermes-gateway-e2e.sh:curl-auth-header:610
+9964b034bbff24e700c8eccf5a8b1fc3daa44bf2:packages/paperclip-runner/src/control-plane/durable-prp-control-plane.test.ts:generic-api-key:170
+9c1f8e788732c2cff971d8f2b0c69499bde0fac7:server/src/__tests__/server-startup-feedback-export.test.ts:generic-api-key:289
+9c1f8e788732c2cff971d8f2b0c69499bde0fac7:server/src/__tests__/server-startup-feedback-export.test.ts:generic-api-key:290
+9c1f8e788732c2cff971d8f2b0c69499bde0fac7:server/src/__tests__/server-startup-feedback-export.test.ts:generic-api-key:406
+9c1f8e788732c2cff971d8f2b0c69499bde0fac7:server/src/__tests__/server-startup-feedback-export.test.ts:generic-api-key:453
+9c1f8e788732c2cff971d8f2b0c69499bde0fac7:server/src/__tests__/decisions-service.test.ts:generic-api-key:44
+f712cedbc2e0c86ffa606018609831167641766a:ui/src/pages/apps/gateways/panels/TokensPanel.test.tsx:generic-api-key:52
+f712cedbc2e0c86ffa606018609831167641766a:ui/src/pages/apps/gateways/gateway-helpers.test.ts:generic-api-key:112
+7b35de65aaabbd53c2393cdf10c2223e36af1c23:packages/google-sheets-mcp-server/src/server.test.ts:private-key:25
+7b35de65aaabbd53c2393cdf10c2223e36af1c23:packages/google-sheets-mcp-server/src/http.test.ts:private-key:26
+931eec3fbf83dc425b5381ba5823125162cd13e7:server/src/__tests__/tool-gateway.test.ts:generic-api-key:2072
