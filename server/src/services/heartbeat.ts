@@ -2020,15 +2020,6 @@ export function isConfigurationIncompleteFailedRun(
   return run?.errorCode === CONFIGURATION_INCOMPLETE_FAILURE_CODE || run?.errorCode === "model_not_found";
 }
 
-async function hasGitMetadata(cwd: string | null | undefined) {
-  const normalized = readNonEmptyString(cwd);
-  if (!normalized) return false;
-  return fs
-    .lstat(path.resolve(normalized, ".git"))
-    .then((entry) => entry.isDirectory() || entry.isFile())
-    .catch(() => false);
-}
-
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
@@ -2357,7 +2348,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && !await hasGitMetadata(effectiveCwd)) {
+  if (workspaceExpectation && effectiveCwd && !await isGitCheckout(effectiveCwd)) {
     fail(
       "missing_git_metadata",
       `Issue ${issue.identifier ?? issue.id} expected a git workspace for ${input.adapterType}, but "${effectiveCwd}" has no .git metadata.`,
@@ -7548,7 +7539,7 @@ export async function enqueueLifecycleCanaryRun(
     ).returning();
     const [queuedWakeupRequest] = await tx
       .update(agentWakeupRequests)
-      .set({ status: "queued", runId: input.receipt.runId, updatedAt: new Date() })
+      .set(sanitizeHeartbeatWakeupWriteForStorage({ status: "queued", runId: input.receipt.runId, updatedAt: new Date() }))
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .returning();
 
@@ -7680,13 +7671,13 @@ async function failLifecycleCanaryInTransaction(input: {
       });
     }
     const errorCode = `agent_lifecycle_canary_${normalizedOutcome}`;
-    const cancelledRun = await input.tx.update(heartbeatRuns).set({
+    const cancelledRun = await input.tx.update(heartbeatRuns).set(sanitizeHeartbeatRunWriteForStorage({
       status: "cancelled",
       error: input.reasonDetail,
       errorCode,
       finishedAt: input.now,
       updatedAt: input.now,
-    }).where(and(
+    })).where(and(
       eq(heartbeatRuns.id, input.run.id),
       eq(heartbeatRuns.companyId, input.agent.companyId),
       eq(heartbeatRuns.agentId, input.agent.id),
@@ -7697,12 +7688,12 @@ async function failLifecycleCanaryInTransaction(input: {
         code: "agent_lifecycle_canary_failure_run_race",
       });
     }
-    const cancelledWake = await input.tx.update(agentWakeupRequests).set({
+    const cancelledWake = await input.tx.update(agentWakeupRequests).set(sanitizeHeartbeatWakeupWriteForStorage({
       status: "cancelled",
       error: input.reasonDetail,
       finishedAt: input.now,
       updatedAt: input.now,
-    }).where(and(
+    })).where(and(
       eq(agentWakeupRequests.id, input.run.wakeupRequestId),
       eq(agentWakeupRequests.companyId, input.agent.companyId),
       eq(agentWakeupRequests.agentId, input.agent.id),
@@ -8060,12 +8051,12 @@ export async function revalidatePendingLifecycleCanaryBoundary(
           code: "agent_lifecycle_canary_checkout_race",
         });
       }
-      const claimed = await tx.update(heartbeatRuns).set({
+      const claimed = await tx.update(heartbeatRuns).set(sanitizeHeartbeatRunWriteForStorage({
         status: "running",
         responsibleUserId: input.claim.responsibleUserId,
         startedAt: run.startedAt ?? input.claim.claimedAt,
         updatedAt: input.claim.claimedAt,
-      }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+      })).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
       if (!claimed) {
@@ -8490,7 +8481,7 @@ async function promotePendingLifecycleCanaryAfterSuccessfulRun(
     delete promotedMetadata.lifecycleCanaryGate;
     const lockedContextSnapshot = parseObject(lockedRun.contextSnapshot);
     const lockedCanaryBinding = parseObject(lockedContextSnapshot.lifecycleCanary);
-    const promotedRun = await tx.update(heartbeatRuns).set({
+    const promotedRun = await tx.update(heartbeatRuns).set(sanitizeHeartbeatRunWriteForStorage({
       contextSnapshot: {
         ...lockedContextSnapshot,
         lifecycleCanary: {
@@ -8500,7 +8491,7 @@ async function promotePendingLifecycleCanaryAfterSuccessfulRun(
         },
       },
       updatedAt: now,
-    }).where(and(
+    })).where(and(
       eq(heartbeatRuns.id, lockedRun.id),
       eq(heartbeatRuns.companyId, lockedRun.companyId),
       eq(heartbeatRuns.agentId, lockedRun.agentId),
@@ -11016,7 +11007,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sanitizedPatch = sanitizeHeartbeatRunPatchForStorage(patch);
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...sanitizedPatch, updatedAt: new Date() })
+      .set(sanitizeHeartbeatRunWriteForStorage({ status, ...sanitizedPatch, updatedAt: new Date() }))
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -11057,7 +11048,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set(sanitizeHeartbeatRunWriteForStorage({ status, ...patch, updatedAt: new Date() }))
       .where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, fromStatuses)))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -11199,7 +11190,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!wakeupRequestId) return;
     await db
       .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set(sanitizeHeartbeatWakeupWriteForStorage({ status, ...patch, updatedAt: new Date() }))
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
@@ -11348,10 +11339,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (continuationRun) {
       await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           continuationAttempt: decision.nextAttempt,
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(heartbeatRuns.id, run.id));
     }
   }
@@ -11669,11 +11660,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (hasUnmanagedBackgroundTaskEvidence(parseObject(run.resultJson))) {
       await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           livenessReason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
           resultJson: withUnmanagedBackgroundTaskStopReason(parseObject(run.resultJson)),
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(heartbeatRuns.id, run.id));
     }
 
@@ -11899,12 +11890,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const startedAt = new Date(meta.startedAt);
     return db
       .update(heartbeatRuns)
-      .set({
+      .set(sanitizeHeartbeatRunWriteForStorage({
         processPid: meta.pid,
         processGroupId: meta.processGroupId,
         processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
         updatedAt: new Date(),
-      })
+      }))
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -11913,11 +11904,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function clearDetachedRunWarning(runId: string) {
     const updated = await db
       .update(heartbeatRuns)
-      .set({
+      .set(sanitizeHeartbeatRunWriteForStorage({
         error: null,
         errorCode: null,
         updatedAt: new Date(),
-      })
+      }))
       .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.errorCode, DETACHED_PROCESS_ERROR_CODE)))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -11938,7 +11929,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     return db
       .update(heartbeatRuns)
-      .set({ ...patch, updatedAt: new Date() })
+      .set(sanitizeHeartbeatRunWriteForStorage({ ...patch, updatedAt: new Date() }))
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -12051,7 +12042,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           source: "automation",
@@ -12066,13 +12057,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: "system",
           requestedByActorId: null,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const queuedRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           invocationSource: "automation",
@@ -12085,16 +12076,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryOfRunId: run.id,
           issueCommentStatus: "not_applicable",
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       await tx
         .update(agentWakeupRequests)
-        .set({
+        .set(sanitizeHeartbeatWakeupWriteForStorage({
           runId: queuedRun.id,
           updatedAt: now,
-        })
+        }))
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       await tx
@@ -12109,11 +12100,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await tx
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           issueCommentStatus: "retry_queued",
           issueCommentRetryQueuedAt: now,
           updatedAt: now,
-        })
+        }))
         .where(eq(heartbeatRuns.id, run.id));
 
       return queuedRun;
@@ -12318,7 +12309,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const queued = await db.transaction(async (tx) => {
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           source: "automation",
@@ -12332,13 +12323,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: "system",
           requestedByActorId: null,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const retryRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           invocationSource: "automation",
@@ -12351,16 +12342,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           retryOfRunId: run.id,
           processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       await tx
         .update(agentWakeupRequests)
-        .set({
+        .set(sanitizeHeartbeatWakeupWriteForStorage({
           runId: retryRun.id,
           updatedAt: now,
-        })
+        }))
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       if (issueId) {
@@ -12704,12 +12695,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const updated = await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           resultJson,
           error: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.error,
           errorCode: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.errorCode,
           updatedAt: now,
-        })
+        }))
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -13153,13 +13144,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const cancelled = await db
       .update(heartbeatRuns)
-      .set({
+      .set(sanitizeHeartbeatRunWriteForStorage({
         status: "cancelled",
         finishedAt: now,
         error: gate.reason,
         errorCode: gate.errorCode,
         updatedAt: now,
-      })
+      }))
       .where(
         and(
           eq(heartbeatRuns.id, run.id),
@@ -13175,12 +13166,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (cancelled.wakeupRequestId) {
       await db
         .update(agentWakeupRequests)
-        .set({
+        .set(sanitizeHeartbeatWakeupWriteForStorage({
           status: "cancelled",
           finishedAt: now,
           error: gate.reason,
           updatedAt: now,
-        })
+        }))
         .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
     }
 
@@ -13281,10 +13272,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const promoted = await db
       .update(heartbeatRuns)
-      .set({
+      .set(sanitizeHeartbeatRunWriteForStorage({
         status: "queued",
         updatedAt: now,
-      })
+      }))
       .where(
         and(
           eq(heartbeatRuns.id, dueRun.id),
@@ -13576,10 +13567,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
             await tx
               .update(agentWakeupRequests)
-              .set({
+              .set(sanitizeHeartbeatWakeupWriteForStorage({
                 coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
                 updatedAt: now,
-              })
+              }))
               .where(eq(agentWakeupRequests.id, existingContinuation.wakeupRequestId));
           }
 
@@ -13631,10 +13622,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
             await tx
               .update(agentWakeupRequests)
-              .set({
+              .set(sanitizeHeartbeatWakeupWriteForStorage({
                 coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
                 updatedAt: now,
-              })
+              }))
               .where(eq(agentWakeupRequests.id, existingContinuation.wakeupRequestId));
           }
 
@@ -13720,7 +13711,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           source: "automation",
@@ -13745,13 +13736,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: null,
           idempotencyKey: continuationRetryIdempotencyKey,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const scheduledRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: run.companyId,
           agentId: run.agentId,
           invocationSource: "automation",
@@ -13767,16 +13758,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           scheduledRetryReason: retryReason,
           continuationAttempt: readContinuationAttempt(retryContextSnapshot.livenessContinuationAttempt),
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       await tx
         .update(agentWakeupRequests)
-        .set({
+        .set(sanitizeHeartbeatWakeupWriteForStorage({
           runId: scheduledRun.id,
           updatedAt: now,
-        })
+        }))
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       let detachWorkspaceFromIssue = false;
@@ -14300,11 +14291,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const updated = await db.transaction(async (tx) => {
       const row = await tx
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           scheduledRetryAt: now,
           contextSnapshot,
           updatedAt: now,
-        })
+        }))
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -14324,10 +14315,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
         await tx
           .update(agentWakeupRequests)
-          .set({
+          .set(sanitizeHeartbeatWakeupWriteForStorage({
             payload: wakeupPayload,
             updatedAt: now,
-          })
+          }))
           .where(eq(agentWakeupRequests.id, row.wakeupRequestId));
       }
 
@@ -14809,12 +14800,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const updated = await txDb
           .update(heartbeatRuns)
-          .set({
+          .set(sanitizeHeartbeatRunWriteForStorage({
             status: "running",
             responsibleUserId,
             startedAt: currentRun.startedAt ?? claimedAt,
             updatedAt: claimedAt,
-          })
+          }))
           .where(and(eq(heartbeatRuns.id, currentRun.id), eq(heartbeatRuns.status, "queued")))
           .returning()
           .then((rows) => rows[0] ?? null);
@@ -14823,7 +14814,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (updated.wakeupRequestId) {
           await txDb
             .update(agentWakeupRequests)
-            .set({ status: "claimed", claimedAt, updatedAt: claimedAt })
+            .set(sanitizeHeartbeatWakeupWriteForStorage({ status: "claimed", claimedAt, updatedAt: claimedAt }))
             .where(and(
               eq(agentWakeupRequests.id, updated.wakeupRequestId),
               eq(agentWakeupRequests.companyId, updated.companyId),
@@ -15458,14 +15449,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const classification = classifyRunLiveness(await buildRunLivenessInput(run, resultJson));
     return db
       .update(heartbeatRuns)
-      .set({
+      .set(sanitizeHeartbeatRunWriteForStorage({
         livenessState: classification.livenessState,
         livenessReason: classification.livenessReason,
         continuationAttempt: classification.continuationAttempt,
         lastUsefulActionAt: classification.lastUsefulActionAt,
         nextAction: classification.nextAction,
         updatedAt: new Date(),
-      })
+      }))
       .where(eq(heartbeatRuns.id, run.id))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -16429,7 +16420,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (responsibleUserId && run.responsibleUserId !== responsibleUserId) {
       await db
         .update(heartbeatRuns)
-        .set({ responsibleUserId, updatedAt: new Date() })
+        .set(sanitizeHeartbeatRunWriteForStorage({ responsibleUserId, updatedAt: new Date() }))
         .where(eq(heartbeatRuns.id, run.id));
       run = { ...run, responsibleUserId };
     }
@@ -17439,10 +17430,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       context.executionWorkspaceId = persistedExecutionWorkspace.id;
       await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           contextSnapshot: context,
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(heartbeatRuns.id, run.id));
     }
     const acquiredEnvironment = await envOrchestrator.acquireForRun({
@@ -17600,10 +17591,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
     await db
       .update(heartbeatRuns)
-      .set({
+      .set(sanitizeHeartbeatRunWriteForStorage({
         contextSnapshot: context,
         updatedAt: new Date(),
-      })
+      }))
       .where(eq(heartbeatRuns.id, run.id));
     const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
       agentId: agent.id,
@@ -17818,13 +17809,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!shouldFlush) return;
       await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           lastOutputAt: pendingOutputProgress.at,
           lastOutputSeq: pendingOutputProgress.seq,
           lastOutputStream: pendingOutputProgress.stream,
           lastOutputBytes: pendingOutputProgress.bytes,
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(heartbeatRuns.id, run.id));
       lastOutputFlushAt = pendingOutputProgress.at;
       outputProgressState.pending = null;
@@ -17833,12 +17824,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const startedAt = run.startedAt ?? new Date();
       const runningWithSession = await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
           contextSnapshot: context,
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(heartbeatRuns.id, run.id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -17905,11 +17896,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           logStore: handle.store,
           logRef: handle.logRef,
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
@@ -18048,10 +18039,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           runtimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
         await db
           .update(heartbeatRuns)
-          .set({
+          .set(sanitizeHeartbeatRunWriteForStorage({
             contextSnapshot: context,
             updatedAt: new Date(),
-          })
+          }))
           .where(eq(heartbeatRuns.id, run.id));
       }
       if (issueId && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
@@ -18546,10 +18537,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           combinedRuntimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
         await db
           .update(heartbeatRuns)
-          .set({
+          .set(sanitizeHeartbeatRunWriteForStorage({
             contextSnapshot: context,
             updatedAt: new Date(),
-          })
+          }))
           .where(eq(heartbeatRuns.id, run.id));
         if (issueId) {
           try {
@@ -18762,11 +18753,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(nativeRunFinalizations.runId, run.id));
           await tx
             .update(heartbeatRuns)
-            .set({
+            .set(sanitizeHeartbeatRunWriteForStorage({
               nativePhase,
               nativePhaseUpdatedAt: new Date(),
               updatedAt: new Date(),
-            })
+            }))
             .where(eq(heartbeatRuns.id, run.id));
         });
       }
@@ -19028,7 +19019,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (failedRun?.runtimeMode === "native") {
         await db
           .update(heartbeatRuns)
-          .set({ nativePhase: "failed", nativePhaseUpdatedAt: new Date(), updatedAt: new Date() })
+          .set(sanitizeHeartbeatRunWriteForStorage({ nativePhase: "failed", nativePhaseUpdatedAt: new Date(), updatedAt: new Date() }))
           .where(eq(heartbeatRuns.id, failedRun.id));
         await db
           .update(nativeRunFinalizations)
@@ -19513,12 +19504,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!deferredAgent || deferredAgent.companyId !== issue.companyId || !deferredInvokability.invokable) {
           await tx
             .update(agentWakeupRequests)
-            .set({
+            .set(sanitizeHeartbeatWakeupWriteForStorage({
               status: "failed",
               finishedAt: new Date(),
               error: "Deferred wake could not be promoted: agent is not invokable",
               updatedAt: new Date(),
-            })
+            }))
             .where(eq(agentWakeupRequests.id, deferred.id));
           continue;
         }
@@ -19537,12 +19528,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (activePauseHold && !treeHoldInteractionWake) {
           await tx
             .update(agentWakeupRequests)
-            .set({
+            .set(sanitizeHeartbeatWakeupWriteForStorage({
               status: "cancelled",
               finishedAt: new Date(),
               error: "Deferred wake suppressed by active subtree pause hold",
               updatedAt: new Date(),
-            })
+            }))
             .where(eq(agentWakeupRequests.id, deferred.id));
           continue;
         }
@@ -19684,7 +19675,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const now = new Date();
         const newRun = await tx
           .insert(heartbeatRuns)
-          .values({
+          .values(sanitizeHeartbeatRunWriteForStorage({
             companyId: deferredAgent.companyId,
             agentId: deferredAgent.id,
             invocationSource: promotedSource,
@@ -19695,13 +19686,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
             continuationAttempt: promotedContinuationAttempt,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
         await tx
           .update(agentWakeupRequests)
-          .set({
+          .set(sanitizeHeartbeatWakeupWriteForStorage({
             status: "queued",
             reason: "issue_execution_promoted",
             runId: newRun.id,
@@ -19709,7 +19700,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: null,
             error: null,
             updatedAt: now,
-          })
+          }))
           .where(eq(agentWakeupRequests.id, deferred.id));
 
         await tx
@@ -19814,7 +19805,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const now = new Date();
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
-          .values({
+          .values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: issue.companyId,
             agentId: recoveryAgent.id,
             source: "automation",
@@ -19831,13 +19822,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorType: "system",
             requestedByActorId: null,
             updatedAt: now,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
         const queuedRun = await tx
           .insert(heartbeatRuns)
-          .values({
+          .values(sanitizeHeartbeatRunWriteForStorage({
             companyId: issue.companyId,
             agentId: recoveryAgent.id,
             invocationSource: "automation",
@@ -19859,16 +19850,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sessionIdBefore: recoverySessionBefore,
             retryOfRunId: run.id,
             updatedAt: now,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
         await tx
           .update(agentWakeupRequests)
-          .set({
+          .set(sanitizeHeartbeatWakeupWriteForStorage({
             runId: queuedRun.id,
             updatedAt: now,
-          })
+          }))
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
         await tx
@@ -19989,7 +19980,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: issue.companyId,
           agentId: recoveryAgent.id,
           source: "automation",
@@ -20003,13 +19994,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: "system",
           requestedByActorId: null,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const queuedRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: issue.companyId,
           agentId: recoveryAgent.id,
           invocationSource: "automation",
@@ -20021,16 +20012,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
           updatedAt: now,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       await tx
         .update(agentWakeupRequests)
-        .set({
+        .set(sanitizeHeartbeatWakeupWriteForStorage({
           runId: queuedRun.id,
           updatedAt: now,
-        })
+        }))
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       await tx
@@ -20125,7 +20116,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
-      await db.insert(agentWakeupRequests).values({
+      await db.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
         companyId: agent.companyId,
         agentId,
         source,
@@ -20138,7 +20129,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey: opts.idempotencyKey ?? null,
         finishedAt: new Date(),
         ...patch,
-      });
+      }));
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
       await writeSkippedRequest(skipReason, {
@@ -20440,7 +20431,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null);
 
         if (!issue) {
-          await tx.insert(agentWakeupRequests).values({
+          await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -20452,12 +20443,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
-          });
+          }));
           return { kind: "skipped" as const };
         }
 
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
-          await tx.insert(agentWakeupRequests).values({
+          await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -20476,7 +20467,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
-          });
+          }));
           return { kind: "skipped" as const };
         }
 
@@ -20495,13 +20486,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : "Cancelled because the issue was reassigned before the scheduled retry became due";
           const cancelled = await tx
             .update(heartbeatRuns)
-            .set({
+            .set(sanitizeHeartbeatRunWriteForStorage({
               status: "cancelled",
               finishedAt: now,
               error: reason,
               errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
               updatedAt: now,
-            })
+            }))
             .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
             .returning()
             .then((rows) => rows[0] ?? null);
@@ -20511,12 +20502,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (scheduledRun.wakeupRequestId) {
             await tx
               .update(agentWakeupRequests)
-              .set({
+              .set(sanitizeHeartbeatWakeupWriteForStorage({
                 status: "cancelled",
                 finishedAt: now,
                 error: reason,
                 updatedAt: now,
-              })
+              }))
               .where(eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId));
           }
 
@@ -20606,13 +20597,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ) {
           const cancelled = await tx
             .update(heartbeatRuns)
-            .set({
+            .set(sanitizeHeartbeatRunWriteForStorage({
               status: "cancelled",
               finishedAt: new Date(),
               error: "Execution lock released after issue reassigned to a different agent",
               errorCode: "lock_released_on_reassignment",
               updatedAt: new Date(),
-            })
+            }))
             .where(
               and(
                 eq(heartbeatRuns.id, activeExecutionRun.id),
@@ -20624,12 +20615,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             if (activeExecutionRun.wakeupRequestId) {
               await tx
                 .update(agentWakeupRequests)
-                .set({
+                .set(sanitizeHeartbeatWakeupWriteForStorage({
                   status: "cancelled",
                   finishedAt: new Date(),
                   error: "Execution lock released after issue reassigned to a different agent",
                   updatedAt: new Date(),
-                })
+                }))
                 .where(eq(agentWakeupRequests.id, activeExecutionRun.wakeupRequestId));
             }
             activeExecutionRun = null;
@@ -20716,7 +20707,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
-          await tx.insert(agentWakeupRequests).values({
+          await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -20732,7 +20723,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
-          });
+          }));
           return { kind: "skipped" as const };
         }
 
@@ -20809,7 +20800,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               createdAt: now,
               updatedAt: now,
             });
-            await tx.insert(agentWakeupRequests).values({
+            await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
               companyId: agent.companyId,
               agentId,
               source,
@@ -20829,7 +20820,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: now,
-            });
+            }));
             await logActivity(tx as unknown as Db, {
               companyId: issue.companyId,
               actorType: "system",
@@ -20892,15 +20883,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
             const mergedRun = await tx
               .update(heartbeatRuns)
-              .set({
+              .set(sanitizeHeartbeatRunWriteForStorage({
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
-              })
+              }))
               .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
               .returning()
               .then((rows) => rows[0] ?? availableActiveExecutionRun);
 
-            await tx.insert(agentWakeupRequests).values({
+            await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
               companyId: agent.companyId,
               agentId,
               source,
@@ -20914,7 +20905,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
               runId: mergedRun.id,
               finishedAt: new Date(),
-            });
+            }));
 
             return { kind: "coalesced" as const, run: mergedRun };
           }
@@ -20957,17 +20948,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
               await tx
                 .update(agentWakeupRequests)
-                .set({
+                .set(sanitizeHeartbeatWakeupWriteForStorage({
                   payload: mergedDeferredPayload,
                   coalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
                   updatedAt: new Date(),
-                })
+                }))
                 .where(eq(agentWakeupRequests.id, existingDeferred.id));
 
               return { kind: "deferred" as const };
             }
 
-            await tx.insert(agentWakeupRequests).values({
+            await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
               companyId: agent.companyId,
               agentId,
               source,
@@ -20978,7 +20969,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
-            });
+            }));
 
             return { kind: "deferred" as const };
           }
@@ -21070,7 +21061,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
 
             if (throttleDecision.blocked) {
-              await tx.insert(agentWakeupRequests).values({
+              await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
                 companyId: agent.companyId,
                 agentId,
                 source,
@@ -21093,7 +21084,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
                 finishedAt: throttleNow,
-              });
+              }));
               return { kind: "skipped" as const };
             }
           }
@@ -21102,7 +21093,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
         if (dailyCapBlock) {
           const now = new Date();
-          await tx.insert(agentWakeupRequests).values({
+          await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -21121,7 +21112,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: now,
-          });
+          }));
           if (source === "timer") {
             await tx
               .update(agents)
@@ -21136,7 +21127,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
-          .values({
+          .values(sanitizeHeartbeatWakeupWriteForStorage({
             companyId: agent.companyId,
             agentId,
             source,
@@ -21147,13 +21138,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
         const newRun = await tx
           .insert(heartbeatRuns)
-          .values({
+          .values(sanitizeHeartbeatRunWriteForStorage({
             companyId: agent.companyId,
             agentId,
             invocationSource: source,
@@ -21164,16 +21155,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
-          })
+          }))
           .returning()
           .then((rows) => rows[0]);
 
         await tx
           .update(agentWakeupRequests)
-          .set({
+          .set(sanitizeHeartbeatWakeupWriteForStorage({
             runId: newRun.id,
             updatedAt: new Date(),
-          })
+          }))
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
         // executionRunId is NOT stamped here (enqueueWakeup queues the run but
@@ -21242,15 +21233,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       const mergedRun = await db
         .update(heartbeatRuns)
-        .set({
+        .set(sanitizeHeartbeatRunWriteForStorage({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
         .returning()
         .then((rows) => rows[0] ?? coalescedTargetRun);
 
-      await db.insert(agentWakeupRequests).values({
+      await db.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
         companyId: agent.companyId,
         agentId,
         source,
@@ -21264,7 +21255,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey: opts.idempotencyKey ?? null,
         runId: mergedRun.id,
         finishedAt: new Date(),
-      });
+      }));
       return mergedRun;
     }
 
@@ -21276,7 +21267,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
         const now = new Date();
-        await tx.insert(agentWakeupRequests).values({
+        await tx.insert(agentWakeupRequests).values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: agent.companyId,
           agentId,
           source,
@@ -21295,7 +21286,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: opts.requestedByActorId ?? null,
           idempotencyKey: opts.idempotencyKey ?? null,
           finishedAt: now,
-        });
+        }));
         if (source === "timer") {
           await tx
             .update(agents)
@@ -21310,7 +21301,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
-        .values({
+        .values(sanitizeHeartbeatWakeupWriteForStorage({
           companyId: agent.companyId,
           agentId,
           source,
@@ -21321,13 +21312,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: opts.requestedByActorType ?? null,
           requestedByActorId: opts.requestedByActorId ?? null,
           idempotencyKey: opts.idempotencyKey ?? null,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       const newRun = await tx
         .insert(heartbeatRuns)
-        .values({
+        .values(sanitizeHeartbeatRunWriteForStorage({
           companyId: agent.companyId,
           agentId,
           invocationSource: source,
@@ -21338,16 +21329,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
-        })
+        }))
         .returning()
         .then((rows) => rows[0]);
 
       await tx
         .update(agentWakeupRequests)
-        .set({
+        .set(sanitizeHeartbeatWakeupWriteForStorage({
           runId: newRun.id,
           updatedAt: new Date(),
-        })
+        }))
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
       return { kind: "queued" as const, run: newRun };
@@ -21461,12 +21452,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     await db
       .update(agentWakeupRequests)
-      .set({
+      .set(sanitizeHeartbeatWakeupWriteForStorage({
         status: "cancelled",
         finishedAt: now,
         error: "Cancelled due to budget pause",
         updatedAt: now,
-      })
+      }))
       .where(inArray(agentWakeupRequests.id, wakeupIds));
 
     return wakeupIds.length;
@@ -21620,12 +21611,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     await db
       .update(agentWakeupRequests)
-      .set({
+      .set(sanitizeHeartbeatWakeupWriteForStorage({
         status: "cancelled",
         finishedAt: now,
         error: reason,
         updatedAt: now,
-      })
+      }))
       .where(inArray(agentWakeupRequests.id, wakeupIds));
 
     return wakeupIds.length;
