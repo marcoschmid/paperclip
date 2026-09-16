@@ -1586,15 +1586,12 @@ export function authorizationService(db: Db) {
       ) {
         return allowIssueMentionGrant(input.action);
       }
-      // An agent that already holds authority to reassign this issue away
-      // from its current assignee (CEO, canAssignTasks manifest, an explicit
-      // tasks:assign/tasks:assign_scope grant, or reporting-chain management)
-      // must also be able to read/comment/mutate it — otherwise the
-      // documented manager-reassignment workflow (SPEC-implementation
-      // "Worked Example: Manager Heartbeat") is unreachable: a manager could
-      // never comment on or PATCH a non-locked issue assigned to someone
-      // else in order to reassign it.
-      if (resource) {
+      // An agent that holds authority to reassign this issue may comment on it
+      // before reassignment. General mutation remains separate: otherwise a
+      // tasks:assign grant would also authorize status, title, policy, and
+      // other unrelated issue changes. The PATCH route has a narrow,
+      // field-based path for assignment-only changes.
+      if (input.action === "issue:comment" && resource) {
         const assignmentAuthority = await decideBase({
           actor: input.actor,
           action: "tasks:assign",

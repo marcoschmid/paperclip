@@ -1579,7 +1579,7 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
-  it("allows a manager with a tasks:assign grant to comment on and mutate another agent's non-locked issue (HAP-569)", async () => {
+  it("lets a task assigner comment on a peer issue without granting general mutation authority (HAP-569)", async () => {
     const company = await createCompany(db, "ManagerCommentBoundary");
     const managerAgent = await createAgent(db, company.id);
     const assigneeAgent = await createAgent(db, company.id);
@@ -1614,10 +1614,7 @@ describeEmbeddedPostgres("authorization service", () => {
         assigneeAgentId: assigneeAgent.id,
         status: "blocked",
       },
-    })).resolves.toMatchObject({
-      allowed: true,
-      reason: "allow_manager_chain",
-    });
+    })).resolves.toMatchObject({ allowed: false });
   });
 
   it("still denies issue:comment/issue:mutate for agents without task-assignment authority over the assignee", async () => {

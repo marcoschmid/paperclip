@@ -2765,6 +2765,14 @@ export function issueRoutes(
     assigneeUserId?: string | null;
   };
 
+  function isPureIssueAssignmentPatch(body: Record<string, unknown>) {
+    const keys = Object.keys(body);
+    return (
+      keys.length > 0 &&
+      keys.every((key) => key === "assigneeAgentId" || key === "assigneeUserId")
+    );
+  }
+
   async function resolveAssignmentProjectId(input: {
     companyId: string;
     projectId: string | null | undefined;
@@ -6932,16 +6940,36 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+      existing.companyId,
+      req.body.assigneeAgentId as string | null | undefined,
+    );
+    const pureUnlockedAgentAssignment =
+      req.actor.type === "agent" &&
+      existing.status !== "in_progress" &&
+      isPureIssueAssignmentPatch(req.body);
+    if (pureUnlockedAgentAssignment) {
+      await assertCanAssignTasks(req, existing.companyId, {
+        issueId: existing.id,
+        projectId: existing.projectId,
+        parentIssueId: existing.parentId,
+        assigneeAgentId:
+          normalizedAssigneeAgentId === undefined
+            ? existing.assigneeAgentId
+            : normalizedAssigneeAgentId,
+        assigneeUserId:
+          req.body.assigneeUserId === undefined
+            ? existing.assigneeUserId
+            : (req.body.assigneeUserId as string | null),
+      });
+    } else if (!(await assertAgentIssueMutationAllowed(req, res, existing))) {
+      return;
+    }
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
-    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
-      existing.companyId,
-      req.body.assigneeAgentId as string | null | undefined,
-    );
     const titleOrDescriptionChanged = req.body.title !== undefined || req.body.description !== undefined;
     const existingRelations =
       Array.isArray(req.body.blockedByIssueIds)
