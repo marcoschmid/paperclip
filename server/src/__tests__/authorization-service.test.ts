@@ -20,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { authorizationService } from "../services/authorization.js";
+import { grantsForHumanRole } from "../services/company-member-roles.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1274,18 +1275,19 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
-  // Fork-Richtlinie: auch Board-Operatoren brauchen fuer Zuweisungen einen Grant; Nachpruefung offen.
-  it.skip("allows simple-mode task assignment for active same-company board operators without explicit grants", async () => {
+  // Upgrade v2026.831 (TEC-828): tasks:assign hat fuer Board-Nutzer keinen
+  // Default-open-Zweig (anders als issue:comment/issue:mutate); es gilt
+  // immer decidePrincipalGrant. company-member-roles.ts#grantsForHumanRole
+  // provisioniert Operatoren aber automatisch mit einem expliziten
+  // tasks:assign-Grant (ueber den Invite-/Join-Pfad, siehe invite-grants.ts),
+  // daher besitzen aktive Board-Operatoren in der Praxis immer den Grant.
+  it("allows task assignment for active same-company board operators via their role-provisioned grant", async () => {
     const company = await createCompany(db, "BoardAssignmentDefault");
     const userId = `user-${randomUUID()}`;
     const targetAgent = await createAgent(db, company.id, { role: "engineer" });
-    await db.insert(companyMemberships).values({
-      companyId: company.id,
-      principalType: "user",
-      principalId: userId,
-      status: "active",
-      membershipRole: "operator",
-    });
+    for (const grant of grantsForHumanRole("operator")) {
+      await grantUserPermission(db, company.id, userId, grant.permissionKey);
+    }
 
     const decision = await authorizationService(db).decide({
       actor: { type: "board", userId, source: "session" },
@@ -1296,7 +1298,8 @@ describeEmbeddedPostgres("authorization service", () => {
 
     expect(decision).toMatchObject({
       allowed: true,
-      reason: "allow_simple_company_member",
+      reason: "allow_explicit_grant",
+      grant: { permissionKey: "tasks:assign" },
     });
   });
 

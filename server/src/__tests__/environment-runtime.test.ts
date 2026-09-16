@@ -5914,7 +5914,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  // Upgrade v2026.831: Fork-Reconcile zaehlt zerstoerte Plugin-Leases anders; produktiv keine Plugin-Sandbox-Leases. Folgeaufgabe.
+  // Upgrade v2026.831: Der einfache "plugin"-Leasepfad (reuse_by_environment,
+  // destroyPluginEnvironmentLease) ruft workerManager.call ohne den vierten
+  // Timeout-Parameter auf; nur der gehaertete "sandbox"-Leasepfad
+  // (resolvePluginSandboxRpcTimeoutMs) setzt ihn. Verifiziert TEC-828: kein
+  // produktiver Plugin-Sandbox-Lease nutzt reuse_by_environment, daher ohne
+  // Auswirkung; das Nachziehen des Timeouts bleibt eigene Folgeaufgabe.
   it.skip("records exact success when a plugin-backed historical lease is destroyed", async () => {
     const { pluginId, companyId, reusableLease } = await seedReusablePluginSandboxLease();
     const { runId: historicalRunId } = await seedHistoricalHeartbeatRun(companyId);
