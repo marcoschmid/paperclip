@@ -1,0 +1,174 @@
+diff --git a/cf/src/connection.js b/cf/src/connection.js
+index 8e79170..7c5fc69 100644
+--- a/cf/src/connection.js
++++ b/cf/src/connection.js
+@@ -254,6 +254,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function nextWrite(fn) {
++    if (socket === null) {
++      const err = Errors.connection('CONNECTION_CLOSED', options, socket)
++      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++      chunk = nextWriteTimer = null
++      // Do not silently drop the buffered operation. Reject every query that
++      // was assigned to this dead connection through the normal error path.
++      errored(err)
++      while (sent.length)
++        queryError(sent.shift(), err)
++      return false
++    }
+     const x = socket.write(chunk, fn)
+     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+     chunk = nextWriteTimer = null
+@@ -436,6 +447,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function closed(hadError) {
++    terminated = true // connect() resets this only when a replacement connection starts
+     incoming = Buffer.alloc(0)
+     remaining = 0
+     incomings = null
+diff --git a/cf/src/index.js b/cf/src/index.js
+index ffbe7ae..baa8077 100644
+--- a/cf/src/index.js
++++ b/cf/src/index.js
+@@ -238,12 +238,13 @@ function Postgres(a, b) {
+     let savepoints = 0
+       , connection
+       , prepare = null
++      , closed = false
+ 
+     try {
+       await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
+       return await Promise.race([
+         scope(connection, fn),
+-        new Promise((_, reject) => connection.onclose = reject)
++        new Promise((_, reject) => connection.onclose = e => (closed = true, reject(e)))
+       ])
+     } catch (error) {
+       throw error
+@@ -290,6 +291,8 @@ function Postgres(a, b) {
+       }
+ 
+       function handler(q) {
++        if (closed)
++          return q.reject(Errors.connection('CONNECTION_CLOSED', options))
+         q.catch(e => uncaughtError || (uncaughtError = e))
+         c.queue === full
+           ? queries.push(q)
+diff --git a/cjs/src/connection.js b/cjs/src/connection.js
+index 07f6716..6ad8d88 100644
+--- a/cjs/src/connection.js
++++ b/cjs/src/connection.js
+@@ -252,6 +252,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function nextWrite(fn) {
++    if (socket === null) {
++      const err = Errors.connection('CONNECTION_CLOSED', options, socket)
++      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++      chunk = nextWriteTimer = null
++      // Do not silently drop the buffered operation. Reject every query that
++      // was assigned to this dead connection through the normal error path.
++      errored(err)
++      while (sent.length)
++        queryError(sent.shift(), err)
++      return false
++    }
+     const x = socket.write(chunk, fn)
+     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+     chunk = nextWriteTimer = null
+@@ -434,6 +445,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function closed(hadError) {
++    terminated = true // connect() resets this only when a replacement connection starts
+     incoming = Buffer.alloc(0)
+     remaining = 0
+     incomings = null
+diff --git a/cjs/src/index.js b/cjs/src/index.js
+index f09c61c..932f432 100644
+--- a/cjs/src/index.js
++++ b/cjs/src/index.js
+@@ -237,12 +237,13 @@ function Postgres(a, b) {
+     let savepoints = 0
+       , connection
+       , prepare = null
++      , closed = false
+ 
+     try {
+       await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
+       return await Promise.race([
+         scope(connection, fn),
+-        new Promise((_, reject) => connection.onclose = reject)
++        new Promise((_, reject) => connection.onclose = e => (closed = true, reject(e)))
+       ])
+     } catch (error) {
+       throw error
+@@ -289,6 +290,8 @@ function Postgres(a, b) {
+       }
+ 
+       function handler(q) {
++        if (closed)
++          return q.reject(Errors.connection('CONNECTION_CLOSED', options))
+         q.catch(e => uncaughtError || (uncaughtError = e))
+         c.queue === full
+           ? queries.push(q)
+diff --git a/src/connection.js b/src/connection.js
+index 1b1cccd..f2c8d71 100644
+--- a/src/connection.js
++++ b/src/connection.js
+@@ -252,6 +252,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   function nextWrite(fn) {
++    if (socket === null) {
++      const err = Errors.connection('CONNECTION_CLOSED', options, socket)
++      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++      chunk = nextWriteTimer = null
++      // Do not silently drop the buffered operation. Reject every query that
++      // was assigned to this dead connection through the normal error path.
++      errored(err)
++      while (sent.length)
++        queryError(sent.shift(), err)
++      return false
++    }
+     const x = socket.write(chunk, fn)
+     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+     chunk = nextWriteTimer = null
+@@ -434,6 +445,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function closed(hadError) {
++    terminated = true // connect() resets this only when a replacement connection starts
+     incoming = Buffer.alloc(0)
+     remaining = 0
+     incomings = null
+diff --git a/src/index.js b/src/index.js
+index c7fba3d..dd716fd 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -237,12 +237,13 @@ function Postgres(a, b) {
+     let savepoints = 0
+       , connection
+       , prepare = null
++      , closed = false
+ 
+     try {
+       await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
+       return await Promise.race([
+         scope(connection, fn),
+-        new Promise((_, reject) => connection.onclose = reject)
++        new Promise((_, reject) => connection.onclose = e => (closed = true, reject(e)))
+       ])
+     } catch (error) {
+       throw error
+@@ -289,6 +290,8 @@ function Postgres(a, b) {
+       }
+ 
+       function handler(q) {
++        if (closed)
++          return q.reject(Errors.connection('CONNECTION_CLOSED', options))
+         q.catch(e => uncaughtError || (uncaughtError = e))
+         c.queue === full
+           ? queries.push(q)

@@ -1,15 +1,18 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
 import postgres from "postgres";
 import {
   applyPendingMigrations,
+  createDb,
   inspectMigrations,
 } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
+import { runPostgresDisconnectRegressionChild } from "./postgres-disconnect-regression-runner.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -91,6 +94,44 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping embedded Postgres migration tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+describeEmbeddedPostgres("createDb transaction safeguards", () => {
+  it("sets the idle transaction timeout and contains disconnect handling in a child process", async () => {
+    const connectionString = await createTempDatabase();
+    const db = createDb(connectionString, {
+      max: 1,
+      idleInTransactionSessionTimeoutMs: 250,
+      applicationName: "paperclip-timeout-test",
+    });
+
+    try {
+      const settings = await db.execute(sql<{
+        timeout: string;
+        applicationName: string;
+      }>`
+        select
+          current_setting('idle_in_transaction_session_timeout') as timeout,
+          current_setting('application_name') as "applicationName"
+      `);
+      expect(Array.from(settings)[0]).toMatchObject({
+        timeout: "250ms",
+        applicationName: "paperclip-timeout-test",
+      });
+    } finally {
+      await db.$client.end({ timeout: 0 });
+    }
+
+    await expect(
+      runPostgresDisconnectRegressionChild("real-idle-transaction-timeout", {
+        databaseUrl: connectionString,
+      }),
+    ).resolves.toMatchObject({
+      transactionOutcome: "CONNECTION_CLOSED",
+      staleCode: "CONNECTION_CLOSED",
+      rolledBackRows: 0,
+    });
+  }, 10_000);
+});
 
 describeEmbeddedPostgres("applyPendingMigrations", () => {
   it("rejects unallowlisted migration backfills that bump updated_at on user-visible tables", async () => {

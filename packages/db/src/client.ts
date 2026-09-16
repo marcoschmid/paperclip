@@ -4,14 +4,69 @@ import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import {
+  migrationHistoryNamesForFile,
+  resolveMigrationHistoryHashes,
+  resolveMigrationHistoryFileName,
+  validateForkMigrationLineage,
+} from "./migration-lineage.js";
 import * as schema from "./schema/index.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
+export const DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS = 60_000;
+const MIN_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS = 100;
+const MAX_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS = 86_400_000;
+
+export type CreateDbOptions = {
+  max?: number;
+  idleInTransactionSessionTimeoutMs?: number;
+  applicationName?: string;
+};
+
+function boundedInteger(name: string, value: number, min: number, max: number): number {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+function resolveRuntimePostgresOptions(options: CreateDbOptions = {}) {
+  const configuredTimeout = options.idleInTransactionSessionTimeoutMs
+    ?? (process.env.PAPERCLIP_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS === undefined
+      ? DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS
+      : Number(process.env.PAPERCLIP_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS));
+  const idleInTransactionSessionTimeoutMs = boundedInteger(
+    "idleInTransactionSessionTimeoutMs",
+    configuredTimeout,
+    MIN_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS,
+    MAX_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS,
+  );
+  const applicationName = options.applicationName?.trim() || "paperclip-server";
+  const max = options.max === undefined
+    ? undefined
+    : boundedInteger("max", options.max, 1, 100);
+
+  return {
+    ...(max === undefined ? {} : { max }),
+    connection: {
+      application_name: applicationName,
+      idle_in_transaction_session_timeout: idleInTransactionSessionTimeoutMs,
+    },
+  };
+}
 
 function createUtilitySql(url: string) {
-  return postgres(url, { max: 1, onnotice: () => {} });
+  const runtimeOptions = resolveRuntimePostgresOptions({
+    max: 1,
+    // Runtime incident tuning must not silently change startup migration
+    // behavior. Migrations keep the reviewed default unless a dedicated
+    // migration setting is introduced later.
+    idleInTransactionSessionTimeoutMs: DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS,
+    applicationName: "paperclip-migrations",
+  });
+  return postgres(url, { ...runtimeOptions, onnotice: () => {} });
 }
 
 function isSafeIdentifier(value: string): boolean {
@@ -45,8 +100,8 @@ export type MigrationState =
       reason: "no-migration-journal-empty-db" | "no-migration-journal-non-empty-db" | "pending-migrations";
     };
 
-export function createDb(url: string) {
-  const sql = postgres(url);
+export function createDb(url: string, options: CreateDbOptions = {}) {
+  const sql = postgres(url, resolveRuntimePostgresOptions(options));
   return drizzlePg(sql, { schema });
 }
 
@@ -186,7 +241,10 @@ async function migrationHistoryEntryExists(
 ): Promise<boolean> {
   const predicates: string[] = [];
   if (columnNames.has("hash")) predicates.push(`hash = ${quoteLiteral(hash)}`);
-  if (columnNames.has("name")) predicates.push(`name = ${quoteLiteral(migrationFile)}`);
+  if (columnNames.has("name")) {
+    const historyNames = migrationHistoryNamesForFile(migrationFile);
+    predicates.push(`name IN (${historyNames.map(quoteLiteral).join(", ")})`);
+  }
   if (predicates.length === 0) return false;
 
   const rows = await sql.unsafe<{ one: number }[]>(
@@ -280,15 +338,32 @@ async function applyPendingMigrationsManually(
 }
 
 async function mapHashesToMigrationFiles(migrationFiles: string[]): Promise<Map<string, string>> {
+  const migrationHashesByFile = new Map<string, string>();
   const mapped = new Map<string, string>();
 
-  await Promise.all(
+  const entries = await Promise.all(
     migrationFiles.map(async (migrationFile) => {
       const content = await readMigrationFileContent(migrationFile);
       const hash = createHash("sha256").update(content).digest("hex");
-      mapped.set(hash, migrationFile);
+      return { migrationFile, hash };
     }),
   );
+
+  for (const { migrationFile, hash } of entries) {
+    const existingFile = mapped.get(hash);
+    if (existingFile && existingFile !== migrationFile) {
+      throw new Error(
+        `Migration hash ${hash} is ambiguous between ${existingFile} and ${migrationFile}`,
+      );
+    }
+    migrationHashesByFile.set(migrationFile, hash);
+    mapped.set(hash, migrationFile);
+  }
+
+  const pinnedForkFiles = validateForkMigrationLineage(migrationHashesByFile);
+  for (const [hash, migrationFile] of pinnedForkFiles) {
+    mapped.set(hash, migrationFile);
+  }
 
   return mapped;
 }
@@ -428,44 +503,23 @@ async function loadAppliedMigrations(
   const quotedSchema = quoteIdentifier(migrationTableSchema);
   const qualifiedTable = `${quotedSchema}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
   const columnNames = await getMigrationTableColumnNames(sql, migrationTableSchema);
+  const hashesToMigrationFiles = await mapHashesToMigrationFiles(availableMigrations);
 
   if (columnNames.has("name")) {
     const rows = await sql.unsafe<{ name: string }[]>(`SELECT name FROM ${qualifiedTable} ORDER BY id`);
-    return rows.map((row) => row.name).filter((name): name is string => Boolean(name));
+    const availableMigrationSet = new Set(availableMigrations);
+    return rows
+      .map((row) => row.name)
+      .filter((name): name is string => Boolean(name))
+      .map((name) => resolveMigrationHistoryFileName(name, availableMigrationSet));
   }
 
   if (columnNames.has("hash")) {
     const rows = await sql.unsafe<{ hash: string }[]>(`SELECT hash FROM ${qualifiedTable} ORDER BY id`);
-    const hashesToMigrationFiles = await mapHashesToMigrationFiles(availableMigrations);
-    const appliedFromHashes = rows
-      .map((row) => hashesToMigrationFiles.get(row.hash))
-      .filter((name): name is string => Boolean(name));
-
-    if (appliedFromHashes.length > 0) {
-      // Best-effort: when all hashes resolve, this is authoritative.
-      if (appliedFromHashes.length === rows.length) return appliedFromHashes;
-
-      // Partial hash resolution can happen when files have changed; return what we can trust.
-      return appliedFromHashes;
-    }
-
-    // Fallback only when hashes are unavailable/unresolved.
-    if (columnNames.has("created_at")) {
-      const journalEntries = await listJournalMigrationEntries();
-      if (journalEntries.length > 0) {
-        const lastDbRows = await sql.unsafe<{ created_at: string | number | null }[]>(
-          `SELECT created_at FROM ${qualifiedTable} ORDER BY created_at DESC LIMIT 1`,
-        );
-        const lastCreatedAt = Number(lastDbRows[0]?.created_at ?? -1);
-        if (Number.isFinite(lastCreatedAt) && lastCreatedAt >= 0) {
-          return journalEntries
-            .filter((entry) => availableMigrations.includes(entry.fileName))
-            .filter((entry) => entry.folderMillis <= lastCreatedAt)
-            .map((entry) => entry.fileName)
-            .slice(0, rows.length);
-        }
-      }
-    }
+    return resolveMigrationHistoryHashes(
+      rows.map((row) => row.hash),
+      hashesToMigrationFiles,
+    );
   }
 
   const rows = await sql.unsafe<{ id: number }[]>(`SELECT id FROM ${qualifiedTable} ORDER BY id`);
@@ -512,6 +566,8 @@ export async function reconcilePendingMigrationHistory(
 
       const hash = createHash("sha256").update(migrationContent).digest("hex");
       const folderMillis = folderMillisByFile.get(migrationFile) ?? Date.now();
+      const historyNames = migrationHistoryNamesForFile(migrationFile);
+      const historyNamesSql = historyNames.map(quoteLiteral).join(", ");
       const existingByHash = columnNames.has("hash")
         ? await sql.unsafe<{ created_at: string | number | null }[]>(
             `SELECT created_at FROM ${qualifiedTable} WHERE hash = ${quoteLiteral(hash)} ORDER BY created_at DESC LIMIT 1`,
@@ -519,7 +575,7 @@ export async function reconcilePendingMigrationHistory(
         : [];
       const existingByName = columnNames.has("name")
         ? await sql.unsafe<{ created_at: string | number | null }[]>(
-            `SELECT created_at FROM ${qualifiedTable} WHERE name = ${quoteLiteral(migrationFile)} ORDER BY created_at DESC LIMIT 1`,
+            `SELECT created_at FROM ${qualifiedTable} WHERE name IN (${historyNamesSql}) ORDER BY created_at DESC LIMIT 1`,
           )
         : [];
       if (existingByHash.length > 0 || existingByName.length > 0) {
@@ -534,7 +590,7 @@ export async function reconcilePendingMigrationHistory(
           const existingNameCreatedAt = Number(existingByName[0]?.created_at ?? -1);
           if (existingByName.length > 0 && Number.isFinite(existingNameCreatedAt) && existingNameCreatedAt < folderMillis) {
             await sql.unsafe(
-              `UPDATE ${qualifiedTable} SET created_at = ${quoteLiteral(String(folderMillis))} WHERE name = ${quoteLiteral(migrationFile)} AND created_at < ${quoteLiteral(String(folderMillis))}`,
+              `UPDATE ${qualifiedTable} SET created_at = ${quoteLiteral(String(folderMillis))} WHERE name IN (${historyNamesSql}) AND created_at < ${quoteLiteral(String(folderMillis))}`,
             );
           }
         }
