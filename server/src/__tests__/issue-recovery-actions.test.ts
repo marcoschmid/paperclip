@@ -13,6 +13,7 @@ import {
   environments,
   heartbeatRuns,
   issueComments,
+  issueInboxArchives,
   issueRecoveryActions,
   issueRelations,
   issues,
@@ -23,8 +24,10 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -140,6 +143,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
+    await db.delete(issueInboxArchives);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -218,42 +222,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   }
 
-  async function seedLegacyTombstoneAction(companyId: string, sourceIssueId: string) {
-    await db.insert(agents).values({
-      id: HISTORICAL_TOMBSTONE_ID,
-      companyId,
-      name: "Historical recovery owner",
-      role: "engineer",
-      status: "terminated",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    }).onConflictDoNothing();
-    const [action] = await db.insert(issueRecoveryActions).values({
-      companyId,
-      sourceIssueId,
-      kind: "stranded_assigned_issue",
-      status: "active",
-      ownerType: "agent",
-      ownerAgentId: HISTORICAL_TOMBSTONE_ID,
-      cause: "stranded_assigned_issue",
-      fingerprint: `legacy-tombstone:${sourceIssueId}`,
-      evidence: { legacy: true },
-      nextAction: "Legacy action must remain inert until board repair.",
-      attemptCount: 1,
-    }).returning();
-    return action!;
-  }
-
-  function createApp(actor: any = { type: "board", source: "local_implicit" }) {
+  function createApp(
+    actor: any = { type: "board", source: "local_implicit" },
+    opts: Parameters<typeof issueRoutes>[2] = {},
+  ) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       (req as any).actor = actor;
       next();
     });
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", issueRoutes(db, {} as any, opts));
     app.use(errorHandler);
     return app;
   }
@@ -294,144 +273,60 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
-  it("rejects tombstone recovery owners on create and legacy update without changing rows", async () => {
-    const { companyId, managerId, sourceIssueId } = await seedCompany();
-    await db.insert(agents).values({
-      id: HISTORICAL_TOMBSTONE_ID,
-      companyId,
-      name: "Historical recovery owner",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
-    const otherIssueId = await db.insert(issues).values({
-      companyId,
-      title: "Other recovery source",
-      status: "blocked",
-      priority: "medium",
-      issueNumber: 2,
-      identifier: `RA-${randomUUID().slice(0, 8)}`,
-    }).returning({ id: issues.id }).then((rows) => rows[0]!.id);
+  it("preserves legacy recovery ownership when new evidence is folded into an active action", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
-
-    await expect(svc.upsertSourceScoped({
-      companyId,
-      sourceIssueId: otherIssueId,
-      kind: "stranded_assigned_issue",
-      ownerType: "agent",
-      ownerAgentId: HISTORICAL_TOMBSTONE_ID.toUpperCase(),
-      cause: "stranded_assigned_issue",
-      fingerprint: "new-tombstone-owner",
-      nextAction: "Do not create",
-    })).rejects.toMatchObject({
-      status: 409,
-      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
-    });
-    await expect(db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, otherIssueId)))
-      .resolves.toHaveLength(0);
-
-    const legacy = await seedLegacyTombstoneAction(companyId, sourceIssueId);
-    await expect(svc.upsertSourceScoped({
+    const legacy = await svc.upsertSourceScoped({
       companyId,
       sourceIssueId,
       kind: "stranded_assigned_issue",
       ownerType: "agent",
       ownerAgentId: managerId,
-      cause: "stranded_assigned_issue",
-      fingerprint: "attempted-repair-through-runtime",
-      nextAction: "Must fail closed",
-    })).rejects.toMatchObject({
-      status: 409,
-      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "process_lost",
+      fingerprint: "legacy-recovery",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Repair the execution path.",
+      wakePolicy: { type: "bounded_recovery_owner", ownerAgentId: managerId, attempt: 1, maxAttempts: 5 },
+      attemptCount: 1,
+      maxAttempts: 5,
     });
-    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, legacy.id)))[0])
-      .toEqual(legacy);
-  });
 
-  it("allows terminal cleanup of a legacy tombstone-owned action and changes only that action", async () => {
-    const { companyId, sourceIssue } = await seedCompany();
-    const legacy = await seedLegacyTombstoneAction(companyId, sourceIssue.id);
-    const svc = issueRecoveryActionService(db);
-    const sourceBefore = (await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0];
-
-    const resolved = await svc.resolveActiveForIssue({
+    const updated = await svc.upsertSourceScoped({
       companyId,
-      sourceIssueId: sourceIssue.id,
-      actionId: legacy.id,
-      status: "resolved",
-      outcome: "restored",
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "process_lost",
+      fingerprint: "legacy-recovery",
+      evidence: { latestRunId: "run-2" },
+      evidenceOnCreate: { routingPolicy: "board_escalation_no_takeover_v1" },
+      nextAction: "Board decision required.",
+      wakePolicy: { type: "board_escalation" },
+      preserveExistingOwner: true,
     });
-    expect(resolved).toMatchObject({
+
+    expect(updated).toMatchObject({
       id: legacy.id,
-      status: "resolved",
-      outcome: "restored",
-      ownerAgentId: HISTORICAL_TOMBSTONE_ID,
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      attemptCount: 2,
+      maxAttempts: 5,
+      nextAction: "Repair the execution path.",
+      evidence: expect.objectContaining({ latestRunId: "run-2" }),
+      wakePolicy: expect.objectContaining({ type: "bounded_recovery_owner" }),
     });
-    const after = (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, legacy.id)))[0]!;
-    const {
-      status: _beforeStatus,
-      outcome: _beforeOutcome,
-      resolutionNote: _beforeNote,
-      resolvedAt: _beforeResolvedAt,
-      updatedAt: _beforeUpdatedAt,
-      ...beforeStable
-    } = legacy;
-    const {
-      status: _afterStatus,
-      outcome: _afterOutcome,
-      resolutionNote: _afterNote,
-      resolvedAt: _afterResolvedAt,
-      updatedAt: _afterUpdatedAt,
-      ...afterStable
-    } = after;
-    expect(afterStable).toEqual(beforeStable);
-    expect((await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0]).toEqual(sourceBefore);
-    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id)))
-      .resolves.toHaveLength(0);
-    await expect(db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssue.id)))
-      .resolves.toHaveLength(0);
-  });
-
-  it("does not mutate or wake through the reconciler for a legacy tombstone-owned action", async () => {
-    const { companyId, coderId, sourceIssue } = await seedCompany();
-    const legacy = await seedLegacyTombstoneAction(companyId, sourceIssue.id);
-    const sourceBefore = (await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0];
-
-    const enqueueWakeup = vi.fn(async () => null);
-    const recovery = recoveryService(db, { enqueueWakeup });
-    await expect(recovery.escalateStrandedAssignedIssue({
-      issue: sourceIssue,
-      previousStatus: "in_progress",
-      latestRun: {
-        id: randomUUID(),
-        agentId: coderId,
-        status: "failed",
-        error: "adapter failed",
-        errorCode: "adapter_failed",
-        contextSnapshot: { retryReason: "issue_continuation_needed" },
-        livenessState: "needs_followup",
-      },
-      comment: "Must not mutate a tombstone-owned action.",
-    })).rejects.toMatchObject({
-      status: 409,
-      details: { code: "historical_agent_tombstone_active_reference_forbidden" },
-    });
-
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, legacy.id)))[0])
-      .toEqual(legacy);
-    expect((await db.select().from(issues).where(eq(issues.id, sourceIssue.id)))[0]).toEqual(sourceBefore);
-    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id)))
-      .resolves.toHaveLength(0);
-    await expect(db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssue.id)))
-      .resolves.toHaveLength(0);
+    expect(updated.evidence).not.toHaveProperty("routingPolicy");
   });
 
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
-    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const { companyId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
     const latestRun = {
@@ -444,18 +339,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       livenessState: "needs_followup",
     } as const;
 
-    await recovery.escalateStrandedAssignedIssue({
-      issue: sourceIssue,
-      previousStatus: "in_progress",
-      latestRun,
-      comment: "Automatic continuation recovery failed.",
-    });
-    await recovery.escalateStrandedAssignedIssue({
-      issue: sourceIssue,
-      previousStatus: "in_progress",
-      latestRun,
-      comment: "Automatic continuation recovery failed.",
-    });
+    await Promise.all([
+      recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      }),
+      recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      }),
+    ]);
 
     const actionRows = await db
       .select()
@@ -466,10 +363,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       companyId,
       kind: "stranded_assigned_issue",
       status: "active",
+      ownerType: "board",
+      ownerAgentId: null,
       previousOwnerAgentId: coderId,
       returnOwnerAgentId: coderId,
       cause: "stranded_assigned_issue",
       attemptCount: 2,
+      evidence: expect.objectContaining({
+        routingPolicy: "board_escalation_no_takeover_v1",
+      }),
     });
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
@@ -481,12 +383,846 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      recoveryCause: "stranded_assigned_issue",
+    expect(updatedIssue?.assigneeAgentId).toBe(coderId);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // Model the production payload: `requestedRef` keeps the operator spelling,
+  // and the fingerprint carries the canonical remote ref. Two equivalent
+  // spellings of one remote branch share `identityRef`, so they share one
+  // fingerprint. A different branch gets a different `identityRef`.
+  const makeUnresolvedBaseRefRun = (agentId: string, issueId: string) =>
+    (requestedRef: string, identityRef: string) =>
+      ({
+        id: randomUUID(),
+        agentId,
+        status: "failed",
+        error: `Configured workspace base ref "${requestedRef}" did not resolve to a commit on origin after an authenticated fetch.`,
+        errorCode: "configuration_incomplete",
+        contextSnapshot: { issueId },
+        livenessState: "needs_followup",
+        resultJson: {
+          configurationIncomplete: {
+            reason: "workspace_base_ref_unresolved",
+            requestedRef,
+            attemptedRefs: [identityRef],
+            fingerprint: `workspace_base_ref:${identityRef}`,
+          },
+        },
+      }) as const;
+
+  it("bounds configuration-incomplete recovery by the unresolved base ref fingerprint", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const makeRun = makeUnresolvedBaseRefRun(coderId, sourceIssue.id);
+
+    // Two reconciliations with the same unresolved ref reuse one active action.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
     });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      cause: "configuration_incomplete",
+      status: "active",
+      attemptCount: 2,
+    });
+    // The fingerprint carries the canonical remote ref, so the same branch stays
+    // one action and a different branch would make a distinct fingerprint.
+    expect(actions[0]?.fingerprint).toBe(
+      `source_scoped_recovery:${sourceIssue.companyId}:${sourceIssue.id}:configuration_incomplete:workspace_base_ref:origin/fix/foo`,
+    );
+  });
+
+  it("keeps equivalent spellings of one unresolved base ref under one recovery identity", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const makeRun = makeUnresolvedBaseRefRun(coderId, sourceIssue.id);
+
+    // The operator retries the same remote branch under two spellings. Both map
+    // to the canonical `origin/fix/foo` identity, so recovery must not reset the
+    // attempt count or post a second notice.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("origin/fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // One identity, one active action, the attempt count advances.
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      cause: "configuration_incomplete",
+      status: "active",
+      attemptCount: 2,
+    });
+    expect(actions[0]?.fingerprint).toBe(
+      `source_scoped_recovery:${sourceIssue.companyId}:${sourceIssue.id}:configuration_incomplete:workspace_base_ref:origin/fix/foo`,
+    );
+
+    // The operator gets one notice, bound to the one action.
+    const notices = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      );
+    expect(
+      notices.filter((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, actions[0]!.id),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("gives a distinct recovery identity and a new operator notice when the unresolved base ref changes", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const makeRun = makeUnresolvedBaseRefRun(coderId, sourceIssue.id);
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/foo", "origin/fix/foo"),
+      recoveryCause: "configuration_incomplete",
+    });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: makeRun("fix/bar", "origin/fix/bar"),
+      recoveryCause: "configuration_incomplete",
+    });
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // The prior ref keeps its own record and the new ref gets a fresh identity.
+    expect(actions).toHaveLength(2);
+    const priorAction = actions.find((row) =>
+      row.fingerprint.endsWith("workspace_base_ref:origin/fix/foo"),
+    );
+    const newAction = actions.find((row) =>
+      row.fingerprint.endsWith("workspace_base_ref:origin/fix/bar"),
+    );
+    expect(priorAction?.status).toBe("cancelled");
+    expect(priorAction?.outcome).toBe("cancelled");
+    expect(newAction?.status).toBe("active");
+    expect(newAction?.attemptCount).toBe(1);
+    expect(newAction?.id).not.toBe(priorAction?.id);
+
+    // The operator gets one notice per distinct ref, each bound to its action.
+    const systemComments = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, sourceIssue.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      );
+    expect(
+      systemComments.some((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, priorAction!.id),
+      ),
+    ).toBe(true);
+    expect(
+      systemComments.some((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, newAction!.id),
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["process_lost", undefined],
+    ["adapter_failed", "successful_run_missing_state"],
+    ["codex_output_inactivity_monitor", undefined],
+    ["workspace_validation_failed", "workspace_validation_failed"],
+    ["adapter_failed", undefined],
+  ] as const)(
+    "routes %s recovery through the cause-keyed playbook",
+    async (errorCode, explicitCause) => {
+      const { coderId, sourceIssue } = await seedCompany();
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const latestRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: errorCode === "adapter_failed" && explicitCause === "successful_run_missing_state"
+          ? "succeeded"
+          : "failed",
+        error: `${errorCode} failure`,
+        errorCode,
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: errorCode === "workspace_validation_failed"
+          ? { workspaceValidation: { reason: "missing_workspace", fingerprint: "workspace:test" } }
+          : null,
+      } as const;
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        ...(explicitCause ? { recoveryCause: explicitCause } : {}),
+      });
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(action).toMatchObject({
+        ownerType: "board",
+        ownerAgentId: null,
+        previousOwnerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+        evidence: expect.objectContaining({
+          routingPolicy: "board_escalation_no_takeover_v1",
+        }),
+        wakePolicy: expect.objectContaining({
+          type: "board_escalation",
+          preservesSourceAssignee: true,
+        }),
+      });
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stands down while the latest run was cancelled by a board operator", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "cancelled",
+      error: "Cancelled by a board operator",
+      errorCode: "cancelled",
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board-user" },
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.operatorCancelExempted).toBe(1);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("stands down after an operator interrupt cancellation", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "cancelled",
+      error: "Interrupted by board comment",
+      errorCode: "operator_interrupted",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.operatorCancelExempted).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("still recovers system-cancelled runs with no operator attribution", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "cancelled",
+      error: "Cancelled because the workspace lease expired",
+      errorCode: "cancelled",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.operatorCancelExempted).toBe(0);
+    // The system-cancelled run still flows into the pre-existing recovery
+    // behavior (a continuation requeue or escalation — either produces a
+    // wake), proving the stand-down is scoped to operator attribution.
+    expect(enqueueWakeup).toHaveBeenCalled();
+  });
+
+  it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "You've hit your usage limit for GPT-5. Try again at 12:00 AM (UTC).",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.providerQuotaMonitored).toBe(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+      monitorScheduledBy: "assignee",
+      monitorNotes: "Provider usage quota reached; retry the original assignee at the provider reset time.",
+    });
+    expect(updatedIssue?.monitorNextCheckAt).toBeInstanceOf(Date);
+    expect(updatedIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        serviceName: "AI provider quota",
+        externalRef: runId,
+        maxAttempts: null,
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun).toMatchObject({ errorCode: "provider_quota" });
+    expect(updatedRun?.resultJson).toMatchObject({ errorFamily: "provider_quota" });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const secondResult = await recovery.reconcileStrandedAssignedIssues();
+    expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+  });
+
+  it("schedules another provider-quota monitor after a prior quota monitor fired", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ monitorAttemptCount: 1 }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T21:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T21:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.providerQuotaMonitored).toBe(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        maxAttempts: null,
+        externalRef: runId,
+      },
+    });
+  });
+
+  it("skips provider-quota monitor scheduling for todo issues without aborting reconciliation", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "todo",
+      assigneeAgentId: coderId,
+      monitorNextCheckAt: null,
+    });
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun?.errorCode).toBe("adapter_failed");
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not create takeover recovery when a quota monitor cannot be scheduled", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      monitorNextCheckAt: null,
+    });
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun?.errorCode).toBe("adapter_failed");
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("schedules a quota monitor for a cross-agent active review participant", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: managerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    const [reviewIssueBeforeRecovery] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(reviewIssueBeforeRecovery).toMatchObject({
+      assigneeAgentId: coderId,
+      executionState: {
+        currentParticipant: { type: "agent", agentId: managerId },
+        returnAssignee: { type: "agent", agentId: coderId },
+      },
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored: 1, reviewParticipantRequeued: 0 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      monitorNextCheckAt: expect.any(Date),
+      monitorNotes: "Provider usage quota reached; retry the active review participant after the default recovery backoff.",
+    });
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun?.errorCode).toBe("provider_quota");
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not restamp an in_review quota monitor when the assignee has a newer terminal run", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: managerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    const participantRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: participantRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const firstResult = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(firstResult).toMatchObject({ providerQuotaMonitored: 1 });
+    const [monitoredIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const firstNextCheckAt = monitoredIssue?.monitorNextCheckAt;
+    expect(firstNextCheckAt).toBeInstanceOf(Date);
+    expect(monitoredIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        serviceName: "AI provider quota",
+        externalRef: participantRunId,
+      },
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "Stale assignee wake fired after the issue entered review.",
+      errorCode: "issue_assignee_changed",
+      startedAt: new Date("2026-07-15T20:02:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:03:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+
+    const secondResult = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(secondResult).toMatchObject({ providerQuotaMonitored: 0, skipped: 1 });
+    const [unchangedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(unchangedIssue?.monitorNextCheckAt?.getTime()).toBe(firstNextCheckAt?.getTime());
+    expect(unchangedIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        serviceName: "AI provider quota",
+        externalRef: participantRunId,
+      },
+    });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("classifies review recovery from the active participant run instead of a newer assignee run", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: managerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    const participantRunId = randomUUID();
+    const assigneeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([{
+      id: participantRunId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "review process exited unexpectedly",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    }, {
+      id: assigneeRunId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "You've hit your usage limit. Try again at 11:00 PM (UTC)",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:02:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:03:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    }]);
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored: 0, reviewParticipantRequeued: 1 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: coderId,
+      monitorNextCheckAt: null,
+    });
+    const [assigneeRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, assigneeRunId));
+    expect(assigneeRun?.errorCode).toBe("adapter_failed");
+    expect(enqueueWakeup).toHaveBeenCalledWith(managerId, expect.objectContaining({
+      reason: "execution_review_participant_recovery",
+      payload: expect.objectContaining({ issueId: sourceIssueId, retryOfRunId: participantRunId }),
+    }));
+  });
+
+  it("blocks a cross-agent review participant with incomplete configuration", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const stageId = randomUUID();
+    await db.update(issues).set({
+      status: "in_review",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: managerId, userId: null },
+        returnAssignee: { type: "agent", agentId: coderId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "model_not_found: requested review model does not exist",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() } as never));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ escalated: 1, reviewParticipantRequeued: 0 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: coderId,
+    });
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun?.errorCode).toBe("configuration_incomplete");
+    const [action] = await db.select().from(issueRecoveryActions);
+    expect(action).toMatchObject({
+      sourceIssueId,
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      cause: "configuration_incomplete",
+      recoveryIssueId: null,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("uses the default quota backoff when the provider does not state a reset time", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.providerQuotaMonitored).toBe(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+      monitorNotes: "Provider usage quota reached; retry the original assignee after the default recovery backoff.",
+    });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+  });
+
+  it("classifies model lookup failures as configuration incomplete without waking a recovery owner", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "model_not_found: requested model does not exist",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ escalated: 1, skipped: 0 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue?.status).toBe("blocked");
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun?.errorCode).toBe("configuration_incomplete");
+    const [action] = await db.select().from(issueRecoveryActions);
+    expect(action).toMatchObject({
+      sourceIssueId,
+      cause: "configuration_incomplete",
+      recoveryIssueId: null,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not classify stale configuration failures from a non-assignee run", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "model_not_found: previous assignee model does not exist",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ escalated: 0, skipped: 1 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+    });
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun?.errorCode).toBe("adapter_failed");
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
@@ -535,13 +1271,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: secondLatestRun.id });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[1]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      strandedRunId: secondLatestRun.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("deduplicates workspace-incoherence recovery actions by the typed workspace fingerprint", async () => {
@@ -594,6 +1324,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       comment: "Workspace failed validation.",
       recoveryCause: "workspace_validation_failed",
     });
+    // Prove dedupe uses the structured recovery-action reference rather than
+    // depending only on the legacy body marker.
+    await db
+      .update(issueComments)
+      .set({ body: "Workspace recovery was already escalated." })
+      .where(eq(issueComments.issueId, sourceIssue.id));
     await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
@@ -629,13 +1365,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       }),
       nextAction: expect.stringContaining("git worktree branch incoherence"),
       wakePolicy: expect.objectContaining({
-        type: "manual_repair_required",
+        type: "board_escalation",
         reason: "workspace_validation_failed",
+        preservesSourceAssignee: true,
       }),
     });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
-    expect(comments.filter((comment) => comment.body.includes(`Recovery action: \`${actionRows[0]?.id}\``))).toHaveLength(1);
+    const escalationComments = comments.filter((comment) =>
+      noticeMetadataReferencesRecoveryAction(comment.metadata, actionRows[0]!.id),
+    );
+    expect(escalationComments).toHaveLength(1);
+    expect(escalationComments[0]?.presentation).toMatchObject({
+      kind: "system_notice",
+      tone: "danger",
+      title: "Workspace validation failed",
+    });
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
@@ -701,7 +1446,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Recovery action:");
+    // Dedupe for structured notices is metadata-based: the short body no longer
+    // carries the `Recovery action: \`id\`` marker line.
+    expect(comments[0]?.body).not.toContain("Recovery action:");
+    expect(noticeMetadataReferencesRecoveryAction(comments[0]?.metadata, actionRows[0]!.id)).toBe(true);
+    expect(comments[0]?.presentation).toMatchObject({ kind: "system_notice", tone: "danger" });
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
@@ -778,6 +1527,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(list.body.actions).toHaveLength(1);
   });
 
+  it("projects recovery action metadata into the structured wake payload", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "workspace_validation",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "workspace_validation_failed",
+      fingerprint: "workspace:wake-payload",
+      evidence: {
+        failureSummary: "Worktree branch does not match the pinned branch.",
+        routingFallbackReason: null,
+      },
+      nextAction: "Repair the worktree, then return the issue to the coder.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+    });
+
+    const payload = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      contextSnapshot: {
+        issueId: sourceIssueId,
+        wakeReason: "source_scoped_recovery_action",
+        recoveryActionId: action.id,
+        recoveryCause: action.cause,
+      },
+    });
+
+    expect(payload?.recovery).toEqual({
+      cause: "workspace_validation_failed",
+      failureSummary: "Worktree branch does not match the pinned branch.",
+      originalAssignee: { id: coderId, name: "Coder" },
+      attemptCount: 1,
+      maxAttempts: 3,
+      nextAction: "Repair the worktree, then return the issue to the coder.",
+      routingFallbackReason: null,
+    });
+  });
+
   it("resolves an active recovery action and removes it from active projections", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);
@@ -813,11 +1605,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(resolved.body.recoveryAction).toMatchObject({
       id: action.id,
       status: "resolved",
-      outcome: "restored",
+      outcome: "owner_completed",
       resolutionNote: "Operator confirmed the source issue is complete.",
     });
     expect(resolved.body.recoveryAction.resolvedAt).toBeTruthy();
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    expect(
+      await db
+        .select()
+        .from(issueInboxArchives)
+        .where(eq(issueInboxArchives.issueId, sourceIssueId)),
+    ).toHaveLength(1);
 
     const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
     expect(detail.body.activeRecoveryAction).toBeNull();
@@ -829,6 +1627,99 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(activityRows.map((row) => row.action)).toEqual(
       expect.arrayContaining(["issue.updated", "issue.recovery_action_resolved"]),
     );
+  });
+
+  it("hands restored work back to the recorded return owner and records the outcome", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: coderId })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "workspace_validation",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "workspace_validation_failed",
+      fingerprint: "workspace:fingerprint",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Repair the workspace and hand the issue back.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const enqueueRecoveryActionWakeup = vi.fn(async () => null);
+    const resolved = await request(createApp(undefined, {
+      recoveryActionEnqueueWakeup: enqueueRecoveryActionWakeup,
+    }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Workspace repaired.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "todo",
+      assigneeAgentId: coderId,
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "handed_back",
+    });
+    expect(enqueueRecoveryActionWakeup).toHaveBeenCalledWith(
+      coderId,
+      expect.objectContaining({
+        reason: "issue_recovery_action_restored",
+        payload: expect.objectContaining({ issueId: sourceIssueId, recoveryActionId: action.id }),
+      }),
+    );
+  });
+
+  it("does not enqueue a restored wake when todo status and assignee are unchanged", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "todo", assigneeAgentId: coderId })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "workspace_validation",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "workspace_validation_failed",
+      fingerprint: "workspace:already-restored",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Confirm the workspace remains healthy.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const enqueueRecoveryActionWakeup = vi.fn(async () => null);
+    await request(createApp(undefined, {
+      recoveryActionEnqueueWakeup: enqueueRecoveryActionWakeup,
+    }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Workspace was already restored.",
+      })
+      .expect(200);
+
+    expect(enqueueRecoveryActionWakeup).not.toHaveBeenCalled();
   });
 
   it("resolves an active recovery action by returning the source issue to todo", async () => {
@@ -1162,7 +2053,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("allows the named recovery owner to resolve a board-owned source recovery action", async () => {
+  it("keeps the named recovery owner from completing a board-owned source issue", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
@@ -1204,18 +2095,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         sourceIssueStatus: "done",
         resolutionNote: "Recovery owner verified the work was intentionally completed.",
       })
-      .expect(200);
+      .expect(403);
 
-    expect(resolved.body.issue).toMatchObject({
-      id: sourceIssueId,
-      status: "done",
-      activeRecoveryAction: null,
-    });
-    expect(resolved.body.recoveryAction).toMatchObject({
-      id: action.id,
-      status: "resolved",
-      outcome: "restored",
-    });
+    expect(resolved.body.details?.code).toBe("recovery_source_authority_required");
+    const [sourceAfter, actionAfter] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, sourceIssueId)).then((rows) => rows[0]),
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)).then((rows) => rows[0]),
+    ]);
+    expect(sourceAfter).toMatchObject({ status: "blocked", assigneeUserId: "board-user" });
+    expect(actionAfter).toMatchObject({ status: "active", outcome: null });
   });
 
   it("rejects blocked recovery resolution when the source issue has no first-class blockers", async () => {
@@ -1429,7 +2317,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         outcome: "restored",
         sourceIssueStatus: "done",
       })
-      .expect(403);
+      .expect(404);
 
     const [actionRow] = await db
       .select()

@@ -1,5 +1,16 @@
 export { execute, ensureCodexSkillsInjected } from "./execute.js";
 export {
+  resolveCodexAuthPrecedence,
+  CODEX_SANDBOX_AUTH_PRECEDENCE_WARNING,
+  CODEX_SANDBOX_AUTH_PRECEDENCE_WARNING_LOG_LINE,
+  CODEX_SANDBOX_AUTH_EXISTS_COMMAND,
+  type CodexAuthPrecedenceInput,
+  type CodexAuthPrecedenceResolution,
+  type CodexAuthPrecedenceWinner,
+} from "./auth-precedence.js";
+export * from "./acp.js";
+export { getConfigSchema } from "./config-schema.js";
+export {
   reconcileManagedCodexHome,
   isManagedCodexHomePath,
   evaluateCodexCredentialReadiness,
@@ -13,7 +24,25 @@ export {
 export { listCodexSkills, syncCodexSkills } from "./skills.js";
 export { testEnvironment } from "./test.js";
 export { assertCodexPermissionConfigIsFailClosed } from "./codex-args.js";
-export { parseCodexJsonl, isCodexTransientUpstreamError, isCodexUnknownSessionError } from "./parse.js";
+export {
+  runDeviceLogin,
+  CODEX_DEVICE_LOGIN_COMMAND,
+  type SandboxLoginDriver,
+  type DeviceLoginPromptSink,
+  type DeviceLoginOutcome,
+  type DeviceLoginResult,
+  type RunDeviceLoginOptions,
+} from "./device-login-runner.js";
+export { DEVICE_LOGIN_URL, parseDeviceLoginPrompt, type DeviceLoginPrompt } from "./device-login-parse.js";
+export {
+  promoteDeviceLoginCredential,
+  checkStagedCredentialReadiness,
+  DeviceLoginReadinessError,
+  type CredentialReadinessResult,
+  type PromoteDeviceLoginCredentialInput,
+  type PromoteDeviceLoginCredentialOutcome,
+} from "./adapter-auth-promotion.js";
+export { parseCodexJsonl, isCodexHarnessCrash, isCodexProviderQuotaError, isCodexTransientUpstreamError, isCodexUnknownSessionError } from "./parse.js";
 export {
   getQuotaWindows,
   readCodexAuthInfo,
@@ -26,6 +55,7 @@ export {
   codexHomeDir,
 } from "./quota.js";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
+import { sessionCodec as acpxSessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -36,7 +66,7 @@ export const sessionCodec: AdapterSessionCodec = {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
     const record = raw as Record<string, unknown>;
     const sessionId = readNonEmptyString(record.sessionId) ?? readNonEmptyString(record.session_id);
-    if (!sessionId) return null;
+    if (!sessionId) return acpxSessionCodec.deserialize(raw);
     const cwd =
       readNonEmptyString(record.cwd) ??
       readNonEmptyString(record.workdir) ??
@@ -55,7 +85,7 @@ export const sessionCodec: AdapterSessionCodec = {
   serialize(params: Record<string, unknown> | null) {
     if (!params) return null;
     const sessionId = readNonEmptyString(params.sessionId) ?? readNonEmptyString(params.session_id);
-    if (!sessionId) return null;
+    if (!sessionId) return acpxSessionCodec.serialize(params);
     const cwd =
       readNonEmptyString(params.cwd) ??
       readNonEmptyString(params.workdir) ??
@@ -73,6 +103,11 @@ export const sessionCodec: AdapterSessionCodec = {
   },
   getDisplayId(params: Record<string, unknown> | null) {
     if (!params) return null;
-    return readNonEmptyString(params.sessionId) ?? readNonEmptyString(params.session_id);
+    return (
+      readNonEmptyString(params.sessionId) ??
+      readNonEmptyString(params.session_id) ??
+      acpxSessionCodec.getDisplayId?.(params) ??
+      null
+    );
   },
 };

@@ -346,8 +346,13 @@ export function validateAgentLifecyclePatchTransition(input: {
   return { ok: true, mode: "pending_contract" };
 }
 
-function parseLifecycleIssues(error: { issues: Array<{ path: Array<string | number>; message: string }> }) {
-  return error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }));
+function parseLifecycleIssues(error: {
+  issues: ReadonlyArray<{ path: ReadonlyArray<PropertyKey>; message: string }>;
+}) {
+  return error.issues.map((issue) => ({
+    path: issue.path.map((segment) => String(segment)).join("."),
+    message: issue.message,
+  }));
 }
 
 function readPermissionPolicy(input: AgentLifecycleFingerprintInput, now: Date) {

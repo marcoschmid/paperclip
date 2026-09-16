@@ -46,7 +46,8 @@ const sharedOpts = {
 };
 
 export const logger = pino({
-  level: "debug",
+  level: process.env.PAPERCLIP_LOG_LEVEL?.trim()
+    || (process.env.NODE_ENV === "production" ? "info" : "debug"),
   hooks: {
     logMethod(inputArgs, method) {
       return Reflect.apply(method, this, sanitizeLogArguments(inputArgs));

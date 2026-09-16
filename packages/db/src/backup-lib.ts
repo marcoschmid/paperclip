@@ -113,7 +113,13 @@ function isoWeekKey(date: Date): string {
 }
 
 function monthKey(date: Date): string {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function monthlyRetentionCutoff(nowMs: number, monthlyMonths: number): number {
+  const months = Math.max(1, monthlyMonths);
+  const now = new Date(nowMs);
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - months, 1);
 }
 
 /**
@@ -129,7 +135,7 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   const now = Date.now();
   const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
   const weeklyCutoff = now - Math.max(1, retention.weeklyWeeks) * 7 * 24 * 60 * 60 * 1000;
-  const monthlyCutoff = now - Math.max(1, retention.monthlyMonths) * 30 * 24 * 60 * 60 * 1000;
+  const monthlyCutoff = monthlyRetentionCutoff(now, retention.monthlyMonths);
 
   type BackupEntry = { name: string; fullPath: string; mtimeMs: number };
   const entries: BackupEntry[] = [];
@@ -630,6 +636,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("BEGIN;");
     emitStatement("SET LOCAL session_replication_role = replica;");
     emitStatement("SET LOCAL client_min_messages = warning;");
+    emitStatement("SET LOCAL check_function_bodies = false;");
     emit("");
 
     const allTables = await sql<TableDefinition[]>`
@@ -848,7 +855,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    // Foreign keys (after all tables and referenced unique constraints are created)
+    // Collect foreign keys now. Emit them after routines and standalone indexes
+    // because PostgreSQL permits a non-constraint unique index to be the target
+    // of a foreign key.
     const allForeignKeys = await sql<{
       constraint_name: string;
       source_schema: string;
@@ -888,14 +897,29 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         && includedTableNames.has(tableKey(fk.target_schema, fk.target_table)),
     );
 
-    if (fks.length > 0) {
-      emit("-- Foreign keys");
-      for (const fk of fks) {
-        const srcCols = fk.source_columns.map((c) => `"${c}"`).join(", ");
-        const tgtCols = fk.target_columns.map((c) => `"${c}"`).join(", ");
-        emitStatement(
-          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT "${fk.constraint_name}" FOREIGN KEY (${srcCols}) REFERENCES ${quoteQualifiedName(fk.target_schema, fk.target_table)} (${tgtCols}) ON UPDATE ${fk.update_rule} ON DELETE ${fk.delete_rule};`,
-        );
+    // JavaScript backups are used when a worktree seed filters or transforms
+    // table data. Preserve user-defined routines before indexes because an
+    // expression index may depend on a user-defined function.
+    const routines = await sql<{ definition: string }[]>`
+      SELECT pg_get_functiondef(p.oid) AS definition
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
+        AND p.prokind IN ('f', 'p')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pg_depend d
+          WHERE d.classid = 'pg_proc'::regclass
+            AND d.objid = p.oid
+            AND d.deptype = 'e'
+        )
+      ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)
+    `;
+    if (routines.length > 0) {
+      emit("-- Functions and procedures");
+      for (const routine of routines) {
+        const definition = routine.definition.trimEnd();
+        emitStatement(definition.endsWith(";") ? definition : `${definition};`);
       }
       emit("");
     }
@@ -918,6 +942,18 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("-- Indexes");
       for (const idx of indexes) {
         emitStatement(`${idx.indexdef};`);
+      }
+      emit("");
+    }
+
+    if (fks.length > 0) {
+      emit("-- Foreign keys");
+      for (const fk of fks) {
+        const srcCols = fk.source_columns.map((c) => `"${c}"`).join(", ");
+        const tgtCols = fk.target_columns.map((c) => `"${c}"`).join(", ");
+        emitStatement(
+          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT "${fk.constraint_name}" FOREIGN KEY (${srcCols}) REFERENCES ${quoteQualifiedName(fk.target_schema, fk.target_table)} (${tgtCols}) ON UPDATE ${fk.update_rule} ON DELETE ${fk.delete_rule};`,
+        );
       }
       emit("");
     }
@@ -977,6 +1013,33 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
+    const allTriggers = await sql<{
+      schema_name: string;
+      tablename: string;
+      definition: string;
+    }[]>`
+      SELECT
+        n.nspname AS schema_name,
+        c.relname AS tablename,
+        pg_get_triggerdef(t.oid, true) AS definition
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE NOT t.tgisinternal
+        AND ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
+      ORDER BY n.nspname, c.relname, t.tgname
+    `;
+    const triggers = allTriggers.filter((entry) => (
+      includedTableNames.has(tableKey(entry.schema_name, entry.tablename))
+    ));
+    if (triggers.length > 0) {
+      emit("-- Triggers");
+      for (const trigger of triggers) {
+        emitStatement(`${trigger.definition};`);
+      }
+      emit("");
+    }
+
     // Sequence values
     if (sequences.length > 0) {
       emit("-- Sequence values");
@@ -1031,10 +1094,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
 export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<void> {
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
+  let psqlRestoreError: unknown = null;
   try {
     await restoreWithPsql(opts, connectTimeout);
     return;
   } catch (error) {
+    psqlRestoreError = error;
     if (!(await hasStatementBreakpoints(opts.backupFile))) {
       throw new Error(
         `Failed to restore ${basename(opts.backupFile)} with psql: ${sanitizeRestoreErrorMessage(error)}`,
@@ -1056,8 +1121,9 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
         .map((line) => line.trim())
         .find((line) => line.length > 0 && !line.startsWith("--"))
       : null;
+    const psqlMessage = psqlRestoreError === null ? "" : `; psql error: ${sanitizeRestoreErrorMessage(psqlRestoreError)}`;
     throw new Error(
-      `Failed to restore ${basename(opts.backupFile)}: ${sanitizeRestoreErrorMessage(error)}${statementPreview ? ` [statement: ${statementPreview.slice(0, 120)}]` : ""}`,
+      `Failed to restore ${basename(opts.backupFile)}: ${sanitizeRestoreErrorMessage(error)}${statementPreview ? ` [statement: ${statementPreview.slice(0, 120)}]` : ""}${psqlMessage}`,
     );
   } finally {
     await sql.end();

@@ -28,6 +28,10 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   listCompanyIds: vi.fn(),
 }));
 
+const mockRunSecretRedactionRegistry = vi.hoisted(() => ({
+  redactForRun: vi.fn(async (_companyId: string, _runId: string, value: unknown) => value),
+}));
+
 const routeAgentId = "11111111-1111-4111-8111-111111111111";
 
 function registerModuleMocks() {
@@ -49,6 +53,10 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
   }));
 
+  vi.doMock("../services/run-secret-redaction.js", () => ({
+    createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
+  }));
+
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
     agentRetirementService: () => ({}),
@@ -64,6 +72,7 @@ function registerModuleMocks() {
       hasPermission: vi.fn(async () => true),
     }),
     approvalService: () => ({}),
+    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
     companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
     budgetService: () => ({}),
     heartbeatService: () => mockHeartbeatService,
@@ -315,7 +324,7 @@ describe("agent live run routes", () => {
   it("includes ephemeral current status fields on active run polling", async () => {
     mockHeartbeatService.decorateActiveRunStatus.mockImplementation((run) => ({
       ...run,
-      currentStatusMessage: "Syncing workspace to sandbox",
+      currentStatusMessage: "Syncing workspace to environment",
       currentStatusUpdatedAt: new Date("2026-04-10T09:30:05.000Z"),
       currentToolName: "bash",
       lastAssistantSnippet: "Inspecting files",
@@ -333,7 +342,7 @@ describe("agent live run routes", () => {
       { companyId: "company-1", issueId: "issue-1" },
     );
     expect(res.body).toMatchObject({
-      currentStatusMessage: "Syncing workspace to sandbox",
+      currentStatusMessage: "Syncing workspace to environment",
       currentStatusUpdatedAt: "2026-04-10T09:30:05.000Z",
       currentToolName: "bash",
       lastAssistantSnippet: "Inspecting files",

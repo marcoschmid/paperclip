@@ -16,6 +16,7 @@ import {
   issueExecutionDecisions,
   issueReadStates,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -55,6 +56,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await db.delete(companySkills);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
+    await db.delete(routines);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -268,33 +270,22 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
   });
 
-  it("blocks physical company deletion while any protected retirement source exists", async () => {
-    await db.insert(companies).values({
-      id: PROTECTED_COMPANY_ID,
-      name: "Casa Marco",
-      issuePrefix: "CAS",
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: PROTECTED_SOURCE_ID,
-      companyId: PROTECTED_COMPANY_ID,
-      name: "Calendar und Events Butler",
-      role: "general",
-      status: "paused",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
+  it("removes routines before deleting company agents", async () => {
+    const { agentId, companyId } = await seedFixture();
+    const routineId = randomUUID();
+
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Daily cleanup",
+      assigneeAgentId: agentId,
     });
 
-    await expect(companyService(db).remove(PROTECTED_COMPANY_ID)).rejects.toMatchObject({
-      status: 409,
-      details: {
-        code: "retirement_company_delete_forbidden",
-        protectedSourceIds: [PROTECTED_SOURCE_ID],
-      },
-    });
-    await expect(db.select().from(companies).where(eq(companies.id, PROTECTED_COMPANY_ID))).resolves.toHaveLength(1);
-    await expect(db.select().from(agents).where(eq(agents.id, PROTECTED_SOURCE_ID))).resolves.toHaveLength(1);
+    const removed = await companyService(db).remove(companyId);
+
+    expect(removed?.id).toBe(companyId);
+    await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
+    await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
   });
 });

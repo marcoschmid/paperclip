@@ -2,8 +2,13 @@ import { IncomingMessage, ServerResponse } from "node:http";
 import { redactCommandText } from "@paperclipai/adapter-utils";
 
 const SECRET_FIELD_NAME_PATTERN =
-  String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
+  String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]*`;
 
+// Authorization reasons are policy decision codes, not credentials. They must
+// remain visible in audit receipts even though the field name contains
+// "authorization". JWT-shaped values are still caught by the value guard below.
+const AUDIT_REASON_PAYLOAD_KEY_RE = /^authorizationReason$/;
+const AUDIT_SURFACE_PAYLOAD_KEY_RE = /^surface$/;
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -259,7 +264,7 @@ function sanitizeRecordInternal(
       redacted[key] = value;
       continue;
     }
-    if (isSensitivePayloadKey(key, value)) {
+    if (isSensitivePayloadKey(key, value) && !AUDIT_REASON_PAYLOAD_KEY_RE.test(key)) {
       if (isSecretRefBinding(value)) {
         redacted[key] = sanitizeValue(value, state, depth + 1);
         continue;
@@ -275,7 +280,7 @@ function sanitizeRecordInternal(
       redacted[key] = REDACTED_EVENT_VALUE;
       continue;
     }
-    if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
+    if (typeof value === "string" && JWT_VALUE_RE.test(value) && !AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key)) {
       redacted[key] = REDACTED_EVENT_VALUE;
       continue;
     }

@@ -218,6 +218,28 @@ vi.mock("../routes/authz.js", async () => {
     }
   }
 
+  function hasCompanyAccess(req: Express.Request, expectedCompanyId: string): boolean {
+    if (req.actor.type === "none") return false;
+    if (req.actor.type === "agent") return req.actor.companyId === expectedCompanyId;
+    if (req.actor.source === "local_implicit") return true;
+    return (req.actor.companyIds ?? []).includes(expectedCompanyId);
+  }
+
+  async function getAccessibleResource<T extends { companyId: string }>(
+    req: Express.Request,
+    res: { status(code: number): { json(body: unknown): unknown } },
+    resource: T | null | undefined | Promise<T | null | undefined>,
+    notFoundMessage: string,
+  ): Promise<T | null> {
+    const resolved = await resource;
+    if (!resolved || !hasCompanyAccess(req, resolved.companyId)) {
+      res.status(404).json({ error: notFoundMessage });
+      return null;
+    }
+    assertCompanyAccess(req, resolved.companyId);
+    return resolved;
+  }
+
   function assertInstanceAdmin(req: Express.Request) {
     assertBoard(req);
     if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;
@@ -232,6 +254,7 @@ vi.mock("../routes/authz.js", async () => {
         actorId: req.actor.agentId ?? "unknown-agent",
         agentId: req.actor.agentId ?? null,
         runId: req.actor.runId ?? null,
+        agentApiKeyId: req.actor.keyId ?? null,
       };
     }
     return {
@@ -239,6 +262,7 @@ vi.mock("../routes/authz.js", async () => {
       actorId: req.actor.userId ?? "board",
       agentId: null,
       runId: req.actor.runId ?? null,
+      agentApiKeyId: null,
     };
   }
 
@@ -247,7 +271,9 @@ vi.mock("../routes/authz.js", async () => {
     assertBoard,
     assertCompanyAccess,
     assertInstanceAdmin,
+    getAccessibleResource,
     getActorInfo,
+    hasCompanyAccess,
   };
 });
 
@@ -256,6 +282,7 @@ vi.mock("../services/index.js", () => ({
   agentInstructionsService: () => mockAgentInstructionsService,
   accessService: () => mockAccessService,
   approvalService: () => mockApprovalService,
+  builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
   companySkillService: () => mockCompanySkillService,
   budgetService: () => mockBudgetService,
   heartbeatService: () => mockHeartbeatService,
@@ -483,8 +510,8 @@ describe.sequential("agent cross-tenant route authorization", () => {
       const app = await createApp(crossTenantActor);
       const res = await deniedCase.request(app);
 
-      expect(res.status, `${deniedCase.label}: ${JSON.stringify(res.body)}`).toBe(403);
-      expect(res.body.error).toContain("User does not have access to this company");
+      expect(res.status, `${deniedCase.label}: ${JSON.stringify(res.body)}`).toBe(404);
+      expect(res.body.error).toBe("Agent not found");
       expect(mockAgentService.getById).toHaveBeenCalledWith(agentId);
       for (const mock of deniedCase.untouched) {
         expect(mock).not.toHaveBeenCalled();
@@ -528,171 +555,15 @@ describe.sequential("agent cross-tenant route authorization", () => {
     expect(mockAgentService.clearError).not.toHaveBeenCalled();
   });
 
-  it("keeps retirement preflight and cleanup board-only and company-scoped", async () => {
-    const agentApp = await createApp({
-      type: "agent",
-      agentId,
-      companyId,
-      runId: "run-1",
+  it("preserves board resume access", async () => {
+    const pausedAgent = { ...baseAgent, status: "paused", pauseReason: "manual", pausedAt: new Date() };
+    mockAgentService.getById.mockResolvedValue(pausedAgent);
+    mockAgentService.resume.mockResolvedValue({
+      ...pausedAgent,
+      status: "idle",
+      pauseReason: null,
+      pausedAt: null,
     });
-    const agentResponse = await requestApp(agentApp, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${agentId}/retirement-preflight`).send({}),
-    );
-    expect(agentResponse.status).toBe(403);
-    expect(mockAgentRetirementService.preflight).not.toHaveBeenCalled();
-
-    const crossTenantApp = await createApp({
-      type: "board",
-      userId: "board-user",
-      companyIds: [],
-      source: "session",
-      isInstanceAdmin: false,
-    });
-    const crossTenantResponse = await requestApp(crossTenantApp, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${agentId}/retirement-cleanup`).send({}),
-    );
-    expect(crossTenantResponse.status).toBe(403);
-    expect(mockAgentRetirementService.cleanup).not.toHaveBeenCalled();
-  });
-
-  it("requires retirement authorization before terminating an exact allowlist source", async () => {
-    mockAgentService.getById.mockResolvedValue({
-      ...baseAgent,
-      id: retirementSourceId,
-      companyId: retirementCompanyId,
-      name: "Calendar und Events Butler",
-    });
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      companyIds: [retirementCompanyId],
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
-
-    const res = await requestApp(app, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${retirementSourceId}/terminate`).send({}),
-    );
-
-    expect(res.status).toBe(400);
-    expect(mockAgentRetirementService.terminateAuthorized).not.toHaveBeenCalled();
-    expect(mockAgentService.terminate).not.toHaveBeenCalled();
-  });
-
-  it("delegates an allowlisted termination to the receipt gate before lifecycle mutation", async () => {
-    const { conflict } = await import("../errors.js");
-    mockAgentService.getById.mockResolvedValue({
-      ...baseAgent,
-      id: retirementSourceId,
-      companyId: retirementCompanyId,
-      name: "Calendar und Events Butler",
-    });
-    mockAgentRetirementService.terminateAuthorized.mockRejectedValue(
-      conflict("Retirement final preflight is stale or blocked"),
-    );
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      companyIds: [retirementCompanyId],
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    });
-    const body = {
-      cleanupReceiptId: `v1:sha256:${"7".repeat(64)}`,
-      preflightFingerprint: `v1:sha256:${"8".repeat(64)}`,
-      expectedUpdatedAt: "2026-07-13T10:00:00.000Z",
-      humanGate: retirementEvidence().humanGate,
-      planClaimReceiptId: `v1:sha256:${"9".repeat(64)}`,
-      executionClaimReceiptId: `v1:sha256:${"a".repeat(64)}`,
-    };
-
-    const res = await requestApp(app, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${retirementSourceId}/terminate`).send(body),
-    );
-
-    expect(res.status).toBe(409);
-    expect(mockAgentRetirementService.terminateAuthorized).toHaveBeenCalledWith(
-      retirementSourceId,
-      body,
-      { actorUserId: "board-user" },
-    );
-    expect(mockAgentService.terminate).not.toHaveBeenCalled();
-  });
-
-  it("returns the normalized API agent after an atomic allowlisted termination", async () => {
-    const existingAgent = {
-      ...baseAgent,
-      id: retirementSourceId,
-      companyId: retirementCompanyId,
-      name: "Calendar und Events Butler",
-      status: "paused",
-    };
-    const normalizedTerminatedAgent = {
-      ...existingAgent,
-      urlKey: "calendar-und-events-butler",
-      status: "terminated",
-      orgChainHealth: {
-        status: "healthy",
-        reason: null,
-        repairGuidance: null,
-      },
-    };
-    const { urlKey: _urlKey, ...rawTerminatedAgent } = normalizedTerminatedAgent;
-    const { orgChainHealth: _orgChainHealth, ...rawDbTerminatedAgent } = rawTerminatedAgent;
-    mockAgentService.getById
-      .mockResolvedValueOnce(existingAgent)
-      .mockResolvedValueOnce(normalizedTerminatedAgent);
-    mockAgentRetirementService.terminateAuthorized.mockResolvedValue({
-      agent: rawDbTerminatedAgent,
-      receipt: {},
-    });
-    const db = {
-      select: vi.fn(() => ({
-        from: vi.fn(() => ({
-          where: vi.fn(async () => [{
-            id: retirementSourceId,
-            companyId: retirementCompanyId,
-            name: "Calendar und Events Butler",
-            reportsTo: null,
-            status: "terminated",
-          }]),
-        })),
-      })),
-    };
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      companyIds: [retirementCompanyId],
-      source: "local_implicit",
-      isInstanceAdmin: true,
-    }, db);
-    const body = {
-      cleanupReceiptId: `v1:sha256:${"7".repeat(64)}`,
-      preflightFingerprint: `v1:sha256:${"8".repeat(64)}`,
-      expectedUpdatedAt: "2026-07-13T10:00:00.000Z",
-      humanGate: retirementEvidence().humanGate,
-      planClaimReceiptId: `v1:sha256:${"9".repeat(64)}`,
-      executionClaimReceiptId: `v1:sha256:${"a".repeat(64)}`,
-    };
-
-    const res = await requestApp(app, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${retirementSourceId}/terminate`).send(body),
-    );
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toMatchObject({
-      id: retirementSourceId,
-      status: "terminated",
-      urlKey: "calendar-und-events-butler",
-      orgChainHealth: { status: "healthy" },
-    });
-    expect(mockAgentRetirementService.terminateAuthorized).toHaveBeenCalledTimes(1);
-    expect(mockAgentService.getById).toHaveBeenCalledTimes(2);
-    expect(mockAgentService.getById).toHaveBeenLastCalledWith(retirementSourceId);
-    expect(mockAgentService.terminate).not.toHaveBeenCalled();
-  });
-
-  it("delegates validated retirement evidence with the real board actor", async () => {
     const app = await createApp({
       type: "board",
       userId: "board-user",
@@ -700,97 +571,202 @@ describe.sequential("agent cross-tenant route authorization", () => {
       source: "local_implicit",
       isInstanceAdmin: true,
     });
-    const evidence = retirementEvidence();
 
-    const preflight = await requestApp(app, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${agentId}/retirement-preflight`).send(evidence),
-    );
-    expect(preflight.status).toBe(200);
-    expect(mockAgentRetirementService.preflight).toHaveBeenCalledWith(
-      agentId,
-      evidence,
-      { actorUserId: "board-user" },
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}),
     );
 
-    const cleanupInput = {
-      evidence,
-      planClaimReceiptId: `v1:sha256:${"9".repeat(64)}`,
-      executionClaimReceiptId: `v1:sha256:${"a".repeat(64)}`,
-      preflightFingerprint: `v1:sha256:${"6".repeat(64)}`,
-    };
-    const cleanup = await requestApp(app, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${agentId}/retirement-cleanup`).send(cleanupInput),
-    );
-    expect(cleanup.status).toBe(200);
-    expect(mockAgentRetirementService.cleanup).toHaveBeenCalledWith(
-      agentId,
-      cleanupInput,
-      { actorUserId: "board-user" },
-    );
+    expect(res.status).toBe(200);
+    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      agentId: null,
+      runId: null,
+      agentApiKeyId: null,
+      action: "agent.resumed",
+      entityType: "agent",
+      entityId: agentId,
+    }));
   });
 
-  it("forbids physical deletion for an exact retirement source", async () => {
-    mockAgentService.getById.mockResolvedValue({
-      ...baseAgent,
-      id: retirementSourceId,
-      companyId: retirementCompanyId,
-      name: "Calendar und Events Butler",
+  it("allows a same-company agent with a direct agents:configure grant to resume", async () => {
+    mockAccessService.decide.mockResolvedValue({
+      allowed: true,
+      action: "agent_config:update",
+      reason: "allow_direct_change",
+      explanation: "Allowed by direct configuration grant.",
+      grant: { permissionKey: "agents:configure" },
     });
     const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      companyIds: [retirementCompanyId],
-      source: "local_implicit",
-      isInstanceAdmin: true,
+      type: "agent",
+      agentId: "44444444-4444-4444-8444-444444444444",
+      companyId,
+      runId: "55555555-5555-4555-8555-555555555555",
+      keyId: "66666666-6666-4666-8666-666666666666",
+      source: "agent_key",
     });
 
     const res = await requestApp(app, (baseUrl) =>
-      request(baseUrl).delete(`/api/agents/${retirementSourceId}`),
+      request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "agent_config:update",
+      resource: { type: "agent", companyId, agentId },
+      scope: { requiresChangeGrant: true },
+    }));
+    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+  });
+
+  it.each([
+    ["an ungranted peer", "44444444-4444-4444-8444-444444444444"],
+    ["an ungranted self", agentId],
+  ])("denies resume for %s", async (_label, actorAgentId) => {
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      action: "agent_config:update",
+      reason: "deny_no_grant",
+      explanation: "No direct agent configuration grant.",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: actorAgentId,
+      companyId,
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({
+      error: "No direct agent configuration grant.",
+      details: { reason: "deny_no_grant" },
+    });
+    expect(mockAgentService.resume).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("denies resume when the agent only has agents:suggest-changes", async () => {
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      action: "agent_config:update",
+      reason: "deny_missing_consent",
+      explanation: "Accepted consent is required for this suggested change.",
+      grant: { permissionKey: "agents:suggest-changes" },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: "44444444-4444-4444-8444-444444444444",
+      companyId,
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.body.details).toEqual({ reason: "deny_missing_consent" });
+    expect(mockAgentService.resume).not.toHaveBeenCalled();
+  });
+
+  it("does not disclose a cross-company resume target", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "44444444-4444-4444-8444-444444444444",
+      companyId: "77777777-7777-4777-8777-777777777777",
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}),
+    );
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Agent not found");
+    expect(mockAccessService.decide).not.toHaveBeenCalled();
+    expect(mockAgentService.resume).not.toHaveBeenCalled();
+  });
+
+  it("keeps the invalid-org-chain guard for granted agent resume", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      status: "paused",
+      orgChainHealth: {
+        status: "invalid_org_chain",
+        reason: "missing_manager",
+        repairGuidance: "Repair the reporting chain first.",
+      },
+    });
+    mockAccessService.decide.mockResolvedValue({
+      allowed: true,
+      action: "agent_config:update",
+      reason: "allow_direct_change",
+      explanation: "Allowed by direct configuration grant.",
+      grant: { permissionKey: "agents:configure" },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: "44444444-4444-4444-8444-444444444444",
+      companyId,
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}),
     );
 
     expect(res.status).toBe(409);
-    expect(res.body.details?.code).toBe("retirement_physical_delete_forbidden");
-    expect(mockAgentService.remove).not.toHaveBeenCalled();
+    expect(res.body.error).toBe("Repair the reporting chain first.");
+    expect(mockAgentService.resume).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("keeps mixed-case retirement source pause, terminate, and delete routes gated", async () => {
-    const mixedCaseId = retirementSourceId.toUpperCase();
-    mockAgentService.getById.mockResolvedValue({
-      ...baseAgent,
-      id: retirementSourceId,
-      companyId: retirementCompanyId,
-      name: "Calendar und Events Butler",
+  it("attributes agent resume activity to the acting agent, run, and API key", async () => {
+    const actorAgentId = "44444444-4444-4444-8444-444444444444";
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const actorKeyId = "66666666-6666-4666-8666-666666666666";
+    mockAccessService.decide.mockResolvedValue({
+      allowed: true,
+      action: "agent_config:update",
+      reason: "allow_direct_change",
+      explanation: "Allowed by direct configuration grant.",
+      grant: { permissionKey: "agents:configure" },
     });
     const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      companyIds: [retirementCompanyId],
-      source: "local_implicit",
-      isInstanceAdmin: true,
+      type: "agent",
+      agentId: actorAgentId,
+      companyId,
+      runId,
+      keyId: actorKeyId,
+      source: "agent_key",
     });
 
-    const pause = await requestApp(app, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${mixedCaseId}/pause`).send({}),
-    );
-    const terminate = await requestApp(app, (baseUrl) =>
-      request(baseUrl).post(`/api/agents/${mixedCaseId}/terminate`).send({}),
-    );
-    const remove = await requestApp(app, (baseUrl) =>
-      request(baseUrl).delete(`/api/agents/${mixedCaseId}`),
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}),
     );
 
-    expect(pause.status).toBe(409);
-    expect(pause.body.details).toMatchObject({
-      code: "retirement_gated_termination_required",
-      sourceAgentId: mixedCaseId,
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), {
+      companyId,
+      actorType: "agent",
+      actorId: actorAgentId,
+      agentId: actorAgentId,
+      runId,
+      agentApiKeyId: actorKeyId,
+      action: "agent.resumed",
+      entityType: "agent",
+      entityId: agentId,
     });
-    expect(terminate.status).toBe(400);
-    expect(terminate.body.details?.code).toBe("retirement_termination_invalid");
-    expect(remove.status).toBe(409);
-    expect(remove.body.details?.code).toBe("retirement_physical_delete_forbidden");
-    expect(mockAgentService.pause).not.toHaveBeenCalled();
-    expect(mockAgentService.terminate).not.toHaveBeenCalled();
-    expect(mockAgentService.remove).not.toHaveBeenCalled();
   });
 
   it("clears error agents and records a distinct audit action", async () => {

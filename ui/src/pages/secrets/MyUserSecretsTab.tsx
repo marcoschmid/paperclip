@@ -10,6 +10,7 @@ import { queryKeys } from "../../lib/queryKeys";
 import { cn } from "../../lib/utils";
 import { useToastActions } from "../../context/ToastContext";
 import { SetMyUserSecretDialog } from "./SetMyUserSecretDialog";
+import { SecretPathName } from "./SecretPathName";
 import {
   myValueLabel,
   myValueState,
@@ -52,7 +53,7 @@ export function MyUserSecretsTab({ companyId }: { companyId: string }) {
   ).length;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+    <div className="flex flex-col gap-3">
       <div className="flex items-start gap-2 rounded-md border border-violet-500/30 bg-violet-500/5 px-4 py-3 text-xs text-violet-800 dark:text-violet-200">
         <UserRound className="h-4 w-4 mt-0.5 shrink-0" />
         <p>
@@ -68,7 +69,7 @@ export function MyUserSecretsTab({ companyId }: { companyId: string }) {
         </p>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div>
         {mySecretsQuery.isError ? (
           <div className="flex items-center gap-2 py-4 text-sm text-destructive">
             <AlertCircle className="h-4 w-4" /> Failed to load your secrets:{" "}
@@ -80,7 +81,7 @@ export function MyUserSecretsTab({ companyId }: { companyId: string }) {
         ) : entries.length === 0 && !mySecretsQuery.isPending ? (
           <EmptyState
             icon={KeyRound}
-            message="No user secrets are defined for this company yet. An admin defines which credentials each member supplies."
+            message="No user secrets are defined for this organization yet. An admin defines which credentials each member supplies."
           />
         ) : (
           <ul className="space-y-2">
@@ -136,12 +137,12 @@ function MyUserSecretRow({
     >
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="font-medium text-foreground">{definition.name}</span>
-          <code className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+          <SecretPathName name={definition.name} />
+          <code className="rounded bg-muted px-1.5 py-0.5 text-(length:--text-micro) text-muted-foreground">
             {definition.key}
           </code>
           {disabledDefinition ? (
-            <Badge variant="outline" className="text-[10px]">
+            <Badge variant="outline" className="text-(length:--text-nano)">
               {definition.status}
             </Badge>
           ) : null}
@@ -150,12 +151,12 @@ function MyUserSecretRow({
           <p className="mt-1 text-xs text-muted-foreground">{definition.description}</p>
         ) : null}
         {definition.usageGuidance ? (
-          <p className="mt-1 text-[11px] text-muted-foreground/80">{definition.usageGuidance}</p>
+          <p className="mt-1 text-(length:--text-micro) text-muted-foreground/80">{definition.usageGuidance}</p>
         ) : null}
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
-        <Badge variant="outline" className={cn("text-[11px]", myValueTone(state))}>
+        <Badge variant="outline" className={cn("text-(length:--text-micro)", myValueTone(state))}>
           {myValueLabel(state)}
         </Badge>
         {!disabledDefinition ? (

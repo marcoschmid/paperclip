@@ -1,5 +1,4 @@
 import type {
-  AdapterModel,
   AdapterModelProfileDefinition,
   AdapterRuntimeCommandSpec,
   ServerAdapterModule,
@@ -10,18 +9,7 @@ import {
   buildSandboxNpmInstallCommand,
   getAdapterSessionManagement,
 } from "@paperclipai/adapter-utils";
-import {
-  execute as acpxExecute,
-  testEnvironment as acpxTestEnvironment,
-  sessionCodec as acpxSessionCodec,
-  getConfigSchema as getAcpxConfigSchema,
-  listAcpxSkills,
-  syncAcpxSkills,
-} from "@paperclipai/adapter-acpx-local/server";
-import {
-  agentConfigurationDoc as acpxAgentConfigurationDoc,
-  models as acpxModels,
-} from "@paperclipai/adapter-acpx-local";
+import type { AdapterLoginCapability } from "@paperclipai/adapter-utils";
 import {
   execute as claudeExecute,
   listClaudeSkills,
@@ -31,6 +19,10 @@ import {
   testEnvironment as claudeTestEnvironment,
   sessionCodec as claudeSessionCodec,
   getQuotaWindows as claudeGetQuotaWindows,
+  getConfigSchema as getClaudeConfigSchema,
+  CLAUDE_SETUP_TOKEN_COMMAND,
+  parseSetupTokenPrompt,
+  parseSetupTokenCredential,
 } from "@paperclipai/adapter-claude-local/server";
 import {
   agentConfigurationDoc as claudeAgentConfigurationDoc,
@@ -44,6 +36,9 @@ import {
   testEnvironment as codexTestEnvironment,
   sessionCodec as codexSessionCodec,
   getQuotaWindows as codexGetQuotaWindows,
+  getConfigSchema as getCodexConfigSchema,
+  CODEX_DEVICE_LOGIN_COMMAND,
+  parseDeviceLoginPrompt,
 } from "@paperclipai/adapter-codex-local/server";
 import {
   agentConfigurationDoc as codexAgentConfigurationDoc,
@@ -75,6 +70,7 @@ import {
   syncGeminiSkills,
   testEnvironment as geminiTestEnvironment,
   sessionCodec as geminiSessionCodec,
+  getConfigSchema as getGeminiConfigSchema,
 } from "@paperclipai/adapter-gemini-local/server";
 import {
   agentConfigurationDoc as geminiAgentConfigurationDoc,
@@ -92,6 +88,17 @@ import {
   agentConfigurationDoc as grokAgentConfigurationDoc,
   models as grokModels,
 } from "@paperclipai/adapter-grok-local";
+import {
+  execute as kimiExecute,
+  listKimiSkills,
+  syncKimiSkills,
+  testEnvironment as kimiTestEnvironment,
+  sessionCodec as kimiSessionCodec,
+} from "@paperclipai/adapter-kimi-local/server";
+import {
+  agentConfigurationDoc as kimiAgentConfigurationDoc,
+  models as kimiModels,
+} from "@paperclipai/adapter-kimi-local";
 import {
   createHermesGatewayServerAdapter,
   createHermesLocalServerAdapter,
@@ -176,42 +183,69 @@ function buildCursorRuntimeCommandSpec(config: Record<string, unknown>): Adapter
   };
 }
 
-function dedupeAdapterModels(models: AdapterModel[]): AdapterModel[] {
-  const seen = new Set<string>();
-  const result: AdapterModel[] = [];
-  for (const model of models) {
-    const id = model.id.trim();
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    result.push({ ...model, id });
-  }
-  return result;
-}
+const retiredAcpxMessage =
+  "The acpx_local adapter has been retired. Existing Claude and Codex ACPX agents should be migrated to claude_local or codex_local with adapterConfig.engine=\"acp\".";
 
-function prefixAdapterModelLabels(models: AdapterModel[], provider: "Claude" | "Codex"): AdapterModel[] {
-  const prefix = `${provider}: `;
-  return models.map((model) => ({
-    ...model,
-    label: model.label.startsWith(prefix) ? model.label : `${prefix}${model.label}`,
-  }));
-}
+const retiredAcpxAgentConfigurationDoc = `# acpx_local retired
 
-async function listAcpxModels(): Promise<AdapterModel[]> {
-  const [claude, codex] = await Promise.all([
-    listClaudeModels().catch(() => claudeModels),
-    listCodexModels().catch(() => codexModels),
-  ]);
-  return dedupeAdapterModels([
-    ...acpxModels,
-    ...prefixAdapterModelLabels(claude, "Claude"),
-    ...prefixAdapterModelLabels(codex, "Codex"),
-  ]);
-}
+Adapter: acpx_local
+
+The standalone ACPX adapter has been retired. Use:
+
+- claude_local with adapterConfig.engine="acp" for Claude ACP execution.
+- codex_local with adapterConfig.engine="acp" for Codex ACP execution.
+
+Paperclip keeps this tombstone registered so stale acpx_local rows fail clearly instead of falling back to the process adapter.
+`;
+
+// The Claude interactive login capability. Claude runs `claude setup-token` on a
+// real pseudo-terminal. The user pastes a browser code back into the flow. The
+// flow uses a fixed host-side timeout and records a stored session identifier on
+// success. The capability data holds no secret; the callbacks return runtime
+// values only.
+const claudeLoginCapability: AdapterLoginCapability = {
+  panelMode: "submitted_browser_code",
+  timeoutPolicy: "fixed",
+  getCommand: () => CLAUDE_SETUP_TOKEN_COMMAND,
+  parsePrompt: (output) => {
+    const prompt = parseSetupTokenPrompt(output);
+    return prompt ? { url: prompt.url } : null;
+  },
+  captureCredential: (output) => {
+    const token = parseSetupTokenCredential(output);
+    return token === null ? null : Buffer.from(token, "utf8");
+  },
+  completionClaim: "storedSessionId",
+};
+
+// The Codex interactive login capability. Codex runs `codex login --device-auth`
+// on a real pseudo-terminal, because a pipe emits no login prompt. The flow shows
+// a one-time code that the user enters in the browser. The caller sets the
+// host-side timeout. The device-login flow writes its credential inside the
+// sandbox, so the capability declares no terminal credential capture and no
+// completion claim.
+const codexLoginCapability: AdapterLoginCapability = {
+  panelMode: "displayed_code",
+  timeoutPolicy: "caller_bounded",
+  getCommand: () => CODEX_DEVICE_LOGIN_COMMAND,
+  parsePrompt: (output) => {
+    const prompt = parseDeviceLoginPrompt(output);
+    return prompt ? { url: prompt.url, code: prompt.code } : null;
+  },
+};
 
 const claudeLocalAdapter: ServerAdapterModule = {
   type: "claude_local",
   execute: stampClaudeAgentIdHeader(claudeExecute),
   testEnvironment: claudeTestEnvironment,
+  acp: {
+    agentId: "claude",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=24.11.0",
+      packages: ["@agentclientprotocol/claude-agent-acp"],
+    },
+  },
   listSkills: listClaudeSkills,
   syncSkills: syncClaudeSkills,
   sessionCodec: claudeSessionCodec,
@@ -227,34 +261,65 @@ const claudeLocalAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) =>
     buildNpmRuntimeCommandSpec(config, "claude", "@anthropic-ai/claude-code"),
   agentConfigurationDoc: claudeAgentConfigurationDoc,
+  getConfigSchema: getClaudeConfigSchema,
   getQuotaWindows: claudeGetQuotaWindows,
+  loginCapability: claudeLoginCapability,
 };
 
 const acpxLocalAdapter: ServerAdapterModule = {
   type: "acpx_local",
-  execute: acpxExecute,
-  testEnvironment: acpxTestEnvironment,
-  listSkills: listAcpxSkills,
-  syncSkills: syncAcpxSkills,
-  sessionCodec: acpxSessionCodec,
-  sessionManagement: getAdapterSessionManagement("acpx_local") ?? undefined,
-  models: dedupeAdapterModels([
-    ...prefixAdapterModelLabels(claudeModels, "Claude"),
-    ...prefixAdapterModelLabels(codexModels, "Codex"),
-  ]),
-  listModels: listAcpxModels,
-  supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: true,
-  instructionsPathKey: "instructionsFilePath",
+  async execute(ctx) {
+    await ctx.onLog("stderr", `${retiredAcpxMessage}\n`);
+    await ctx.onMeta?.({
+      adapterType: "acpx_local",
+      command: "acpx_local-retired",
+      commandNotes: [retiredAcpxMessage],
+    });
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: retiredAcpxMessage,
+      errorCode: "acpx_local_retired",
+      provider: "acpx",
+      summary: retiredAcpxMessage,
+    };
+  },
+  async testEnvironment() {
+    return {
+      adapterType: "acpx_local",
+      status: "fail",
+      testedAt: new Date().toISOString(),
+      checks: [
+        {
+          code: "acpx_local_retired",
+          level: "error",
+          message: retiredAcpxMessage,
+          hint: "Set the agent adapter to claude_local or codex_local and set adapterConfig.engine to acp.",
+        },
+      ],
+    };
+  },
+  models: [],
+  supportsLocalAgentJwt: false,
+  supportsInstructionsBundle: false,
   requiresMaterializedRuntimeSkills: false,
-  agentConfigurationDoc: acpxAgentConfigurationDoc,
-  getConfigSchema: getAcpxConfigSchema,
+  agentConfigurationDoc: retiredAcpxAgentConfigurationDoc,
+  getConfigSchema: () => ({ fields: [] }),
 };
 
 const codexLocalAdapter: ServerAdapterModule = {
   type: "codex_local",
   execute: codexExecute,
   testEnvironment: codexTestEnvironment,
+  acp: {
+    agentId: "codex",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=24.11.0",
+      packages: ["@agentclientprotocol/codex-acp"],
+    },
+  },
   listSkills: listCodexSkills,
   syncSkills: syncCodexSkills,
   sessionCodec: codexSessionCodec,
@@ -269,7 +334,55 @@ const codexLocalAdapter: ServerAdapterModule = {
   requiresMaterializedRuntimeSkills: false,
   getRuntimeCommandSpec: (config) => buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex"),
   agentConfigurationDoc: codexAgentConfigurationDoc,
+  getConfigSchema: getCodexConfigSchema,
   getQuotaWindows: codexGetQuotaWindows,
+  loginCapability: codexLoginCapability,
+};
+
+const paperclipRunnerAdapter: ServerAdapterModule = {
+  type: "paperclip_runner",
+  async execute(ctx) {
+    const message = "paperclip_runner requires the native runner coordinator";
+    await ctx.onLog("stderr", `${message}\n`);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: message,
+      errorCode: "paperclip_runner_coordinator_required",
+      provider: "codex",
+      summary: message,
+    };
+  },
+  async testEnvironment(context) {
+    const result = await codexTestEnvironment(context);
+    return { ...result, adapterType: "paperclip_runner" };
+  },
+  listSkills: listCodexSkills,
+  syncSkills: syncCodexSkills,
+  sessionCodec: codexSessionCodec,
+  models: codexModels,
+  listModels: listCodexModels,
+  refreshModels: refreshCodexModels,
+  supportsLocalAgentJwt: false,
+  supportsInstructionsBundle: false,
+  requiresMaterializedRuntimeSkills: false,
+  getRuntimeCommandSpec: (config) => buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex"),
+  agentConfigurationDoc:
+    "# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex through the Rust Paperclip runner and authenticated PRP transport.\n",
+  getConfigSchema: () => ({
+    fields: [
+      {
+        key: "provider",
+        label: "Provider",
+        type: "select",
+        default: "codex",
+        options: [{ value: "codex", label: "Codex" }],
+        hint: "Paperclip Runner currently supports only Codex app-server.",
+      },
+    ],
+  }),
+  loginCapability: codexLoginCapability,
 };
 
 const cursorLocalAdapter: ServerAdapterModule = {
@@ -310,6 +423,14 @@ const geminiLocalAdapter: ServerAdapterModule = {
   type: "gemini_local",
   execute: geminiExecute,
   testEnvironment: geminiTestEnvironment,
+  acp: {
+    agentId: "gemini",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=24.11.0",
+      packages: ["@google/gemini-cli"],
+    },
+  },
   listSkills: listGeminiSkills,
   syncSkills: syncGeminiSkills,
   sessionCodec: geminiSessionCodec,
@@ -323,6 +444,7 @@ const geminiLocalAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) =>
     buildNpmRuntimeCommandSpec(config, "gemini", "@google/gemini-cli"),
   agentConfigurationDoc: geminiAgentConfigurationDoc,
+  getConfigSchema: getGeminiConfigSchema,
 };
 
 const grokLocalAdapter: ServerAdapterModule = {
@@ -344,6 +466,32 @@ const grokLocalAdapter: ServerAdapterModule = {
     installCommand: null,
   }),
   agentConfigurationDoc: grokAgentConfigurationDoc,
+};
+
+const kimiLocalAdapter: ServerAdapterModule = {
+  type: "kimi_local",
+  execute: kimiExecute,
+  testEnvironment: kimiTestEnvironment,
+  acp: {
+    agentId: "kimi",
+    skillsMode: "ephemeral",
+    prerequisites: {
+      nodeRange: ">=20.0.0",
+      packages: ["@moonshot-ai/kimi-code"],
+    },
+  },
+  listSkills: listKimiSkills,
+  syncSkills: syncKimiSkills,
+  sessionCodec: kimiSessionCodec,
+  sessionManagement: getAdapterSessionManagement("kimi_local") ?? undefined,
+  models: kimiModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
+  requiresMaterializedRuntimeSkills: true,
+  getRuntimeCommandSpec: (config) =>
+    buildNpmRuntimeCommandSpec(config, "kimi", "@moonshot-ai/kimi-code"),
+  agentConfigurationDoc: kimiAgentConfigurationDoc,
 };
 
 const hermesGatewayAdapter = createHermesGatewayServerAdapter();
@@ -416,12 +564,14 @@ function registerBuiltInAdapters() {
     acpxLocalAdapter,
     claudeLocalAdapter,
     codexLocalAdapter,
+    paperclipRunnerAdapter,
     openCodeLocalAdapter,
     piLocalAdapter,
     cursorCloudAdapter,
     cursorLocalAdapter,
     geminiLocalAdapter,
     grokLocalAdapter,
+    kimiLocalAdapter,
     hermesGatewayAdapter,
     hermesLocalAdapter,
     openclawGatewayAdapter,

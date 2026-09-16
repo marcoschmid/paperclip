@@ -44,6 +44,8 @@ describe("routine validators", () => {
     });
 
     expect(parsed.triggers[0]?.publicId).toBe("routine_webhook_123");
+    expect(parsed.routine.activityGatePolicy).toBe("always");
+    expect(parsed.routine.activityGateScope).toBe("company");
   });
 
   it("rejects secret-bearing trigger fields in routine revision snapshots", () => {
@@ -86,16 +88,17 @@ describe("routine validators", () => {
     }).baseRevisionId).toBe(baseRevisionId);
   });
 
-  it("accepts optional trigger revision CAS while preserving legacy trigger patches", () => {
-    expect(updateRoutineTriggerSchema.parse({ enabled: false })).toEqual({ enabled: false });
-    expect(updateRoutineTriggerSchema.parse({
-      enabled: false,
-      baseRevisionId,
-    })).toEqual({ enabled: false, baseRevisionId });
-    expect(updateRoutineTriggerSchema.safeParse({
-      enabled: false,
-      baseRevisionId: "not-a-uuid",
-    }).success).toBe(false);
+  it("validates routine activity gate values", () => {
+    expect(updateRoutineSchema.parse({
+      activityGatePolicy: "require_external_activity",
+      activityGateScope: "project",
+    })).toMatchObject({
+      activityGatePolicy: "require_external_activity",
+      activityGateScope: "project",
+    });
+
+    expect(() => updateRoutineSchema.parse({ activityGatePolicy: "when_busy" })).toThrow();
+    expect(() => updateRoutineSchema.parse({ activityGateScope: "agent" })).toThrow();
   });
 
   it("accepts date variables with valid YYYY-MM-DD defaults", () => {

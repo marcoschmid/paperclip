@@ -67,6 +67,9 @@ vi.mock("../services/index.js", () => ({
   agentService: () => ({
     getById: vi.fn(),
   }),
+  companySkillService: () => ({
+    completeTestRunForIssue: vi.fn(async () => null),
+  }),
   executionWorkspaceService: () => ({}),
   goalService: () => ({
     getById: vi.fn(),
@@ -176,7 +179,6 @@ describe.sequential("execution environment route guards", () => {
     mockCompanyService.getById.mockReset();
     mockCompanyService.getById.mockResolvedValue({
       id: "company-1",
-      attachmentMaxBytes: 10 * 1024 * 1024,
     });
     mockEnvironmentService.getById.mockReset();
     mockIssueReferenceService.deleteDocumentSource.mockClear();

@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,6 +32,7 @@ describe("project and goal commands", () => {
     delete process.env.PAPERCLIP_API_URL;
     delete process.env.PAPERCLIP_COMPANY_ID;
     process.env.PAPERCLIP_CONTEXT = path.join(tmpdir(), `paperclip-project-goal-${randomUUID()}.json`);
+    process.env.PAPERCLIP_CONTEXT = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-project-goal-")), "context.json");
   });
 
   afterEach(() => {
@@ -39,6 +42,7 @@ describe("project and goal commands", () => {
     } else {
       process.env.PAPERCLIP_CONTEXT = ORIGINAL_PAPERCLIP_CONTEXT;
     }
+    delete process.env.PAPERCLIP_CONTEXT;
   });
 
   it("creates and updates projects with shared schemas", async () => {

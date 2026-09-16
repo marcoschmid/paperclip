@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -15,13 +18,17 @@ const {
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
   environmentCustomImagesServiceFactoryMock,
-  environmentRuntimeServiceFactoryMock,
-  environmentRuntimeServiceMock,
+  executionWorkspaceServiceFactoryMock,
+  executionWorkspaceServiceMock,
+  externalObjectsServiceMock,
+  externalObjectsServiceFactoryMock,
   feedbackExportServiceMock,
   feedbackServiceFactoryMock,
   fakeServer,
   heartbeatServiceFactoryMock,
   heartbeatServiceMock,
+  issueThreadInteractionServiceFactoryMock,
+  issueThreadInteractionServiceMock,
   loadConfigMock,
   reconcilePersistedRuntimeServicesOnStartupMock,
   resolveHeartbeatSchedulingSuppressionMock,
@@ -38,10 +45,20 @@ const {
     return app as never;
   });
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
-  const createDbMock = vi.fn(() => ({}) as never);
+  const createDbMock = vi.fn(() => ({
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({ where: vi.fn(async () => []) })),
+    })),
+  }) as never);
   const detectPortMock = vi.fn(async (port: number) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
+  const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
+    suppressed: false,
+    reason: null,
+  }));
   const heartbeatServiceMock = {
+    resolveSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
+    reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
@@ -61,24 +78,43 @@ const {
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
+  const issueThreadInteractionServiceMock = {
+    sweepSupersededPendingRequestConfirmations: vi.fn(async () => ({ expired: 0 })),
+    sweepMergedPullRequestConfirmations: vi.fn(async () => ({
+      checked: 0,
+      candidates: 0,
+      accepted: 0,
+      woken: 0,
+    })),
+  };
+  const issueThreadInteractionServiceFactoryMock = vi.fn(() => issueThreadInteractionServiceMock);
   const environmentCustomImagesServiceMock = {
     cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
   };
   const environmentCustomImagesServiceFactoryMock = vi.fn(() => environmentCustomImagesServiceMock);
-  const environmentRuntimeServiceMock = {
-    reconcileEnvironmentLeasesOnStartup: vi.fn(async () => ({
-      reconciled: 0,
-      destroyed: 0,
-      failed: 0,
-      failures: [],
+  const executionWorkspaceServiceMock = {
+    sweepTerminalWorkspaces: vi.fn(async () => ({
+      checked: 0,
+      eligible: 0,
+      archived: 0,
+      cleanupFailed: 0,
+      skippedActiveRun: 0,
+      skippedNonTerminalTree: 0,
+      skippedUndelivered: 0,
+      skippedRace: 0,
     })),
   };
-  const environmentRuntimeServiceFactoryMock = vi.fn(() => environmentRuntimeServiceMock);
+  const executionWorkspaceServiceFactoryMock = vi.fn(() => executionWorkspaceServiceMock);
+  const externalObjectsServiceMock = {
+    refreshDueObjectsForActiveCompanies: vi.fn(async () => ({ companies: 0, checked: 0, refreshed: 0 })),
+  };
+  const externalObjectsServiceFactoryMock = vi.fn(() => externalObjectsServiceMock);
   const routineServiceMock = {
     tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
     reconcileRunDeliveries: vi.fn(async () => ({
@@ -90,15 +126,12 @@ const {
     })),
   };
   const routineServiceFactoryMock = vi.fn(() => routineServiceMock);
-  const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
-    suppressed: false,
-    reason: null,
-  }));
   const feedbackExportServiceMock = {
     flushPendingFeedbackTraces: vi.fn(async () => ({ attempted: 0, sent: 0, failed: 0 })),
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
   const fakeServer = {
+    on: vi.fn().mockReturnThis(),
     once: vi.fn().mockReturnThis(),
     off: vi.fn().mockReturnThis(),
     listen: vi.fn((_port: number, _host: string, callback?: () => void) => {
@@ -120,13 +153,17 @@ const {
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
     environmentCustomImagesServiceFactoryMock,
-    environmentRuntimeServiceFactoryMock,
-    environmentRuntimeServiceMock,
+    executionWorkspaceServiceFactoryMock,
+    executionWorkspaceServiceMock,
+    externalObjectsServiceMock,
+    externalObjectsServiceFactoryMock,
     feedbackExportServiceMock,
     feedbackServiceFactoryMock,
     fakeServer,
     heartbeatServiceFactoryMock,
     heartbeatServiceMock,
+    issueThreadInteractionServiceFactoryMock,
+    issueThreadInteractionServiceMock,
     loadConfigMock,
     reconcilePersistedRuntimeServicesOnStartupMock,
     resolveHeartbeatSchedulingSuppressionMock,
@@ -226,16 +263,43 @@ vi.mock("../realtime/live-events-ws.js", () => ({
 }));
 
 vi.mock("../services/index.js", () => ({
+  backfillLegacyToolOAuthTokens: vi.fn(async () => ({
+    scannedConnections: 0,
+    migratedConnections: 0,
+    sanitizedConnections: 0,
+    createdSecrets: 0,
+    rotatedSecrets: 0,
+    accessTokensBackfilled: 0,
+    refreshTokensBackfilled: 0,
+  })),
   backfillPrincipalAccessCompatibility: vi.fn(async () => ({
     agentMembershipsInserted: 0,
     humanGrantsInserted: 0,
   })),
+  attentionService: vi.fn(() => ({
+    list: vi.fn(async () => ({ items: [], nextCursor: null })),
+  })),
+  decisionService: vi.fn(() => ({
+    sweepExpired: vi.fn(async () => ({ expired: 0 })),
+  })),
+  decisionRetentionService: vi.fn(() => ({
+    autoArchive: vi.fn(async () => 0),
+    deliverNotifications: vi.fn(async () => ({ notifiedAgents: 0, delivered: 0 })),
+  })),
   feedbackService: feedbackServiceFactoryMock,
   bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
+  applyManagedEnvironments: vi.fn(async () => null),
   environmentCustomImageService: environmentCustomImagesServiceFactoryMock,
-  environmentRuntimeService: environmentRuntimeServiceFactoryMock,
+  executionWorkspaceService: executionWorkspaceServiceFactoryMock,
+  externalObjectService: externalObjectsServiceFactoryMock,
   heartbeatService: heartbeatServiceFactoryMock,
+  issueThreadInteractionService: issueThreadInteractionServiceFactoryMock,
+  issueService: vi.fn(() => ({ update: vi.fn(async () => null) })),
   instanceSettingsService: vi.fn(() => ({
+    getExperimental: vi.fn(async () => ({
+      enableExternalObjects: true,
+      enableStatusCards: false,
+    })),
     getGeneral: vi.fn(async () => ({
       backupRetention: {
         dailyDays: 7,
@@ -244,7 +308,6 @@ vi.mock("../services/index.js", () => ({
       },
     })),
   })),
-  reconcileCloudUpstreamRunsOnStartup: vi.fn(async () => ({ reconciled: 0 })),
   reconcileCodexLocalManagedHomesOnStartup: vi.fn(async () => ({
     scanned: 0,
     seeded: 0,
@@ -255,9 +318,42 @@ vi.mock("../services/index.js", () => ({
     failed: 0,
     seededAgentIds: [],
   })),
-  reconcilePersistedRuntimeServicesOnStartup: reconcilePersistedRuntimeServicesOnStartupMock,
+  reconcileBuiltInAgentsOnStartup: vi.fn(async () => ({
+    scanned: 0,
+    reconciled: 0,
+    unknown: 0,
+    duplicates: 0,
+  })),
+  reconcilePersistedRuntimeServicesOnStartup: vi.fn(async () => ({ reconciled: 0 })),
   resolveHeartbeatSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
   routineService: routineServiceFactoryMock,
+  statusCardService: vi.fn(() => ({})),
+  toolAccessService: vi.fn(() => ({
+    sweepConnectionHealth: vi.fn(async () => ({
+      checked: 0,
+      healthy: 0,
+      needsAttention: 0,
+      failed: 0,
+    })),
+  })),
+}));
+
+vi.mock("../services/question-response-delivery.js", () => ({
+  questionResponseDeliveryService: vi.fn(() => ({
+    sweepPending: vi.fn(async () => ({
+      scanned: 0,
+      steered: 0,
+      coalesced: 0,
+      wakeFallback: 0,
+      failed: 0,
+    })),
+  })),
+}));
+
+vi.mock("../services/secret-proposals.js", () => ({
+  createSecretProposalsService: vi.fn(() => ({
+    sweepExpired: vi.fn(async () => 0),
+  })),
 }));
 
 vi.mock("../storage/index.js", () => ({
@@ -295,6 +391,8 @@ import { startServer } from "../index.ts";
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "0123456789abcdef0123456789abcdef";
     loadConfigMock.mockReturnValue(buildTestConfig());
     resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
       suppressed: false,
@@ -303,6 +401,95 @@ describe("startServer feedback export wiring", () => {
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
     process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
+    const originalHome = process.env.PAPERCLIP_HOME;
+    const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-key-"));
+    process.env.PAPERCLIP_HOME = tempHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+    try {
+      const started = await startServer();
+      expect(started.server).toBe(fakeServer);
+      const keyPath = path.join(tempHome, "instances", "default", "secrets", "decision-signing.key");
+      expect(readFileSync(keyPath, "utf8").trim().length).toBeGreaterThanOrEqual(32);
+      if (process.platform !== "win32") {
+        expect(statSync(path.dirname(keyPath)).mode & 0o777).toBe(0o700);
+        expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = originalHome;
+      if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs permissive permissions on an existing generated decision signing key", async () => {
+    const originalHome = process.env.PAPERCLIP_HOME;
+    const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-key-mode-"));
+    const keyPath = path.join(tempHome, "instances", "default", "secrets", "decision-signing.key");
+    const existingKey = Buffer.alloc(32, 7).toString("base64");
+    mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o777 });
+    chmodSync(path.dirname(keyPath), 0o777);
+    writeFileSync(keyPath, existingKey, { encoding: "utf8", mode: 0o644 });
+    chmodSync(keyPath, 0o644);
+    process.env.PAPERCLIP_HOME = tempHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+    try {
+      const started = await startServer();
+      expect(started.server).toBe(fakeServer);
+      expect(readFileSync(keyPath, "utf8")).toBe(existingKey);
+      if (process.platform !== "win32") {
+        expect(statSync(path.dirname(keyPath)).mode & 0o777).toBe(0o700);
+        expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = originalHome;
+      if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlink planted as the generated decision signing key", async () => {
+    if (process.platform === "win32") return;
+
+    const originalHome = process.env.PAPERCLIP_HOME;
+    const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const tempHome = mkdtempSync(path.join(tmpdir(), "paperclip-decision-key-symlink-"));
+    const keyPath = path.join(tempHome, "instances", "default", "secrets", "decision-signing.key");
+    const plantedTarget = path.join(tempHome, "planted.key");
+    const plantedKey = Buffer.alloc(32, 9).toString("base64");
+    mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o777 });
+    chmodSync(path.dirname(keyPath), 0o777);
+    writeFileSync(plantedTarget, plantedKey, { encoding: "utf8", mode: 0o600 });
+    symlinkSync(plantedTarget, keyPath);
+    process.env.PAPERCLIP_HOME = tempHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+    try {
+      await expect(startServer()).rejects.toThrow("must be a regular file");
+      expect(readFileSync(plantedTarget, "utf8")).toBe(plantedKey);
+    } finally {
+      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = originalHome;
+      if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses startup when an explicit decision signing secret is too short", async () => {
+    process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "too-short";
+    await expect(startServer()).rejects.toThrow("PAPERCLIP_DECISION_SIGNING_SECRET must be at least 32 characters");
+    expect(loadConfigMock).not.toHaveBeenCalled();
   });
 
   it("passes the feedback export service into createApp so pending traces flush in runtime", async () => {
@@ -397,6 +584,9 @@ describe("startServer feedback export wiring", () => {
       await Promise.resolve();
 
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
+      expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
+      expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).toHaveBeenCalledTimes(1);
+      expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
     } finally {
@@ -404,45 +594,54 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
-  it("blocks heartbeat recovery and listen when workspace runtime reconciliation fails", async () => {
-    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
-    reconcilePersistedRuntimeServicesOnStartupMock.mockRejectedValueOnce(
-      new Error("historical runtime process unresolved"),
-    );
+  it("keeps external object refresh active when heartbeat scheduling is disabled", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: false,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
 
-    await expect(startServer()).rejects.toThrow("historical runtime process unresolved");
+    try {
+      await startServer();
 
-    expect(heartbeatServiceFactoryMock).not.toHaveBeenCalled();
-    expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
-    expect(fakeServer.listen).not.toHaveBeenCalled();
+      // The disabled path still creates one heartbeat runtime. This runtime owns
+      // the orphan-sandbox cleanup sweep, so a leaked provider sandbox is still
+      // reaped at startup and on the interval.
+      expect(heartbeatServiceFactoryMock).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepPendingCleanupLeases).toHaveBeenCalled();
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
+      expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
+      expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
-  it("awaits plugin, workspace, and environment reconciliation before heartbeat recovery and listen", async () => {
-    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+  it("does not replay hot-restart adoption when the orphan reaper retries", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileHotRestartAdoption.mockRejectedValueOnce(new Error("partial adoption"));
+    heartbeatServiceMock.reapOrphanedRuns
+      .mockRejectedValueOnce(new Error("transient reap failure"))
+      .mockResolvedValueOnce({ reaped: 0, runIds: [] });
 
     await startServer();
 
-    expect(waitForPluginWorkerStartupMock).toHaveBeenCalledTimes(1);
-    expect(reconcilePersistedRuntimeServicesOnStartupMock).toHaveBeenCalledTimes(1);
-    expect(environmentRuntimeServiceMock.reconcileEnvironmentLeasesOnStartup).toHaveBeenCalledTimes(1);
-    expect(backgroundServicesStartMock).toHaveBeenCalledTimes(1);
-    expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
-    expect(fakeServer.listen).toHaveBeenCalledTimes(1);
-    expect(waitForPluginWorkerStartupMock.mock.invocationCallOrder[0]).toBeLessThan(
-      reconcilePersistedRuntimeServicesOnStartupMock.mock.invocationCallOrder[0]!,
-    );
-    expect(reconcilePersistedRuntimeServicesOnStartupMock.mock.invocationCallOrder[0]).toBeLessThan(
-      environmentRuntimeServiceMock.reconcileEnvironmentLeasesOnStartup.mock.invocationCallOrder[0]!,
-    );
-    expect(environmentRuntimeServiceMock.reconcileEnvironmentLeasesOnStartup.mock.invocationCallOrder[0]).toBeLessThan(
-      backgroundServicesStartMock.mock.invocationCallOrder[0]!,
-    );
-    expect(backgroundServicesStartMock.mock.invocationCallOrder[0]).toBeLessThan(
-      heartbeatServiceMock.reapOrphanedRuns.mock.invocationCallOrder[0]!,
-    );
-    expect(heartbeatServiceMock.reapOrphanedRuns.mock.invocationCallOrder[0]).toBeLessThan(
-      fakeServer.listen.mock.invocationCallOrder[0]!,
-    );
+    expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {
@@ -478,6 +677,7 @@ describe("startServer feedback export wiring", () => {
 describe("startServer authenticated auth origin setup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
     loadConfigMock.mockReturnValue(buildTestConfig());
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
@@ -524,6 +724,7 @@ describe("startServer authenticated auth origin setup", () => {
 describe("startServer PAPERCLIP_API_URL handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
     loadConfigMock.mockReturnValue(buildTestConfig());
     process.env.BETTER_AUTH_SECRET = "test-secret";
     delete process.env.PAPERCLIP_API_URL;
@@ -601,7 +802,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     );
   });
 
-  it("rewrites explicit-port auth public URLs when detect-port selects a new port", async () => {
+  it("preserves explicit-port external auth public URLs when detect-port selects a new port", async () => {
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -611,9 +812,12 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     const started = await startServer();
 
+    // The server listens internally on 3110, but an explicit *external* base URL must keep
+    // its advertised port. Rewriting it to the internal listen port produced an unreachable
+    // URL that leaked to spawned agents as a dead PAPERCLIP_API_URL. (BRO-1558)
     expect(started.listenPort).toBe(3110);
-    expect(started.apiUrl).toBe("http://my-host.ts.net:3110");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3110");
+    expect(started.apiUrl).toBe("http://my-host.ts.net:3100");
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3100");
   });
 
   it("keeps no-port auth public URLs stable when detect-port selects a new port", async () => {

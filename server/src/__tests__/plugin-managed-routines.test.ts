@@ -80,6 +80,8 @@ function manifest(): PaperclipPluginManifestV1 {
       priority: "medium",
       concurrencyPolicy: "coalesce_if_active",
       catchUpPolicy: "skip_missed",
+      activityGatePolicy: "require_external_activity",
+      activityGateScope: "project",
       triggers: [{
         kind: "schedule",
         label: "Nightly",
@@ -171,6 +173,8 @@ describeEmbeddedPostgres("plugin-managed routines", () => {
       title: "Nightly lint",
       assigneeAgentId: agent.agentId,
       projectId: project.projectId,
+      activityGatePolicy: "require_external_activity",
+      activityGateScope: "project",
       managedByPlugin: expect.objectContaining({
         pluginKey: "paperclip.managed-routines-test",
         resourceKind: "routine",

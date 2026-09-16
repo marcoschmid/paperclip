@@ -213,6 +213,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       companyId,
       environmentId,
       executionWorkspaceId: expect.any(String),
+      executionWorkspaceSettings: null,
       issueId: null,
       config: { template: "base" },
       agentId,
@@ -454,11 +455,11 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       expect(latestOverride?.status).toBe("succeeded");
     }, { timeout: 5_000 });
 
-    const acquirePayloads = workerManager.call.mock.calls
-      .filter(([, method]) => method === "environmentAcquireLease")
-      .map(([, , payload]) => payload);
+    const acquireCalls = workerManager.call.mock.calls
+      .filter(([, method]) => method === "environmentAcquireLease");
+    const acquirePayloads = acquireCalls.map(([, , payload]) => payload);
 
-    expect(acquirePayloads).toHaveLength(2);
+    expect(acquireCalls).toHaveLength(2);
     expect(acquirePayloads).toEqual(expect.arrayContaining([
       expect.objectContaining({
         companyId: companyAId,
@@ -674,6 +675,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       companyId,
       environmentId: newEnvironmentId,
       executionWorkspaceId: expect.any(String),
+      executionWorkspaceSettings: { mode: "shared_workspace" },
       issueId,
       config: { template: "new" },
       agentId,

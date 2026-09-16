@@ -3,6 +3,7 @@ import {
   assertClaudePermissionConfigIsFailClosed,
   buildClaudeExecutionPermissionArgs,
   buildClaudeProbePermissionArgs,
+  SANDBOX_ALLOWED_TOOLS,
 } from "./permissions.js";
 
 describe("claude-local remote permission args", () => {
@@ -39,36 +40,43 @@ describe("claude-local remote permission args", () => {
     expect(buildClaudeProbePermissionArgs({ dangerouslySkipPermissions: false, targetIsRemote: false })).toEqual([]);
   });
 
-  it("rejects the global Claude bypass even when requested explicitly", () => {
-    expect(() => buildClaudeExecutionPermissionArgs({ dangerouslySkipPermissions: true, targetIsRemote: false }))
-      .toThrow("global Claude permission bypass is disabled");
-    expect(() => buildClaudeProbePermissionArgs({ dangerouslySkipPermissions: true, targetIsRemote: true }))
-      .toThrow("global Claude permission bypass is disabled");
+  it("uses dangerously-skip-permissions for non-root local execution", () => {
+    expect(
+      buildClaudeExecutionPermissionArgs({
+        dangerouslySkipPermissions: true,
+        targetIsRemote: false,
+        localProcessUid: 1000,
+      }),
+    ).toEqual(["--dangerously-skip-permissions"]);
   });
 
-  it.each(["extraArgs", "args"])("rejects global Claude bypass smuggling through %s", (key) => {
-    expect(() => assertClaudePermissionConfigIsFailClosed({
-      [key]: ["--verbose", "--dangerously-skip-permissions"],
-    })).toThrow("global Claude permission bypass is disabled");
+  it("uses dangerously-skip-permissions for non-root local probes", () => {
+    expect(
+      buildClaudeProbePermissionArgs({
+        dangerouslySkipPermissions: true,
+        targetIsRemote: false,
+        localProcessUid: 1000,
+      }),
+    ).toEqual(["--dangerously-skip-permissions"]);
   });
 
-  it.each([
-    ["--permission-mode", "bypassPermissions"],
-    ["--permission-mode=bypassPermissions"],
-    ["--allow-dangerously-skip-permissions"],
-    ["--allow-dangerously-skip-permissions=true"],
-    ["--allowedTools", "Read"],
-    ["--tools=Read,Bash"],
-  ])("rejects permission-affecting Claude argument form %j", (...args) => {
-    expect(() => assertClaudePermissionConfigIsFailClosed({ extraArgs: args }))
-      .toThrow("Claude extraArgs/args");
+  it("uses allowedTools for local root execution because Claude refuses dangerously-skip-permissions as root", () => {
+    expect(
+      buildClaudeExecutionPermissionArgs({
+        dangerouslySkipPermissions: true,
+        targetIsRemote: false,
+        localProcessUid: 0,
+      }),
+    ).toEqual(["--allowedTools", SANDBOX_ALLOWED_TOOLS]);
   });
 
-  it("allows only the explicit fail-closed Claude extra-argument allowlist", () => {
-    expect(() => assertClaudePermissionConfigIsFailClosed({
-      extraArgs: ["--no-session-persistence"],
-    })).not.toThrow();
-    expect(() => assertClaudePermissionConfigIsFailClosed({ extraArgs: ["--verbose"] }))
-      .toThrow("Claude extraArgs/args");
+  it("uses allowedTools for local root probes because Claude refuses dangerously-skip-permissions as root", () => {
+    expect(
+      buildClaudeProbePermissionArgs({
+        dangerouslySkipPermissions: true,
+        targetIsRemote: false,
+        localProcessUid: 0,
+      }),
+    ).toEqual(["--allowedTools", SANDBOX_ALLOWED_TOOLS]);
   });
 });

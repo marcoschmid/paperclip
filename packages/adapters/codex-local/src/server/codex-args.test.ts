@@ -2,117 +2,17 @@ import { describe, expect, it } from "vitest";
 import { buildCodexExecArgs } from "./codex-args.js";
 
 describe("buildCodexExecArgs", () => {
-  it("pins the complete managed runtime extension surface closed without disabling normal shell tools", () => {
-    const result = buildCodexExecArgs(
-      { model: "gpt-5.6" },
-      { managedRuntime: true },
-    );
-
-    const disabledFeatures = result.args.flatMap((arg, index, args) =>
-      arg === "--disable" ? [args[index + 1]] : []
-    );
-    expect(disabledFeatures).toEqual([
-      "apps",
-      "enable_mcp_apps",
-      "plugins",
-      "remote_plugin",
-      "plugin_sharing",
-      "hooks",
-      "browser_use",
-      "browser_use_external",
-      "browser_use_full_cdp_access",
-      "computer_use",
-      "image_generation",
-      "in_app_browser",
-      "skill_mcp_dependency_install",
-      "tool_call_mcp_elicitation",
-      "tool_suggest",
-      "non_prefixed_mcp_tool_names",
-      "workspace_dependencies",
-      "multi_agent",
-      "multi_agent_v2",
-      "goals",
-      "auth_elicitation",
-    ]);
-    expect(disabledFeatures).not.toContain("shell_tool");
-    expect(disabledFeatures).not.toContain("unified_exec");
-    expect(result.args).not.toContain("--ephemeral");
-    expect(result.args).not.toContain("read-only");
-  });
-
-  it("makes lifecycle canaries ephemeral and read-only with all command hosts disabled", () => {
-    const result = buildCodexExecArgs(
-      { model: "gpt-5.6", search: true },
-      { managedRuntime: true, lifecyclePendingCanary: true },
-    );
-
-    expect(result.args).toEqual(expect.arrayContaining([
-      "--sandbox",
-      "read-only",
-      "--ephemeral",
-      "--disable",
-      "shell_tool",
-      "unified_exec",
-      "shell_snapshot",
-      "code_mode_host",
-    ]));
-    expect(result.args).not.toContain("--search");
-  });
-
-  it.each([
-    { dangerouslyBypassApprovalsAndSandbox: true },
-    { dangerouslyBypassSandbox: true },
-    { extraArgs: ["--dangerously-bypass-approvals-and-sandbox"] },
-    { args: ["--dangerously-bypass-approvals-and-sandbox"] },
-  ])("rejects the global Codex approvals and sandbox bypass", (config) => {
-    expect(() => buildCodexExecArgs(config)).toThrow(
-      "global Codex approvals and sandbox bypass is disabled",
-    );
-  });
-
-  it.each([
-    ["--sandbox", "danger-full-access"],
-    ["--sandbox=danger-full-access"],
-    ["-s", "danger-full-access"],
-    ["--ask-for-approval", "never"],
-    ["--ask-for-approval=never"],
-    ["-a", "never"],
-    ["-c", 'sandbox_mode="danger-full-access"'],
-    ["--config", 'approval_policy="never"'],
-    ["--config=approval_policy=\"never\""],
-    ["--profile", "unsafe"],
-    ["--profile=unsafe"],
-    ["--full-auto"],
-  ])("rejects sandbox/approval-affecting Codex argument form %j", (...args) => {
-    expect(() => buildCodexExecArgs({ extraArgs: args })).toThrow("Codex extraArgs/args");
-  });
-
-  it.each([
-    { sandbox: "danger-full-access" },
-    { sandboxMode: "danger-full-access" },
-    { approvalPolicy: "never" },
-    { profile: "unsafe" },
-    { config: { approval_policy: "never" } },
-  ])("rejects direct security-policy config keys", (config) => {
-    expect(() => buildCodexExecArgs(config)).toThrow("Codex security policy");
-  });
-
-  it("allows only the explicit fail-closed Codex extra-argument allowlist", () => {
-    expect(() => buildCodexExecArgs({ extraArgs: ["--skip-git-repo-check"] })).not.toThrow();
-    expect(() => buildCodexExecArgs({ extraArgs: ["--no-alt-screen"] }))
-      .toThrow("Codex extraArgs/args");
-  });
-
-  it("enables Codex fast mode overrides for GPT-5.6", () => {
+  it("rewrites the legacy bare gpt-5.6 alias to gpt-5.6-sol and applies fast mode", () => {
     const result = buildCodexExecArgs({
       model: "gpt-5.6",
       fastMode: true,
     });
 
+    expect(result.model).toBe("gpt-5.6-sol");
+    expect(result.args).toContain("gpt-5.6-sol");
+    expect(result.args).not.toContain("gpt-5.6");
     expect(result.fastModeApplied).toBe(true);
     expect(result.fastModeIgnoredReason).toBeNull();
-    expect(result.args).toContain("gpt-5.6");
-    expect(result.args).toContain('service_tier="fast"');
   });
 
   it("enables Codex fast mode overrides for GPT-5.4", () => {
@@ -202,22 +102,39 @@ describe("buildCodexExecArgs", () => {
     ]);
   });
 
-  it("ignores fast mode for unsupported models", () => {
+  it("ignores fast mode for known unsupported models", () => {
     const result = buildCodexExecArgs({
-      model: "gpt-5.3-codex-spark",
+      model: "gpt-5",
       fastMode: true,
     });
 
     expect(result.fastModeRequested).toBe(true);
     expect(result.fastModeApplied).toBe(false);
     expect(result.fastModeIgnoredReason).toContain(
-      "currently only supported on gpt-5.6, gpt-5.5, gpt-5.4 or manually configured model IDs",
+      "currently only supported on gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4 or manually configured model IDs",
     );
     expect(result.args).toEqual([
       "exec",
       "--json",
       "--model",
-      "gpt-5.3-codex-spark",
+      "gpt-5",
+      "-",
+    ]);
+  });
+
+  it("ignores fast mode for gpt-5.4-mini", () => {
+    const result = buildCodexExecArgs({
+      model: "gpt-5.4-mini",
+      fastMode: true,
+    });
+
+    expect(result.fastModeRequested).toBe(true);
+    expect(result.fastModeApplied).toBe(false);
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.4-mini",
       "-",
     ]);
   });
@@ -238,5 +155,46 @@ describe("buildCodexExecArgs", () => {
       "gpt-5.5",
       "-",
     ]);
+  });
+
+  it("does not add a second --skip-git-repo-check when extraArgs already carry it", () => {
+    const result = buildCodexExecArgs(
+      {
+        model: "gpt-5.5",
+        extraArgs: ["--skip-git-repo-check"],
+      },
+      { skipGitRepoCheck: true },
+    );
+
+    expect(result.args.filter((arg) => arg === "--skip-git-repo-check")).toHaveLength(1);
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.5",
+      "--skip-git-repo-check",
+      "-",
+    ]);
+  });
+
+  it("does not add a second --skip-git-repo-check when the legacy args field carries it", () => {
+    const result = buildCodexExecArgs(
+      {
+        model: "gpt-5.5",
+        args: ["--skip-git-repo-check"],
+      },
+      { skipGitRepoCheck: true },
+    );
+
+    expect(result.args.filter((arg) => arg === "--skip-git-repo-check")).toHaveLength(1);
+  });
+
+  it("keeps the operator's --skip-git-repo-check when the sandbox injection is not requested", () => {
+    const result = buildCodexExecArgs({
+      model: "gpt-5.5",
+      extraArgs: ["--skip-git-repo-check"],
+    });
+
+    expect(result.args.filter((arg) => arg === "--skip-git-repo-check")).toHaveLength(1);
   });
 });

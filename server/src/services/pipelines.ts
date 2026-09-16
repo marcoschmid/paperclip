@@ -54,6 +54,8 @@ import {
   isHistoricalAgentTombstoneId,
 } from "./agent-retirement-historical-tombstones.js";
 import { authorizationService } from "./authorization.js";
+import { visibleIssueCondition } from "./issue-visibility.js";
+import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
   canonicalizeAgentReferenceId,
   lockAgentLifecycleReference,
@@ -369,7 +371,7 @@ async function getUsableConversationIssue(db: PipelineDb, companyId: string, iss
     .where(and(
       eq(issues.companyId, companyId),
       eq(issues.id, issueId),
-      isNull(issues.hiddenAt),
+      visibleIssueCondition(),
       isNull(issues.cancelledAt),
       ne(issues.status, "cancelled"),
     ))
@@ -418,7 +420,7 @@ async function resolveLatestCaseIssueLink(
       eq(pipelineCaseIssueLinks.caseId, input.caseId),
       inArray(pipelineCaseIssueLinks.role, input.roles),
       eq(issues.companyId, input.companyId),
-      isNull(issues.hiddenAt),
+      visibleIssueCondition(),
       isNull(issues.cancelledAt),
       ne(issues.status, "cancelled"),
     ))
@@ -1224,6 +1226,8 @@ function routineRevisionSnapshotRoutine(routine: typeof routines.$inferSelect): 
     status: routine.status as RoutineRevisionSnapshotV1["routine"]["status"],
     concurrencyPolicy: routine.concurrencyPolicy as RoutineRevisionSnapshotV1["routine"]["concurrencyPolicy"],
     catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
+    activityGatePolicy: routine.activityGatePolicy as RoutineRevisionSnapshotV1["routine"]["activityGatePolicy"],
+    activityGateScope: routine.activityGateScope as RoutineRevisionSnapshotV1["routine"]["activityGateScope"],
     originKind: routine.originKind,
     originId: routine.originId,
     variables: routine.variables ?? [],
@@ -1985,7 +1989,7 @@ async function postSystemCommentOnLinkedIssues(
       inArray(pipelineCaseIssueLinks.role, input.roles),
       ne(issues.status, "done"),
       ne(issues.status, "cancelled"),
-      isNull(issues.hiddenAt),
+      visibleIssueCondition(),
     ));
 
   for (const row of rows) {
@@ -2083,7 +2087,7 @@ async function notifyDependentWorkIssuesOfUpstreamContentChange(
       eq(issues.companyId, input.companyId),
       ne(issues.status, "done"),
       ne(issues.status, "cancelled"),
-      isNull(issues.hiddenAt),
+      visibleIssueCondition(),
     ));
   const issueIdsByCase = new Map<string, string[]>();
   for (const row of linkRows) {
@@ -4885,14 +4889,27 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           ? effects.linkedAutomationIssueIds
           : [];
         if (issueIdsToCancel.length > 0) {
-          await tx
+          const cancelledIssues = await tx
             .update(issues)
             .set({ status: "cancelled", updatedAt: now })
             .where(and(
               eq(issues.companyId, input.companyId),
               inArray(issues.id, issueIdsToCancel),
               ne(issues.status, "done"),
-            ));
+            ))
+            .returning({
+              id: issues.id,
+              companyId: issues.companyId,
+              identifier: issues.identifier,
+              title: issues.title,
+              status: issues.status,
+            });
+          for (const issue of cancelledIssues) {
+            await finalizeSummarySlotsForTerminalIssue(tx, {
+              ...issue,
+              status: "cancelled",
+            });
+          }
           await tx
             .update(pipelineCaseIssueLinks)
             .set({

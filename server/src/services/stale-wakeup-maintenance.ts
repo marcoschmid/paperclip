@@ -380,7 +380,6 @@ export function staleWakeupMaintenanceService(db: Db) {
             };
           });
           const pendingActivities = await logActivities(txDb, activityInputs, {
-            censorUsernameInLogs,
             publish: false,
           });
 

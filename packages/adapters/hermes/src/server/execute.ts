@@ -35,7 +35,9 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
   renderPaperclipWakePrompt,
+  selectPaperclipTaskMarkdown,
   stringifyPaperclipWakePayload,
+  isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -50,6 +52,7 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
+import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -158,10 +161,15 @@ export function buildPrompt(
     paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
   }
 
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+  const paperclipTaskMarkdown = selectPaperclipTaskMarkdown(context, {
     resumedSession: options.resumedSession === true,
   });
-  const paperclipTaskMarkdown = cfgString(context.paperclipTaskMarkdown)?.trim() || "";
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    resumedSession: options.resumedSession === true,
+    // The task-context markdown is the authoritative brief on this lane; keep
+    // the wake prompt's description copy out so the prompt carries it once.
+    suppressIssueDescription: paperclipTaskMarkdown.length > 0,
+  });
   const sessionHandoffMarkdown = cfgString(context.paperclipSessionHandoffMarkdown)?.trim() || "";
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake) || "";
 
@@ -191,7 +199,9 @@ export function buildPrompt(
     paperclipRunIdEnv: "PAPERCLIP_RUN_ID",
   };
 
-  const rendered = renderTemplate(renderConditionalSections(template, vars), vars);
+  const rendered = isPaperclipRecoveryWakePayload(context.paperclipWake)
+    ? ""
+    : renderTemplate(renderConditionalSections(template, vars), vars);
   return joinPromptSections([
     wakePrompt,
     sessionHandoffMarkdown,
@@ -341,6 +351,25 @@ export async function execute(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
 
+  // The server adds this runtime inventory at the run boundary. Requiring the
+  // marker avoids touching a developer's real Hermes home in direct unit or
+  // library calls that did not opt into Paperclip runtime skills.
+  if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
+    try {
+      const selectedSkills = await reconcileHermesPaperclipSkills(config);
+      if (selectedSkills.length > 0) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
+        );
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
+      throw err;
+    }
+  }
+
   // ── Resolve provider (defense in depth) ────────────────────────────────
   // Priority chain:
   //   1. Explicit provider in adapterConfig (user override)
@@ -462,7 +491,9 @@ export async function execute(
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
-  // BUG FIX: Inject authToken as PAPERCLIP_API_KEY (matches adapter-claude-local behavior)
+  // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
+  // token is the only source of Paperclip API identity.
+  delete env.PAPERCLIP_API_KEY;
   if ((ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
 
   // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
@@ -527,6 +558,7 @@ export async function execute(
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,
+    onSpawn: ctx.onSpawn,
   });
 
   // ── Parse output ───────────────────────────────────────────────────────
@@ -551,6 +583,8 @@ export async function execute(
 
   if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
+  } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
+    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
   }
 
   if (parsed.usage) {

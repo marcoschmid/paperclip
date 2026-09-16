@@ -1,7 +1,9 @@
 import { useEffect, useState, type ReactNode } from "react";
 import type { Preview } from "@storybook/react-vite";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { WorkTimelineResult } from "@paperclipai/shared";
 import { MemoryRouter } from "@/lib/router";
+import { ONBOARDING_STORAGE_KEY } from "@/components/OnboardingWizard";
 import { BreadcrumbProvider } from "@/context/BreadcrumbContext";
 import { CompanyProvider } from "@/context/CompanyContext";
 import { DialogProvider } from "@/context/DialogContext";
@@ -29,9 +31,38 @@ import {
   storybookSecrets,
   storybookSidebarBadges,
 } from "../fixtures/paperclipData";
+import timelineSample from "../fixtures/workTimeline.human.sample.json";
 import "@mdxeditor/editor/style.css";
 import "./tailwind-entry.css";
 import "./styles.css";
+
+const STORYBOOK_USER_AVATAR =
+  "https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=96&q=80";
+
+function withStorybookTimelineDetails(data: WorkTimelineResult): WorkTimelineResult {
+  return {
+    ...data,
+    actors: data.actors.map((actor) => (
+      actor.type === "user" ? { ...actor, avatar: STORYBOOK_USER_AVATAR } : actor
+    )),
+    spans: data.spans.map((span, index) => {
+      const inputTokens = 42_000 + index * 137;
+      const cachedInputTokens = index % 3 === 0 ? 8_000 : 0;
+      const outputTokens = 5_400 + index * 29;
+      return {
+        ...span,
+        usage: span.usage ?? {
+          inputTokens,
+          cachedInputTokens,
+          outputTokens,
+          totalTokens: inputTokens + cachedInputTokens + outputTokens,
+        },
+      };
+    }),
+  };
+}
+
+const storybookTimelineSample = withStorybookTimelineDetails(timelineSample as WorkTimelineResult);
 
 // Install fetch monkeypatch eagerly so any module-load-time fetches (e.g. schema
 // caches in adapter config renderers) hit our fixtures before they reach the
@@ -98,6 +129,23 @@ function installStorybookApiFixtures() {
         enableIsolatedWorkspaces: true,
         autoRestartDevServerWhenIdle: false,
       });
+    }
+
+    if (url.pathname === "/api/instance/settings") {
+      return Response.json({});
+    }
+
+    // The onboarding wizard's connect step reads these. An empty environment
+    // list is the cloud-tenant shape — agents run in a managed sandbox rather
+    // than a configured environment — and it is also the state that produces
+    // the "no managed sandbox environment is available" notice, which is worth
+    // being able to look at rather than only meeting it on a live stack.
+    if (/^\/api\/companies\/[^/]+\/environments$/.test(url.pathname)) {
+      return Response.json([]);
+    }
+
+    if (/^\/api\/companies\/[^/]+\/adapters\/[^/]+\/models$/.test(url.pathname)) {
+      return Response.json([]);
     }
 
     if (url.pathname === "/api/adapters") {
@@ -235,6 +283,24 @@ function installStorybookApiFixtures() {
           ...storybookDashboardSummary,
           companyId,
         });
+      }
+      if (resource === "timeline") {
+        return Response.json(
+          companyId === "company-storybook"
+            ? storybookTimelineSample
+            : {
+                actors: [],
+                spans: [],
+                events: [],
+                edges: [],
+                pagination: { limit: 100, offset: 0, totalIssues: 0, hasMore: false },
+                window: {
+                  from: url.searchParams.get("from") ?? new Date(0).toISOString(),
+                  to: url.searchParams.get("to") ?? new Date(0).toISOString(),
+                  capped: false,
+                },
+              },
+        );
       }
       if (resource === "heartbeat-runs") {
         return Response.json([]);
@@ -400,6 +466,28 @@ const preview: Preview = {
         },
       },
     },
+  },
+
+  /**
+   * Every story starts without an onboarding draft.
+   *
+   * `localStorage` is per-origin and the preview frame keeps one for the whole
+   * session, so a story that seeds a draft would otherwise hand it to whatever a
+   * reviewer opens next: the wizard restores that saved step ahead of the step
+   * the new story asked for, and the reviewer lands on a screen they never
+   * clicked on.
+   *
+   * Cleared here rather than on the seeding story's unmount, deliberately.
+   * Switching stories navigates the preview iframe, so the page is torn down
+   * rather than React-unmounted and an unmount cleanup never runs — which is
+   * exactly how the first attempt at this leaked anyway.
+   */
+  beforeEach: () => {
+    try {
+      window.localStorage.removeItem(ONBOARDING_STORAGE_KEY);
+    } catch {
+      // Storage access throws in some privacy modes; nothing to clean up there.
+    }
   },
 };
 

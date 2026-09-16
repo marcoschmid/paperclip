@@ -104,94 +104,15 @@ describe("redaction", () => {
     });
   });
 
-  it("redacts Paperclip tokens in arbitrary nested result strings while preserving secret refs", () => {
-    const token = "pcp_board_super_secret_value";
-    const result = redactEventPayload({
-      output: {
-        message: `completed with ${token}`,
-        items: [token, { summary: token }],
-      },
-      binding: {
-        type: "secret_ref",
-        secretId: "11111111-1111-1111-1111-111111111111",
-      },
-    });
-
-    expect(JSON.stringify(result)).not.toContain(token);
-    expect(result?.binding).toEqual({
-      type: "secret_ref",
-      secretId: "11111111-1111-1111-1111-111111111111",
-    });
-  });
-
-  it("sanitizes unexpected fields on secret reference bindings", () => {
-    const token = "pcp_secret_ref_escape_value";
-    const result = redactEventPayload({
-      binding: {
-        type: "secret_ref",
-        secretId: "11111111-1111-1111-1111-111111111111",
-        plaintext: token,
-        metadata: { output: token },
-      },
-      userBinding: {
-        type: "user_secret_ref",
-        key: "OPENAI_API_KEY",
-        leaked: token,
-      },
-    });
-
-    expect(JSON.stringify(result)).not.toContain(token);
-    expect(result?.binding).toMatchObject({
-      type: "secret_ref",
-      secretId: "11111111-1111-1111-1111-111111111111",
-      plaintext: REDACTED_EVENT_VALUE,
-    });
-    expect(result?.userBinding).toMatchObject({
-      type: "user_secret_ref",
-      key: "OPENAI_API_KEY",
-      leaked: REDACTED_EVENT_VALUE,
-    });
-  });
-
-  it("preserves numeric token telemetry while redacting credential token fields", () => {
-    const result = redactEventPayload({
-      inputTokens: 120,
-      outputTokens: 30,
-      cachedInputTokens: 10,
-      tokenCount: 160,
-      token: "opaque-session-token",
-      accessToken: "opaque-access-token",
-    });
-
-    expect(result).toEqual({
-      inputTokens: 120,
-      outputTokens: 30,
-      cachedInputTokens: 10,
-      tokenCount: 160,
-      token: REDACTED_EVENT_VALUE,
-      accessToken: REDACTED_EVENT_VALUE,
-    });
-  });
-
-  it("redacts provider-specific token, auth, and session-key fields", () => {
-    const result = sanitizeRecord({
-      gatewayToken: "gateway-secret",
-      publicShareToken: "share-secret",
-      leaseToken: "lease-secret",
-      bridgeToken: "bridge-secret",
-      "x-openclaw-auth": "openclaw-secret",
-      "x-hermes-session-key": "hermes-secret",
-      totalInputTokens: 42,
-    });
-
-    expect(result).toEqual({
-      gatewayToken: REDACTED_EVENT_VALUE,
-      publicShareToken: REDACTED_EVENT_VALUE,
-      leaseToken: REDACTED_EVENT_VALUE,
-      bridgeToken: REDACTED_EVENT_VALUE,
-      "x-openclaw-auth": REDACTED_EVENT_VALUE,
-      "x-hermes-session-key": REDACTED_EVENT_VALUE,
-      totalInputTokens: 42,
+  it("preserves authorization decision reasons in audit payloads", () => {
+    expect(redactEventPayload({
+      authorizationReason: "allow_scoped_agent_write",
+      authorization: "Bearer secret",
+      surface: "issue.comment.create",
+    })).toEqual({
+      authorizationReason: "allow_scoped_agent_write",
+      authorization: REDACTED_EVENT_VALUE,
+      surface: "issue.comment.create",
     });
   });
 

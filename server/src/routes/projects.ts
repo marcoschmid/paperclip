@@ -14,10 +14,10 @@ import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } fr
 import { trackProjectCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { accessService, projectService, logActivity, workspaceOperationService } from "../services/index.js";
-import { conflict, forbidden } from "../errors.js";
+import { conflict, forbidden, unprocessable } from "../errors.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
   listConfiguredRuntimeServiceEntries,
@@ -52,6 +52,31 @@ export function projectRoutes(db: Db) {
   });
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
   const environmentsSvc = environmentService(db);
+
+  /**
+   * Managed-sandbox-only policy (`enableManagedSandboxOnly`): a project
+   * workspace `cwd` is an absolute path on the execution host. When the policy
+   * is on every agent runs in the platform-managed environment, so there is no
+   * host for a user to point at and a write that carries a path is refused
+   * rather than stored and silently ignored. This is the floor behind the
+   * hidden UI field, and it applies to every actor, mirroring how
+   * `assertNoAgentHostWorkspaceCommandMutation` floors host-executed commands
+   * on these same routes.
+   *
+   * `cwd: null` still passes: clearing a stale path is exactly what an instance
+   * that just turned the policy on needs to do. The settings read only happens
+   * when the payload actually carries a path.
+   */
+  async function assertNoManagedSandboxWorkspacePath(workspacePatch: unknown) {
+    if (typeof workspacePatch !== "object" || workspacePatch === null || Array.isArray(workspacePatch)) return;
+    const patch = workspacePatch as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(patch, "cwd")) return;
+    if (patch.cwd === null || patch.cwd === undefined) return;
+    if ((await instanceSettings.getExperimental()).enableManagedSandboxOnly !== true) return;
+    throw unprocessable(
+      "This instance runs agents only in the platform-managed environment; local folders are not configurable.",
+    );
+  }
 
   async function assertProjectEnvironmentSelection(companyId: string, environmentId: string | null | undefined) {
     if (environmentId === undefined || environmentId === null) return;
@@ -129,30 +154,23 @@ export function projectRoutes(db: Db) {
   router.get("/companies/:companyId/projects", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const result = await svc.list(companyId);
+    const includeArchived = req.query.includeArchived === "true";
+    const result = await svc.list(companyId, { includeArchived });
     res.json(await filterProjectsForActor(req, result));
   });
 
   router.get("/projects/:id", async (req, res) => {
     const id = req.params.id as string;
-    const project = await svc.getById(id);
-    if (!project) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, project.companyId);
+    const project = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!project) return;
     if (!(await assertProjectReadAllowed(req, res, project))) return;
     res.json(project);
   });
 
   router.get("/projects/:id/external-object-summary", async (req, res) => {
     const id = req.params.id as string;
-    const project = await svc.getById(id);
-    if (!project) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, project.companyId);
+    const project = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!project) return;
     const summary = await externalObjectsSvc.getProjectSummary(project.id);
     res.json(summary);
   });
@@ -176,6 +194,7 @@ export function projectRoutes(db: Db) {
         ...collectProjectWorkspaceCommandPaths(workspace, "workspace"),
       ],
     );
+    await assertNoManagedSandboxWorkspacePath(workspace);
     if (projectData.env !== undefined) {
       projectData.env = await secretsSvc.normalizeEnvBindingsForPersistence(
         companyId,
@@ -227,12 +246,8 @@ export function projectRoutes(db: Db) {
 
   router.patch("/projects/:id", validate(updateProjectSchema), async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!existing) return;
     const body = { ...req.body };
     assertNoAgentHostWorkspaceCommandMutation(
       req,
@@ -287,28 +302,21 @@ export function projectRoutes(db: Db) {
 
   router.get("/projects/:id/workspaces", async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!existing) return;
     const workspaces = await svc.listWorkspaces(id);
     res.json(workspaces);
   });
 
   router.post("/projects/:id/workspaces", validate(createProjectWorkspaceSchema), async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!existing) return;
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectProjectWorkspaceCommandPaths(req.body),
     );
+    await assertNoManagedSandboxWorkspacePath(req.body);
     const workspace = await svc.createWorkspace(id, req.body);
     if (!workspace) {
       res.status(422).json({ error: "Invalid project workspace payload" });
@@ -341,16 +349,13 @@ export function projectRoutes(db: Db) {
     async (req, res) => {
       const id = req.params.id as string;
       const workspaceId = req.params.workspaceId as string;
-      const existing = await svc.getById(id);
-      if (!existing) {
-        res.status(404).json({ error: "Project not found" });
-        return;
-      }
-      assertCompanyAccess(req, existing.companyId);
+      const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+      if (!existing) return;
       assertNoAgentHostWorkspaceCommandMutation(
         req,
         collectProjectWorkspaceCommandPaths(req.body),
       );
+      await assertNoManagedSandboxWorkspacePath(req.body);
       const workspaceExists = (await svc.listWorkspaces(id)).some((workspace) => workspace.id === workspaceId);
       if (!workspaceExists) {
         res.status(404).json({ error: "Project workspace not found" });
@@ -390,12 +395,8 @@ export function projectRoutes(db: Db) {
       return;
     }
 
-    const project = await svc.getById(id);
-    if (!project) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, project.companyId);
+    const project = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!project) return;
 
     const workspace = project.workspaces.find((entry) => entry.id === workspaceId) ?? null;
     if (!workspace) {
@@ -516,6 +517,7 @@ export function projectRoutes(db: Db) {
               worktreePath: null,
               warnings: [],
               created: false,
+              branchCreatedByRuntime: false,
             },
             command: workspaceCommand.rawConfig,
             adapterEnv: {},
@@ -571,6 +573,7 @@ export function projectRoutes(db: Db) {
               worktreePath: null,
               warnings: [],
               created: false,
+              branchCreatedByRuntime: false,
             },
             config: { workspaceRuntime: runtimeConfig },
             adapterEnv: {},
@@ -584,7 +587,9 @@ export function projectRoutes(db: Db) {
 
         const currentDesiredState: WorkspaceRuntimeDesiredState =
           workspace.runtimeConfig?.desiredState
-          ?? ((workspace.runtimeServices ?? []).some((service) => service.status === "starting" || service.status === "running")
+          ?? ((workspace.runtimeServices ?? []).some((service) =>
+            service.status === "provisioning" || service.status === "starting" || service.status === "running"
+          )
             ? "running"
             : "stopped");
         const nextRuntimeState: {
@@ -662,12 +667,8 @@ export function projectRoutes(db: Db) {
   router.delete("/projects/:id/workspaces/:workspaceId", async (req, res) => {
     const id = req.params.id as string;
     const workspaceId = req.params.workspaceId as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!existing) return;
     const workspace = await svc.removeWorkspace(id, workspaceId);
     if (!workspace) {
       res.status(404).json({ error: "Project workspace not found" });
@@ -694,12 +695,8 @@ export function projectRoutes(db: Db) {
 
   router.delete("/projects/:id", async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Project not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
+    if (!existing) return;
     const project = await svc.remove(id);
     if (!project) {
       res.status(404).json({ error: "Project not found" });

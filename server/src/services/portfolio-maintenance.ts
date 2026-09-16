@@ -1382,13 +1382,6 @@ export function portfolioMaintenanceService(db: Db, options: PortfolioMaintenanc
               const cancellation = await heartbeatService(txDb).cancelInvocationsForAgents(
                 input.agentIds,
                 "Cancelled by portfolio maintenance",
-                {
-                  errorCode: "portfolio_maintenance_quiesced",
-                  suppressDeferredPromotion: true,
-                  suppressEvents: true,
-                  requireProcessTerminationEvidence: true,
-                  agentStartLocksHeld: true,
-                },
               );
               if (cancellation.runsCancelled !== activeRunIds.length) {
                 throw conflict("Portfolio maintenance run coverage changed during cleanup", {

@@ -2,7 +2,7 @@ const GLOBAL_CLAUDE_PERMISSION_BYPASS_FLAG = "--dangerously-skip-permissions";
 const ALLOWED_CLAUDE_EXTRA_ARGS = new Set(["--no-session-persistence"]);
 // Remote sandbox runs are non-interactive, so the runtime owns one immutable
 // tool scope. Agent configuration may not replace or extend this list.
-const SANDBOX_ALLOWED_TOOLS =
+export const SANDBOX_ALLOWED_TOOLS =
   "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit " +
   "EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor " +
   "NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill " +
@@ -50,20 +50,30 @@ export function assertClaudePermissionConfigIsFailClosed(config: unknown) {
   assertClaudeExtraArgsAreAllowlisted(legacyArgs);
 }
 
+function shouldUseAllowedTools(input: { targetIsRemote: boolean; localProcessUid?: number | null }): boolean {
+  // Claude Code refuses `--dangerously-skip-permissions` when the process runs
+  // as root. Use the same explicit allowlist that remote targets use so local
+  // Docker/root probes and executions fail safe instead of hard-failing before
+  // auth/runtime validation can complete.
+  return input.targetIsRemote || input.localProcessUid === 0;
+}
+
 export function buildClaudeProbePermissionArgs(input: {
   dangerouslySkipPermissions?: boolean;
   allowedTools?: string[];
   targetIsRemote: boolean;
+  localProcessUid?: number | null;
 }): string[] {
   assertClaudePermissionConfigIsFailClosed(input);
-  return input.targetIsRemote ? ["--allowedTools", SANDBOX_ALLOWED_TOOLS] : [];
+  return shouldUseAllowedTools(input) ? ["--allowedTools", SANDBOX_ALLOWED_TOOLS] : [];
 }
 
 export function buildClaudeExecutionPermissionArgs(input: {
   dangerouslySkipPermissions?: boolean;
   allowedTools?: string[];
   targetIsRemote: boolean;
+  localProcessUid?: number | null;
 }): string[] {
   assertClaudePermissionConfigIsFailClosed(input);
-  return input.targetIsRemote ? ["--allowedTools", SANDBOX_ALLOWED_TOOLS] : [];
+  return shouldUseAllowedTools(input) ? ["--allowedTools", SANDBOX_ALLOWED_TOOLS] : [];
 }
