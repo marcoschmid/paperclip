@@ -65,27 +65,38 @@ describe("logger translateTime respects TZ environment variable", () => {
     vi.clearAllMocks();
   });
 
-  // Upgrade v2026.831: Fork-Logger (Dateilog mit 0600, Rotation, Redaction) statt Upstream-pino-pretty-Transport.
-  it.skip("configures pino-pretty with SYS:HH:MM:ss so timestamps honour the TZ env var", async () => {
+  it("configures both pino-pretty targets with SYS:HH:MM:ss so timestamps honour the TZ env var", async () => {
     vi.stubEnv("NODE_ENV", "development");
     await import("../middleware/logger.js");
 
     expect(mockTransport).toHaveBeenCalledOnce();
-    const transport = mockTransport.mock.calls[0][0] as {
-      target: string;
-      options: Record<string, unknown>;
+    const transportOpts = mockTransport.mock.calls[0][0] as {
+      targets: Array<{ target: string; options: Record<string, unknown> }>;
     };
-    expect(transport.target).toBe("pino-pretty");
-    expect(transport.options.translateTime).toBe("SYS:HH:MM:ss");
+    expect(transportOpts.targets).toHaveLength(2);
+    for (const target of transportOpts.targets) {
+      expect(target.target).toBe("pino-pretty");
+      expect(target.options.translateTime).toBe("SYS:HH:MM:ss");
+    }
   });
 
-  // Upgrade v2026.831: Fork-Logger (Dateilog mit 0600, Rotation, Redaction) statt Upstream-pino-pretty-Transport.
-  it.skip("does not construct a pretty transport in production", async () => {
+  // The fork always builds both pino-pretty targets (console + file), in every
+  // NODE_ENV, unlike upstream's dev-only pretty transport — the file target is
+  // how production logs land on disk with 0600 perms and redaction.
+  it("still constructs a pretty transport (console + file) in production", async () => {
     vi.stubEnv("NODE_ENV", "production");
     await import("../middleware/logger.js");
 
-    expect(mockTransport).not.toHaveBeenCalled();
-    expect(mockPino).toHaveBeenCalledWith(expect.objectContaining({ level: "info" }));
+    expect(mockTransport).toHaveBeenCalledOnce();
+    const transportOpts = mockTransport.mock.calls[0][0] as {
+      targets: Array<{ target: string; level: string; options: Record<string, unknown> }>;
+    };
+    expect(transportOpts.targets).toHaveLength(2);
+    const consoleTarget = transportOpts.targets.find((t) => t.level === "info");
+    const fileTarget = transportOpts.targets.find((t) => t.level === "debug");
+    expect(consoleTarget?.options.colorize).toBe(true);
+    expect(fileTarget?.options.colorize).toBe(false);
+    expect(mockPino).toHaveBeenCalledWith(expect.objectContaining({ level: "info" }), expect.anything());
     expect(mockOpenSync).toHaveBeenCalledWith("/tmp/paperclip-test-logs/server.log", "a", 0o600);
     expect(mockCloseSync).toHaveBeenCalledWith(7);
     expect(mockChmodSync).toHaveBeenCalledWith("/tmp/paperclip-test-logs/server.log", 0o600);

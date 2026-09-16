@@ -171,8 +171,7 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
-  // Upgrade v2026.831: Darstellung eines z.null()-Fork-Felds im OpenAPI-Dokument weicht ab; nur Doku, Folgeaufgabe.
-  it.skip("serves the generated OpenAPI document", async () => {
+  it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 
     expect(res.status).toBe(200);

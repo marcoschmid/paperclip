@@ -430,9 +430,7 @@ describe("claude execute", () => {
    * On resumed sessions the instructions are already in the session cache;
    * re-injecting them wastes tokens and may be rejected by the CLI.
    */
-  // Upgrade v2026.831: Upstream fuehrt die Terminal-Bereinigung selbst (unmanagedBackgroundTask)
-  // und normalisiert Exitcode/Signal nicht mehr. Fork-Erwartung als Folgeaufgabe offen.
-  it.skip(
+  it(
     "normalizes only a successful Claude result terminated by terminal-result cleanup",
     async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-terminal-cleanup-"));
@@ -452,9 +450,10 @@ describe("claude execute", () => {
       try {
         const result = await execute({
           runId: "run-terminal-cleanup-success",
-          agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+          agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
           runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
           config: {
+            engine: "cli",
             command: commandPath,
             cwd: workspace,
             promptTemplate: "Do bounded work.",
@@ -479,9 +478,7 @@ describe("claude execute", () => {
     },
   );
 
-  // Upgrade v2026.831: Upstream fuehrt die Terminal-Bereinigung selbst (unmanagedBackgroundTask)
-  // und normalisiert Exitcode/Signal nicht mehr. Fork-Erwartung als Folgeaufgabe offen.
-  it.skip(
+  it(
     "fails closed when a real SIGTERM follows a parsed Claude success result",
     async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-real-sigterm-"));
@@ -500,9 +497,10 @@ describe("claude execute", () => {
       try {
         const result = await execute({
           runId: "run-real-sigterm-after-success",
-          agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+          agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
           runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
           config: {
+            engine: "cli",
             command: commandPath,
             cwd: workspace,
             promptTemplate: "Do bounded work.",

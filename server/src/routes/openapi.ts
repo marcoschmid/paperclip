@@ -382,7 +382,7 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
   if (typeName === "boolean") return { type: "boolean" };
   if (typeName === "date") return { type: "string", format: "date-time" };
   if (typeName === "any" || typeName === "unknown") return {};
-  if (typeName === "ZodNull") return { nullable: true, enum: [null] };
+  if (typeName === "null") return { nullable: true, enum: [null] };
 
   if (typeName === "literal") {
     const values = def.values as unknown[];
