@@ -1326,9 +1326,7 @@ describeEmbeddedPostgres("portfolio maintenance service", () => {
     },
   );
 
-  // Upgrade v2026.831: Prozess-Identitaets-Fence beim Quiesce noch nicht auf die
-  // Upstream-heartbeat portiert. Folgeaufgabe.
-  it.skip(
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
     "keeps the maintenance fence restart-safe and never signals an active PID without exact identity",
     async () => {
     const fixture = await seedPortfolio();
@@ -1411,9 +1409,7 @@ describeEmbeddedPostgres("portfolio maintenance service", () => {
     },
   );
 
-  // Upgrade v2026.831: Prozess-Identitaets-Fence beim Quiesce noch nicht auf die
-  // Upstream-heartbeat portiert. Folgeaufgabe.
-  it.skip("keeps a recoverable receipt-bound fence and retries after process evidence is repaired", async () => {
+  it("keeps a recoverable receipt-bound fence and retries after process evidence is repaired", async () => {
     const fixture = await seedPortfolio();
     await db.update(heartbeatRuns).set({
       processPid: null,

@@ -21541,7 +21541,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     reason = "Cancelled due to agent pause",
     errorCode = "cancelled",
-    options: { suppressDeferredPromotion?: boolean } = {},
+    options: { suppressDeferredPromotion?: boolean; requireProcessIdentityFence?: boolean } = {},
   ) {
     const agent = await getAgent(agentId);
     const runs = await db
@@ -21550,6 +21550,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
+      // Only a "running" row can have an actual OS process attached; queued
+      // and scheduled-retry runs never spawned one, so there is nothing for
+      // the identity fence to prove or disprove.
+      if (options.requireProcessIdentityFence && run.status === "running") {
+        await cancelActiveRunWithinProcessIdentityFence(run, agent, reason, errorCode, options);
+        continue;
+      }
+
       await setRunStatus(run.id, "cancelled", {
         finishedAt: new Date(),
         error: reason,
@@ -21588,6 +21596,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     return runs.length;
+  }
+
+  // Fork-Fence-Pfad: anders als der Upstream-Cancel-Weg oben wird ein aktiver
+  // Lauf hier nur signalisiert, wenn seine gespeicherte Prozess-Identitaet
+  // gegen das laufende Betriebssystem bewiesen ist (gleiches Muster wie
+  // terminateTerminalOrphanProcessesInternal). Ohne Identitaetsnachweis bleibt
+  // die Maintenance-Fence bestehen und der Aufrufer kann nach einer Reparatur
+  // der Prozessevidenz denselben operationId gefahrlos wiederholen.
+  async function cancelActiveRunWithinProcessIdentityFence(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: Awaited<ReturnType<typeof getAgent>>,
+    reason: string,
+    errorCode: string,
+    options: { suppressDeferredPromotion?: boolean },
+  ) {
+    const finalizeCancelled = async (context: { run: typeof heartbeatRuns.$inferSelect }) => {
+      await setRunStatus(context.run.id, "cancelled", {
+        finishedAt: new Date(),
+        error: reason,
+        errorCode,
+        ...(agent ? {
+          resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
+            resultJson: parseObject(context.run.resultJson),
+            errorCode,
+            errorMessage: reason,
+          }),
+        } : {}),
+      });
+      await setWakeupStatus(context.run.wakeupRequestId, "cancelled", {
+        finishedAt: new Date(),
+        error: reason,
+      });
+      await releaseIssueExecutionAndPromote(context.run, {
+        suppressDeferredPromotion: options.suppressDeferredPromotion,
+      });
+      return true;
+    };
+
+    const verification = await verifyStoredLocalProcessIdentity(run);
+    if (verification.kind === "not_running") {
+      await finalizeHeartbeatRunWithoutSignalWithinFence({
+        db,
+        expectedRun: run,
+        ...(agent ? { expectedAgentStatus: agent.status } : {}),
+        hooks: { terminalize: finalizeCancelled },
+      });
+      runningProcesses.delete(run.id);
+      return;
+    }
+    if (verification.kind !== "verified") {
+      throw conflict(
+        verification.reason === "missing_pid"
+          ? "Active run has no recorded process evidence to prove or disprove liveness"
+          : "Active process identity could not be proven",
+        {
+          code: verification.reason === "missing_pid"
+            ? "portfolio_maintenance_process_evidence_missing"
+            : "portfolio_maintenance_process_identity_unproven",
+          runId: run.id,
+          reason: verification.reason,
+          manualInterventionRequired: true,
+        },
+      );
+    }
+
+    const running = runningProcesses.get(run.id);
+    await terminateHeartbeatRunProcessWithinFence({
+      db,
+      expectedRun: run,
+      ...(agent ? { expectedAgentStatus: agent.status } : {}),
+      identity: verification.identity,
+      ...(running ? { graceMs: Math.max(1, running.graceSec) * 1000 } : {}),
+      hooks: { terminalize: finalizeCancelled },
+    });
+    runningProcesses.delete(run.id);
   }
 
   async function cancelPendingWakeupsForAgentsInternal(agentIds: string[], reason: string) {
@@ -21695,13 +21778,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function cancelInvocationsForAgentsInternal(
     agentIds: string[],
     reason: string,
-    options: { errorCode?: string; suppressDeferredPromotion?: boolean } = {},
+    options: {
+      errorCode?: string;
+      suppressDeferredPromotion?: boolean;
+      requireProcessIdentityFence?: boolean;
+    } = {},
   ) {
     const uniqueAgentIds = [...new Set(agentIds)].filter((agentId) => agentId.length > 0);
     let runsCancelled = 0;
     for (const agentId of uniqueAgentIds) {
       runsCancelled += await cancelActiveForAgentInternal(agentId, reason, options.errorCode ?? "cancelled", {
         suppressDeferredPromotion: options.suppressDeferredPromotion,
+        requireProcessIdentityFence: options.requireProcessIdentityFence,
       });
     }
     const wakeupsCancelled = await cancelPendingWakeupsForAgentsInternal(uniqueAgentIds, reason);
@@ -22142,7 +22230,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelInvocationsForAgents: (
       agentIds: string[],
       reason: string,
-      options?: { errorCode?: string; suppressDeferredPromotion?: boolean },
+      options?: { errorCode?: string; suppressDeferredPromotion?: boolean; requireProcessIdentityFence?: boolean },
     ) => cancelInvocationsForAgentsInternal(agentIds, reason, options),
     terminateTerminalOrphanProcesses: (runIds: string[]) =>
       terminateTerminalOrphanProcessesInternal(runIds),

@@ -1387,6 +1387,7 @@ export function portfolioMaintenanceService(db: Db, options: PortfolioMaintenanc
                 {
                   errorCode: "portfolio_maintenance_quiesced",
                   suppressDeferredPromotion: true,
+                  requireProcessIdentityFence: true,
                 },
               );
               if (cancellation.runsCancelled !== activeRunIds.length) {
