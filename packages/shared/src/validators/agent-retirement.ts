@@ -11,7 +11,6 @@ const approvalNonceSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const agentRetirementUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export const AGENT_RETIREMENT_APPROVAL_MARKER = "PAPERCLIP_RETIREMENT_APPROVAL_V1";
-export const AGENT_RETIREMENT_APPROVAL_SCOPE = "27_allowlisted_sources_tombstone_only";
 
 export interface AgentRetirementAllowlistEntry {
   sourceAgentId: string;
@@ -21,6 +20,14 @@ export interface AgentRetirementAllowlistEntry {
   replacementSystemRef: string | null;
   canaryAgentId: string;
   decisionIssueId: string;
+  retirementWave: number;
+}
+
+// A retirement wave is one human-approved, atomically registered plan scope.
+// Earlier waves stay allowlisted so their audited plans remain verifiable.
+export interface AgentRetirementWave {
+  wave: number;
+  sourceIds: readonly string[];
 }
 
 export interface AgentRetirementHistoricalTombstone {
@@ -44,6 +51,46 @@ export const AGENT_RETIREMENT_ALLOWLIST_ENTRIES: readonly AgentRetirementAllowli
 export const AGENT_RETIREMENT_ALLOWLIST: ReadonlyMap<string, AgentRetirementAllowlistEntry> = new Map(
   AGENT_RETIREMENT_ALLOWLIST_ENTRIES.map((entry) => [entry.sourceAgentId, entry]),
 );
+
+export function buildAgentRetirementWaves(
+  entries: readonly Pick<AgentRetirementAllowlistEntry, "sourceAgentId" | "retirementWave">[],
+): readonly AgentRetirementWave[] {
+  const sourceIds = entries.map((entry) => entry.sourceAgentId);
+  if (entries.length === 0 || new Set(sourceIds).size !== sourceIds.length) {
+    throw new Error("Retirement waves require unique allowlisted sources");
+  }
+  const invalid = entries.find((entry) => (
+    typeof entry.retirementWave !== "number"
+    || !Number.isSafeInteger(entry.retirementWave)
+    || entry.retirementWave < 1
+  ));
+  if (invalid) {
+    throw new Error(`Retirement wave of ${invalid.sourceAgentId} must be a positive integer`);
+  }
+  const waveNumbers = [...new Set(entries.map((entry) => entry.retirementWave))].sort((left, right) => left - right);
+  if (waveNumbers.some((wave, index) => wave !== index + 1)) {
+    throw new Error("Retirement waves must be numbered contiguously from 1");
+  }
+  return Object.freeze(waveNumbers.map((wave) => Object.freeze({
+    wave,
+    sourceIds: Object.freeze(entries
+      .filter((entry) => entry.retirementWave === wave)
+      .map((entry) => entry.sourceAgentId)
+      .sort()),
+  })));
+}
+
+export const AGENT_RETIREMENT_WAVES: readonly AgentRetirementWave[] =
+  buildAgentRetirementWaves(AGENT_RETIREMENT_ALLOWLIST_ENTRIES);
+
+export const AGENT_RETIREMENT_CURRENT_WAVE: AgentRetirementWave =
+  AGENT_RETIREMENT_WAVES[AGENT_RETIREMENT_WAVES.length - 1]!;
+
+export function agentRetirementApprovalScope(wave: AgentRetirementWave) {
+  return `wave${wave.wave}_${wave.sourceIds.length}_allowlisted_sources_tombstone_only`;
+}
+
+export const AGENT_RETIREMENT_APPROVAL_SCOPE = agentRetirementApprovalScope(AGENT_RETIREMENT_CURRENT_WAVE);
 
 export function normalizeAgentRetirementId(
   agentId: string | null | undefined,
@@ -89,12 +136,15 @@ export const agentRetirementApprovalBindingSchema = z.object({
 
 export type AgentRetirementApprovalBinding = z.infer<typeof agentRetirementApprovalBindingSchema>;
 
-export function formatAgentRetirementApprovalComment(raw: AgentRetirementApprovalBinding) {
+export function formatAgentRetirementApprovalComment(
+  raw: AgentRetirementApprovalBinding,
+  scope: string = AGENT_RETIREMENT_APPROVAL_SCOPE,
+) {
   const value = agentRetirementApprovalBindingSchema.parse(raw);
   return [
     AGENT_RETIREMENT_APPROVAL_MARKER,
     "issue=TEC-355",
-    `scope=${AGENT_RETIREMENT_APPROVAL_SCOPE}`,
+    `scope=${scope}`,
     `approvalNonce=${value.approvalNonce}`,
     `manifestSha256=${value.manifestSha256}`,
     `backupSha256=${value.backupSha256}`,
@@ -104,6 +154,7 @@ export function formatAgentRetirementApprovalComment(raw: AgentRetirementApprova
 
 export function parseAgentRetirementApprovalComment(
   body: string,
+  scope: string = AGENT_RETIREMENT_APPROVAL_SCOPE,
 ): AgentRetirementApprovalBinding | null {
   if (typeof body !== "string") return null;
   const lines = body.split("\n");
@@ -111,7 +162,7 @@ export function parseAgentRetirementApprovalComment(
     lines.length !== 7
     || lines[0] !== AGENT_RETIREMENT_APPROVAL_MARKER
     || lines[1] !== "issue=TEC-355"
-    || lines[2] !== `scope=${AGENT_RETIREMENT_APPROVAL_SCOPE}`
+    || lines[2] !== `scope=${scope}`
   ) return null;
   const parsed = agentRetirementApprovalBindingSchema.safeParse({
     approvalNonce: lines[3]?.replace(/^approvalNonce=/, ""),
@@ -119,7 +170,7 @@ export function parseAgentRetirementApprovalComment(
     backupSha256: lines[5]?.replace(/^backupSha256=/, ""),
     restoreReceiptSha256: lines[6]?.replace(/^restoreReceiptSha256=/, ""),
   });
-  if (!parsed.success || formatAgentRetirementApprovalComment(parsed.data) !== body) return null;
+  if (!parsed.success || formatAgentRetirementApprovalComment(parsed.data, scope) !== body) return null;
   return parsed.data;
 }
 
@@ -251,15 +302,11 @@ export const agentRetirementEvidenceBySourceIdSchema = z.record(
   z.string().uuid(),
   agentRetirementEvidenceSchema,
 ).superRefine((value, ctx) => {
-  const expectedSourceIds = [...AGENT_RETIREMENT_ALLOWLIST.keys()].sort();
-  const actualSourceIds = Object.keys(value).sort();
-  if (
-    actualSourceIds.length !== expectedSourceIds.length
-    || actualSourceIds.some((sourceId, index) => sourceId !== expectedSourceIds[index])
-  ) {
+  // Shape only: the service binds a bundle to the exact source set of one wave.
+  if (Object.keys(value).length === 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: "Evidence bundle must contain exactly the canonical 27 retirement sources",
+      message: "Evidence bundle must contain at least one retirement source",
       path: [],
     });
   }
@@ -278,7 +325,10 @@ export const agentRetirementPlanSchema = z.object({
   schemaVersion: z.literal("1.0.0"),
   kind: z.literal("paperclip_retirement_plan"),
   manifestFingerprint: fingerprintSchema,
-  sourceIds: z.array(z.string().uuid()).length(27),
+  sourceIds: z.array(z.string().uuid()).min(1).refine(
+    (sourceIds) => new Set(sourceIds).size === sourceIds.length,
+    "Retirement plan sources must be unique",
+  ),
   evidenceSha256: sha256Schema,
   approvalCommentId: z.string().uuid(),
   approvalFingerprint: fingerprintSchema,

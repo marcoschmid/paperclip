@@ -41,9 +41,14 @@ import {
   AGENT_RETIREMENT_ALLOWLIST_ENTRIES,
   AGENT_RETIREMENT_HISTORICAL_TOMBSTONES,
   AGENT_RETIREMENT_RETAINED_AGENTS,
+  AGENT_RETIREMENT_WAVES,
   type AgentRetirementEvidence,
 } from "@paperclipai/shared";
-import { agentRetirementService } from "../services/agent-retirement.js";
+import {
+  agentRetirementService as createAgentRetirementService,
+  resolveRetirementWaves,
+  retirementWaveManifestFingerprint,
+} from "../services/agent-retirement.js";
 import {
   RETIREMENT_RESTORE_CANONICAL_AGENT_PARTITION,
   RETIREMENT_RESTORE_FULL_COLUMNS,
@@ -65,6 +70,20 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+// The legacy suite exercises one atomic plan over all 27 sources, the shape of
+// the July wave. Wave-specific behavior is covered separately below.
+const LEGACY_SINGLE_WAVE = [AGENT_RETIREMENT_ALLOWLIST_ENTRIES.map((entry) => entry.sourceAgentId)];
+const LEGACY_APPROVAL_SCOPE = "wave1_27_allowlisted_sources_tombstone_only";
+const JULY_PLAN_MANIFEST_FINGERPRINT =
+  "v1:sha256:1af843078e37f5ac61e4a41679dbfa354767160ecdc001a50a66936adf4a8b13";
+
+function agentRetirementService(
+  targetDb: Parameters<typeof createAgentRetirementService>[0],
+  options: Parameters<typeof createAgentRetirementService>[1] = {},
+) {
+  return createAgentRetirementService(targetDb, { retirementWaves: LEGACY_SINGLE_WAVE, ...options });
+}
 
 const SOURCE_ID = "007bcd1f-0462-4c9e-b58a-c6c546393f41";
 const COMPANY_ID = "51eb52b7-49ed-461a-bd67-7384158374e6";
@@ -456,11 +475,11 @@ function approvalText(binding: {
   manifestSha256: string;
   backupSha256: string;
   restoreReceiptSha256: string;
-}) {
+}, scope = LEGACY_APPROVAL_SCOPE) {
   return [
     "PAPERCLIP_RETIREMENT_APPROVAL_V1",
     "issue=TEC-355",
-    "scope=27_allowlisted_sources_tombstone_only",
+    `scope=${scope}`,
     `approvalNonce=${binding.approvalNonce}`,
     `manifestSha256=${binding.manifestSha256}`,
     `backupSha256=${binding.backupSha256}`,
@@ -843,6 +862,34 @@ describe("agent retirement restore inventory", () => {
   });
 });
 
+describe("agent retirement waves", () => {
+  it("binds wave 1 to the exact July plan manifest and schedules Authentik as the current wave", () => {
+    const registry = resolveRetirementWaves();
+    expect(registry.waves).toBe(AGENT_RETIREMENT_WAVES);
+    expect(registry.waves.map((wave) => wave.sourceIds.length)).toEqual([26, 1]);
+    expect(retirementWaveManifestFingerprint(registry.waves[0]!)).toBe(JULY_PLAN_MANIFEST_FINGERPRINT);
+    expect(registry.current).toEqual({ wave: 2, sourceIds: ["04c5ffc3-7eb8-428f-8225-0c50063667e9"] });
+    expect(retirementWaveManifestFingerprint(resolveRetirementWaves(LEGACY_SINGLE_WAVE).current))
+      .toBe(`v1:sha256:${MANIFEST_SHA256}`);
+  });
+
+  it("rejects wave overrides with unknown, repeated, or missing sources", () => {
+    const [first, second] = LEGACY_SINGLE_WAVE[0]!;
+    expect(resolveRetirementWaves([[first!], [second!]]).current).toEqual({ wave: 2, sourceIds: [second] });
+    for (const invalid of [
+      [],
+      [[]],
+      [[first!], []],
+      [[first!], [first!]],
+      [[first!, first!]],
+      [["91000000-0000-4000-8000-000000000001"]],
+      [[first!.toUpperCase()]],
+    ]) {
+      expect(() => resolveRetirementWaves(invalid), JSON.stringify(invalid)).toThrow();
+    }
+  });
+});
+
 describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -955,6 +1002,7 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
       substituteRetainedAgent?: boolean;
       pathSuffix?: string;
       freshRecoveryReview?: boolean;
+      sourceRowOverrides?: Record<string, Record<string, unknown>>;
     } = {},
   ) {
     const suffix = `${sourceAgentId}${timestamps.pathSuffix ?? ""}`;
@@ -974,7 +1022,10 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
       })}\n`,
       sourceExportCapturedAt,
     );
-    const fullSourceRows = retirementFullSourceRows();
+    const fullSourceRows = retirementFullSourceRows().map((row) => ({
+      ...row,
+      ...(timestamps.sourceRowOverrides?.[row.id] ?? {}),
+    }));
     const canonicalRetainedRows = retirementFullRetainedRows({
       freshRecoveryReview: timestamps.freshRecoveryReview,
     });
@@ -1287,8 +1338,12 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     };
   }
 
-  function fullPlanEvidence(primary: AgentRetirementEvidence) {
+  function fullPlanEvidence(
+    primary: AgentRetirementEvidence,
+    sourceIds: readonly string[] = LEGACY_SINGLE_WAVE[0]!,
+  ) {
     return Object.fromEntries(AGENT_RETIREMENT_ALLOWLIST_ENTRIES
+      .filter((entry) => sourceIds.includes(entry.sourceAgentId))
       .map((entry) => {
         if (entry.sourceAgentId === primary.source.sourceAgentId) {
           return [entry.sourceAgentId, structuredClone(primary)];
@@ -1612,6 +1667,10 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     input: AgentRetirementEvidence,
     validatedAt = NOW,
     evidenceBySourceId = fullPlanEvidence(input),
+    planScope: { sourceIds: readonly string[]; manifestSha256: string } = {
+      sourceIds: LEGACY_SINGLE_WAVE[0]!,
+      manifestSha256: MANIFEST_SHA256,
+    },
   ) {
     const restoreReceipt = JSON.parse(fs.readFileSync(input.backupRestore.restoreEvidencePath, "utf8"));
     const scratch = restoreReceipt.scratchRestore;
@@ -1625,8 +1684,8 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     const core = {
       schemaVersion: "1.0.0",
       kind: "paperclip_retirement_plan",
-      manifestFingerprint: `v1:sha256:${MANIFEST_SHA256}`,
-      sourceIds: AGENT_RETIREMENT_ALLOWLIST_ENTRIES.map((entry) => entry.sourceAgentId).sort(),
+      manifestFingerprint: `v1:sha256:${planScope.manifestSha256}`,
+      sourceIds: [...planScope.sourceIds].sort(),
       evidenceSha256: stableSha256(evidenceBySourceId),
       approvalCommentId: input.humanGate.commentId,
       approvalFingerprint: `v1:sha256:${stableSha256(input.humanGate)}`,
@@ -3467,6 +3526,490 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     } as any)).rejects.toMatchObject({
       status: 409,
       details: { code: "retirement_plan_invalid" },
+    });
+  });
+
+  describe("retirement waves", () => {
+    const WAVE_TWO_ENTRY = AGENT_RETIREMENT_ALLOWLIST_ENTRIES.find((entry) => (
+      entry.sourceAgentId !== SOURCE_ID && entry.canaryAgentId === REPLACEMENT_ID
+    ))!;
+    const WAVE_ONE = [SOURCE_ID];
+    const WAVE_TWO = [WAVE_TWO_ENTRY.sourceAgentId];
+    const WAVE_TWO_CLOCK = new Date("2026-07-13T10:25:00.000Z");
+    const WAVE_TWO_COMMENT_ID = "99999999-9999-4999-8999-999999999999";
+    const WAVE_TWO_NONCE = "e".repeat(64);
+
+    function waveScope(wave: number, sourceIds: readonly string[]) {
+      return `wave${wave}_${sourceIds.length}_allowlisted_sources_tombstone_only`;
+    }
+
+    function waveManifestSha256(sourceIds: readonly string[]) {
+      return stableSha256(CANONICAL_RETIREMENT_MANIFEST.filter((entry) => (
+        sourceIds.includes(entry.sourceAgentId)
+      )));
+    }
+
+    function waveService(retirementWaves: readonly (readonly string[])[], now: Date) {
+      return createAgentRetirementService(db, {
+        now: () => new Date(now),
+        backupRoot,
+        retirementEvidenceRoot,
+        workspaceRoot,
+        retirementWaves,
+      });
+    }
+
+    function withWaveApproval(
+      base: Omit<AgentRetirementEvidence, "humanGate">,
+      gate: {
+        commentId: string;
+        nonce: string;
+        approvedAt: string;
+        wave: number;
+        sourceIds: readonly string[];
+        scope?: string;
+      },
+    ): AgentRetirementEvidence {
+      const binding = {
+        approvalNonce: gate.nonce,
+        manifestSha256: waveManifestSha256(gate.sourceIds),
+        backupSha256: base.backupRestore.dumpSha256,
+        restoreReceiptSha256: base.backupRestore.restoreEvidenceSha256,
+      };
+      return {
+        ...base,
+        humanGate: {
+          issueIdentifier: "TEC-355",
+          issueId: DECISION_ISSUE_ID,
+          commentId: gate.commentId,
+          approvedAt: gate.approvedAt,
+          ...binding,
+          approvedTextSha256: sha256(approvalText(binding, gate.scope ?? waveScope(gate.wave, gate.sourceIds))),
+        },
+      };
+    }
+
+    async function postApproval(input: AgentRetirementEvidence, scope: string) {
+      await db.delete(issueComments).where(eq(issueComments.id, input.humanGate.commentId));
+      await db.insert(issueComments).values({
+        id: input.humanGate.commentId,
+        companyId: COMPANY_ID,
+        issueId: DECISION_ISSUE_ID,
+        authorUserId: "iYvM2oV6FdHMFF6UhD5RQU21dekyfX7B",
+        authorType: "user",
+        body: approvalText(input.humanGate, scope),
+        createdAt: new Date(input.humanGate.approvedAt),
+      });
+    }
+
+    function wavePlanRequest(
+      input: AgentRetirementEvidence,
+      sourceIds: readonly string[],
+      validatedAt: Date,
+      evidenceBySourceId: Record<string, AgentRetirementEvidence> = { [input.source.sourceAgentId]: input },
+    ) {
+      return {
+        evidence: input,
+        plan: retirementPlan(input, validatedAt, evidenceBySourceId, {
+          sourceIds,
+          manifestSha256: waveManifestSha256(sourceIds),
+        }),
+        evidenceBySourceId,
+        claimExecution: true,
+        executionClaimReceiptId: null,
+      };
+    }
+
+    async function retireThroughTermination(
+      retirement: ReturnType<typeof createAgentRetirementService>,
+      sourceId: string,
+      input: AgentRetirementEvidence,
+      request: ReturnType<typeof wavePlanRequest>,
+    ) {
+      const started = await retirement.preflight(sourceId, request as any);
+      expect(started).toMatchObject({ claimState: "started" });
+      const cleanup = await retirement.cleanup(sourceId, claimedCleanup(input, started) as any);
+      const final = await retirement.preflight(sourceId, {
+        ...request,
+        evidenceBySourceId: null,
+        claimExecution: false,
+        executionClaimReceiptId: started.executionClaimReceiptId,
+      } as any);
+      expect(final).toMatchObject({ ok: true, claimState: "termination_ready" });
+      return retirement.terminateAuthorized(sourceId, {
+        cleanupReceiptId: cleanup.receiptId,
+        preflightFingerprint: final.fingerprint,
+        expectedUpdatedAt: input.expectedUpdatedAt,
+        humanGate: input.humanGate,
+        planClaimReceiptId: started.planClaimReceiptId!,
+        executionClaimReceiptId: started.executionClaimReceiptId!,
+      });
+    }
+
+    async function retireWaveOne() {
+      const { humanGate: _legacyGate, ...base } = evidence();
+      const input = withWaveApproval(base, {
+        commentId: HUMAN_COMMENT_ID,
+        nonce: APPROVAL_NONCE,
+        approvedAt: APPROVED_AT,
+        wave: 1,
+        sourceIds: WAVE_ONE,
+      });
+      await postApproval(input, waveScope(1, WAVE_ONE));
+      return retireThroughTermination(
+        waveService([WAVE_ONE], NOW),
+        SOURCE_ID,
+        input,
+        wavePlanRequest(input, WAVE_ONE, NOW),
+      );
+    }
+
+    function waveTwoEvidence(options: {
+      waveOneTerminatedAt?: string | null;
+      commentId?: string;
+      nonce?: string;
+      wave?: number;
+      sourceIds?: readonly string[];
+      scope?: string;
+    } = {}) {
+      const waveOneTerminatedAt = options.waveOneTerminatedAt === undefined
+        ? NOW.toISOString()
+        : options.waveOneTerminatedAt;
+      const artifacts = artifactEvidence(
+        WAVE_TWO_ENTRY.sourceAgentId,
+        WAVE_TWO_ENTRY.companyId,
+        WAVE_TWO_ENTRY.sourceName,
+        {
+          sourceExportCapturedAt: "2026-07-13T10:15:00.000Z",
+          masterKeyCapturedAt: "2026-07-13T10:15:30.000Z",
+          dumpCapturedAt: "2026-07-13T10:16:00.000Z",
+          restoreVerifiedAt: "2026-07-13T10:17:00.000Z",
+          pathSuffix: "-wave2",
+          sourceRowOverrides: waveOneTerminatedAt === null ? {} : {
+            [SOURCE_ID]: {
+              status: "terminated",
+              pauseReason: null,
+              pausedAt: null,
+              errorReason: null,
+              updatedAt: waveOneTerminatedAt,
+            },
+          },
+        },
+      );
+      const canary = portfolioCanaryContract(WAVE_TWO_ENTRY.canaryAgentId);
+      return withWaveApproval({
+        schemaVersion: "1.0.0",
+        source: {
+          sourceAgentId: WAVE_TWO_ENTRY.sourceAgentId,
+          companyId: WAVE_TWO_ENTRY.companyId,
+          decision: "terminate",
+          physicalDelete: false,
+        },
+        expectedUpdatedAt: SOURCE_UPDATED_AT,
+        sourceExport: artifacts.sourceExport,
+        backupRestore: artifacts.backupRestore,
+        replacement: {
+          replacementAgentId: WAVE_TWO_ENTRY.replacementAgentId,
+          replacementSystemRef: null,
+          canaryAgentId: WAVE_TWO_ENTRY.canaryAgentId,
+          canaryIssueId: canary.issueId,
+          canaryRunId: canary.runId,
+          configFingerprint: CONFIG_FINGERPRINT,
+        },
+      }, {
+        commentId: options.commentId ?? WAVE_TWO_COMMENT_ID,
+        nonce: options.nonce ?? WAVE_TWO_NONCE,
+        approvedAt: "2026-07-13T10:18:00.000Z",
+        wave: options.wave ?? 2,
+        sourceIds: options.sourceIds ?? WAVE_TWO,
+        scope: options.scope,
+      });
+    }
+
+    async function preparedWaveTwo(options: Parameters<typeof waveTwoEvidence>[0] = {}) {
+      const input = waveTwoEvidence(options);
+      await postApproval(input, options.scope ?? waveScope(options.wave ?? 2, options.sourceIds ?? WAVE_TWO));
+      return { input, request: wavePlanRequest(input, WAVE_TWO, WAVE_TWO_CLOCK) };
+    }
+
+    it("registers, cleans, and terminates a later wave after the earlier wave is terminated", async () => {
+      await seedReadyPortfolio();
+      const waveOne = await retireWaveOne();
+      expect(waveOne.receipt).toMatchObject({ status: "terminated", agentId: SOURCE_ID });
+
+      const { input, request } = await preparedWaveTwo();
+      const retirement = waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK);
+      const terminated = await retireThroughTermination(
+        retirement,
+        WAVE_TWO_ENTRY.sourceAgentId,
+        input,
+        request,
+      );
+      expect(terminated.receipt).toMatchObject({
+        status: "terminated",
+        agentId: WAVE_TWO_ENTRY.sourceAgentId,
+      });
+      const registrations = await db.select().from(activityLog)
+        .where(eq(activityLog.action, "agent.retirement_plan_registered"));
+      expect(registrations.map((row) => (row.details as Record<string, unknown>).sourceCount).sort())
+        .toEqual([1, 1]);
+      expect(await db.select().from(agentRetirementPlanClaims)).toHaveLength(2);
+      await expect(retirement.postcheck(SOURCE_ID, {
+        cleanupReceiptId: waveOne.receipt.cleanupReceiptId,
+        preflightFingerprint: waveOne.receipt.preflightFingerprint,
+        expectedUpdatedAt: SOURCE_UPDATED_AT,
+        humanGate: withWaveApproval(evidence(), {
+          commentId: HUMAN_COMMENT_ID,
+          nonce: APPROVAL_NONCE,
+          approvedAt: APPROVED_AT,
+          wave: 1,
+          sourceIds: WAVE_ONE,
+        }).humanGate,
+        planClaimReceiptId: (await db.select().from(agentRetirementPlanClaims)
+          .where(eq(agentRetirementPlanClaims.approvalCommentId, HUMAN_COMMENT_ID)))[0]!.receiptId,
+        executionClaimReceiptId: (await db.select().from(agentRetirementExecutionClaims)
+          .where(eq(agentRetirementExecutionClaims.sourceAgentId, SOURCE_ID)))[0]!.receiptId,
+      })).resolves.toMatchObject({ agentId: SOURCE_ID, status: "terminated" });
+    });
+
+    it("reports earlier-wave readiness read-only before and after the earlier wave terminates", async () => {
+      await seedReadyPortfolio();
+      const readiness = waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK);
+      await expect(readiness.assertEarlierWavesTerminated()).rejects.toMatchObject({
+        status: 409,
+        details: { code: "retirement_earlier_wave_incomplete", sourceId: SOURCE_ID },
+      });
+      await retireWaveOne();
+      await expect(readiness.assertEarlierWavesTerminated()).resolves.toBeUndefined();
+      await expect(waveService([WAVE_ONE], NOW).assertEarlierWavesTerminated()).resolves.toBeUndefined();
+    });
+
+    it("refuses a later wave while an earlier wave source is still live", async () => {
+      await seedReadyPortfolio();
+      const { request } = await preparedWaveTwo({ waveOneTerminatedAt: null });
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, request as any))
+        .rejects.toMatchObject({
+          status: 409,
+          details: { code: "retirement_earlier_wave_incomplete", sourceId: SOURCE_ID },
+        });
+      expect(await db.select().from(agentRetirementPlanClaims)).toHaveLength(0);
+    });
+
+    it("refuses a later wave when an earlier source was terminated outside the audited plan", async () => {
+      await seedReadyPortfolio();
+      await db.update(agents).set({
+        status: "terminated",
+        pauseReason: null,
+        pausedAt: null,
+        updatedAt: NOW,
+      }).where(eq(agents.id, SOURCE_ID));
+      const { request } = await preparedWaveTwo();
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, request as any))
+        .rejects.toMatchObject({
+          status: 409,
+          details: { code: "retirement_earlier_wave_incomplete", sourceId: SOURCE_ID },
+        });
+    });
+
+    it.each([
+      ["a receipt for another company", (receipt: Record<string, any>) => ({
+        ...receipt,
+        companyId: WAVE_TWO_ENTRY.companyId === COMPANY_ID ? TECHOPS_COMPANY_ID : COMPANY_ID,
+      })],
+      ["a receipt for another cleanup", (receipt: Record<string, any>) => ({
+        ...receipt,
+        cleanupReceiptId: `v1:sha256:${"0".repeat(64)}`,
+      })],
+      ["a receipt dated after the tombstone row", (receipt: Record<string, any>) => ({
+        ...receipt,
+        terminatedAt: "2026-07-13T10:11:00.000Z",
+        tombstone: { ...receipt.tombstone, updatedAt: "2026-07-13T10:11:00.000Z" },
+      })],
+    ])("refuses a later wave when the earlier termination has %s", async (_label, mutate) => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      const [activity] = await db.select().from(activityLog).where(and(
+        eq(activityLog.action, "agent.terminated"),
+        eq(activityLog.entityId, SOURCE_ID),
+      ));
+      const details = activity!.details as Record<string, any>;
+      await db.update(activityLog).set({
+        details: { ...details, receipt: mutate(details.receipt) },
+      }).where(eq(activityLog.id, activity!.id));
+      const { request } = await preparedWaveTwo();
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, request as any))
+        .rejects.toMatchObject({
+          status: 409,
+          details: { code: "retirement_earlier_wave_incomplete", sourceId: SOURCE_ID },
+        });
+    });
+
+    it("refuses a later wave when the earlier termination activity row belongs to another company", async () => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      await db.update(activityLog).set({ companyId: TECHOPS_COMPANY_ID }).where(and(
+        eq(activityLog.action, "agent.terminated"),
+        eq(activityLog.entityId, SOURCE_ID),
+      ));
+      const { request } = await preparedWaveTwo();
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, request as any))
+        .rejects.toMatchObject({
+          status: 409,
+          details: { code: "retirement_earlier_wave_incomplete", sourceId: SOURCE_ID },
+        });
+    });
+
+    it("ignores an unreceipted historical termination entry next to the one audited receipt", async () => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      await db.insert(activityLog).values({
+        companyId: COMPANY_ID,
+        actorType: "user",
+        actorId: "board",
+        action: "agent.terminated",
+        entityType: "agent",
+        entityId: SOURCE_ID,
+        agentId: SOURCE_ID,
+        details: { source: "manual" },
+        createdAt: new Date("2026-04-30T03:59:51.000Z"),
+      });
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK).assertEarlierWavesTerminated())
+        .resolves.toBeUndefined();
+    });
+
+    it("refuses cleanup and recovery of an earlier-wave source once a later wave is current", async () => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      const { humanGate: _legacyGate, ...base } = evidence();
+      const input = withWaveApproval(base, {
+        commentId: HUMAN_COMMENT_ID,
+        nonce: APPROVAL_NONCE,
+        approvedAt: APPROVED_AT,
+        wave: 1,
+        sourceIds: WAVE_ONE,
+      });
+      const [planClaim] = await db.select().from(agentRetirementPlanClaims);
+      const [execution] = await db.select().from(agentRetirementExecutionClaims)
+        .where(eq(agentRetirementExecutionClaims.sourceAgentId, SOURCE_ID));
+      const activityCount = (await db.select().from(activityLog)).length;
+      const retirement = waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK);
+      const cleanupRequest = {
+        evidence: input,
+        planClaimReceiptId: planClaim!.receiptId,
+        executionClaimReceiptId: execution!.receiptId,
+        preflightFingerprint: execution!.initialPreflightFingerprint,
+      };
+      // Replaying the exact stored cleanup only returns its audit receipt.
+      await expect(retirement.cleanup(SOURCE_ID, cleanupRequest as any))
+        .resolves.toMatchObject({ receiptId: execution!.cleanupReceiptId });
+      await expect(retirement.cleanup(SOURCE_ID, {
+        ...cleanupRequest,
+        preflightFingerprint: `v1:sha256:${"7".repeat(64)}`,
+      } as any)).rejects.toMatchObject({ status: 409, details: { code: "retirement_plan_invalid" } });
+      await expect(retirement.preflight(SOURCE_ID, {
+        evidence: input,
+        planClaimReceiptId: planClaim!.receiptId,
+        executionClaimReceiptId: execution!.receiptId,
+        recoveryRequestReceiptId: recoveryRequestReceipt(planClaim!.receiptId, execution!.receiptId, input),
+        recoverExecution: true,
+      } as any)).rejects.toMatchObject({ status: 409, details: { code: "retirement_plan_invalid" } });
+      expect((await db.select().from(activityLog)).length).toBe(activityCount);
+      expect((await db.select().from(agentRetirementExecutionClaims)
+        .where(eq(agentRetirementExecutionClaims.sourceAgentId, SOURCE_ID)))[0]).toEqual(execution);
+    });
+
+    it("accepts an earlier tombstone whose row was touched after its audited termination", async () => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      const touchedAt = "2026-07-13T10:12:00.000Z";
+      await db.update(agents).set({ updatedAt: new Date(touchedAt) }).where(eq(agents.id, SOURCE_ID));
+      const { request } = await preparedWaveTwo({ waveOneTerminatedAt: touchedAt });
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, request as any))
+        .resolves.toMatchObject({ claimState: "started" });
+    });
+
+    it("rejects reuse of the earlier wave approval for the next wave", async () => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      const reused = waveTwoEvidence({ commentId: HUMAN_COMMENT_ID, nonce: APPROVAL_NONCE });
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, wavePlanRequest(reused, WAVE_TWO, WAVE_TWO_CLOCK) as any))
+        .rejects.toMatchObject({
+          status: 409,
+          details: { code: "retirement_approval_already_consumed" },
+        });
+    });
+
+    it.each([
+      "27_allowlisted_sources_tombstone_only",
+      "26_allowlisted_sources_tombstone_only",
+      "wave1_1_allowlisted_sources_tombstone_only",
+    ])("rejects a fresh approval comment whose text carries scope %s", async (scope) => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      const { request } = await preparedWaveTwo({ scope });
+      const response = await waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, request as any);
+      expect(response).toMatchObject({ ok: false, claimState: "unclaimed" });
+      expect(response.blockers.map((blocker) => blocker.code)).toContain("human_gate_invalid");
+      expect(await db.select().from(agentRetirementPlanClaims)).toHaveLength(1);
+    });
+
+    it.each([
+      ["the earlier wave", { wave: 1, sourceIds: [SOURCE_ID] }],
+      ["the full legacy allowlist", { wave: 1, sourceIds: LEGACY_SINGLE_WAVE[0]! }],
+    ])("rejects a fresh approval bound to the manifest of %s", async (_label, gate) => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      const { request } = await preparedWaveTwo(gate);
+      await expect(waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK)
+        .preflight(WAVE_TWO_ENTRY.sourceAgentId, request as any))
+        .rejects.toMatchObject({ status: 409, details: { code: "retirement_plan_invalid" } });
+      expect(await db.select().from(agentRetirementPlanClaims)).toHaveLength(1);
+    });
+
+    it("rejects plans and bundles that reach beyond the current wave", async () => {
+      await seedReadyPortfolio();
+      await retireWaveOne();
+      const { input, request } = await preparedWaveTwo();
+      const retirement = waveService([WAVE_ONE, WAVE_TWO], WAVE_TWO_CLOCK);
+      const widerSourceIds = [...WAVE_ONE, ...WAVE_TWO];
+      const widerBundle = { ...fullPlanEvidence(input, widerSourceIds), [input.source.sourceAgentId]: input };
+      await expect(retirement.preflight(
+        WAVE_TWO_ENTRY.sourceAgentId,
+        {
+          ...request,
+          evidenceBySourceId: widerBundle,
+          plan: retirementPlan(input, WAVE_TWO_CLOCK, widerBundle, {
+            sourceIds: widerSourceIds,
+            manifestSha256: waveManifestSha256(widerSourceIds),
+          }),
+        } as any,
+      )).rejects.toMatchObject({ status: 409, details: { code: "retirement_plan_invalid" } });
+      await expect(retirement.preflight(
+        WAVE_TWO_ENTRY.sourceAgentId,
+        {
+          ...request,
+          evidenceBySourceId: widerBundle,
+          plan: retirementPlan(input, WAVE_TWO_CLOCK, widerBundle, {
+            sourceIds: WAVE_TWO,
+            manifestSha256: waveManifestSha256(WAVE_TWO),
+          }),
+        } as any,
+      )).rejects.toMatchObject({ status: 409, details: { code: "retirement_plan_evidence_mismatch" } });
+      expect(await db.select().from(agentRetirementPlanClaims)).toHaveLength(1);
+    });
+
+    it("blocks preflight for sources outside the current wave", async () => {
+      await seedReadyPortfolio();
+      const response = await waveService([WAVE_ONE, WAVE_TWO], NOW).preflight(SOURCE_ID, evidence());
+      expect(response.ok).toBe(false);
+      expect(response.blockers.map((blocker) => blocker.code)).toContain("source_not_allowlisted");
     });
   });
 });

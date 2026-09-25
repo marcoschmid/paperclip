@@ -27,7 +27,7 @@ function approvalText() {
   return [
     "PAPERCLIP_RETIREMENT_APPROVAL_V1",
     "issue=TEC-355",
-    "scope=27_allowlisted_sources_tombstone_only",
+    "scope=wave2_1_allowlisted_sources_tombstone_only",
     `approvalNonce=${APPROVAL_NONCE}`,
     `manifestSha256=${MANIFEST_SHA256}`,
     `backupSha256=${"b".repeat(64)}`,
@@ -147,6 +147,7 @@ describe("agent retirement validators", () => {
       replacementSystemRef: null,
       canaryAgentId: "96c36604-fa6b-4a15-9027-2f0b50e32cea",
       decisionIssueId: "50d6efd7-85c7-4ce0-aceb-ff6a94127200",
+      retirementWave: 2,
     });
     expect(retirementContract.normalizeAgentRetirementId(
       "3F406D3A-9B98-4687-9A89-61A3F927CBF5",
@@ -167,6 +168,78 @@ describe("agent retirement validators", () => {
     expect(retirementContract.agentRetirementCleanupRequestSchema).toBeDefined();
     expect(retirementContract.agentRetirementTerminationSchema).toBeDefined();
     expect(retirementContract.agentRetirementTerminationReceiptSchema).toBeDefined();
+  });
+
+  it("publishes contiguous retirement waves with July as wave 1 and Authentik as the current wave", () => {
+    const waves = retirementContract.AGENT_RETIREMENT_WAVES;
+    expect(waves.map((wave) => [wave.wave, wave.sourceIds.length])).toEqual([[1, 26], [2, 1]]);
+    expect(retirementContract.AGENT_RETIREMENT_CURRENT_WAVE).toEqual({
+      wave: 2,
+      sourceIds: ["04c5ffc3-7eb8-428f-8225-0c50063667e9"],
+    });
+    expect(waves[0]!.sourceIds).not.toContain("04c5ffc3-7eb8-428f-8225-0c50063667e9");
+    expect(waves[0]!.sourceIds).toEqual([...waves[0]!.sourceIds].sort());
+    expect(waves.flatMap((wave) => wave.sourceIds).sort())
+      .toEqual([...retirementContract.AGENT_RETIREMENT_ALLOWLIST.keys()].sort());
+    expect(retirementContract.AGENT_RETIREMENT_ALLOWLIST_ENTRIES.every((entry) => (
+      waves[entry.retirementWave - 1]!.sourceIds.includes(entry.sourceAgentId)
+    ))).toBe(true);
+    expect(retirementContract.agentRetirementApprovalScope(retirementContract.AGENT_RETIREMENT_CURRENT_WAVE))
+      .toBe("wave2_1_allowlisted_sources_tombstone_only");
+    expect(retirementContract.AGENT_RETIREMENT_APPROVAL_SCOPE).toBe("wave2_1_allowlisted_sources_tombstone_only");
+  });
+
+  it("rejects retirement waves that are missing, fractional, zero, or not contiguous", () => {
+    const entry = (sourceAgentId: string, retirementWave: unknown) => ({
+      sourceAgentId,
+      retirementWave: retirementWave as number,
+    });
+    const first = "11111111-1111-4111-8111-111111111111";
+    const second = "22222222-2222-4222-8222-222222222222";
+    expect(retirementContract.buildAgentRetirementWaves([entry(second, 1), entry(first, 1)]))
+      .toEqual([{ wave: 1, sourceIds: [first, second] }]);
+    for (const invalid of [
+      [entry(first, undefined)],
+      [entry(first, 1.5)],
+      [entry(first, 0)],
+      [entry(first, "1")],
+      [entry(first, 1), entry(second, 3)],
+      [entry(first, 2)],
+      [entry(first, 1), entry(first, 2)],
+      [],
+    ]) {
+      expect(() => retirementContract.buildAgentRetirementWaves(invalid), JSON.stringify(invalid)).toThrow();
+    }
+  });
+
+  it("validates plan and evidence bundle shape while the service binds the exact wave scope", () => {
+    const evidence = validEvidence();
+    expect(retirementContract.agentRetirementEvidenceBySourceIdSchema.safeParse({
+      [SOURCE_ID]: evidence,
+    }).success).toBe(true);
+    expect(retirementContract.agentRetirementEvidenceBySourceIdSchema.safeParse({}).success).toBe(false);
+    expect(retirementContract.agentRetirementEvidenceBySourceIdSchema.safeParse({
+      [REPLACEMENT_ID]: evidence,
+    }).success).toBe(false);
+    const plan = {
+      schemaVersion: "1.0.0",
+      kind: "paperclip_retirement_plan",
+      manifestFingerprint: `v1:sha256:${"1".repeat(64)}`,
+      sourceIds: [SOURCE_ID],
+      evidenceSha256: "2".repeat(64),
+      approvalCommentId: COMMENT_ID,
+      approvalFingerprint: `v1:sha256:${"3".repeat(64)}`,
+      validatedAt: "2026-07-13T10:05:00.000Z",
+      expiresAt: "2026-07-13T16:05:00.000Z",
+      commonArtifactFingerprint: `v1:sha256:${"4".repeat(64)}`,
+      receiptId: `v1:sha256:${"5".repeat(64)}`,
+    };
+    expect(retirementContract.agentRetirementPlanSchema.safeParse(plan).success).toBe(true);
+    expect(retirementContract.agentRetirementPlanSchema.safeParse({ ...plan, sourceIds: [] }).success).toBe(false);
+    expect(retirementContract.agentRetirementPlanSchema.safeParse({
+      ...plan,
+      sourceIds: [SOURCE_ID, SOURCE_ID],
+    }).success).toBe(false);
   });
 
   it("requires an exact durable request receipt for recovery and an exact execution receipt for resume", () => {
@@ -245,6 +318,19 @@ describe("agent retirement validators", () => {
     expect(retirementContract.parseAgentRetirementApprovalComment(approvalText())).toEqual(approvalBinding());
     expect(retirementContract.parseAgentRetirementApprovalComment("Erledige alles")).toBeNull();
     expect(retirementContract.parseAgentRetirementApprovalComment(`${approvalText()}\n`)).toBeNull();
+    for (const olderScope of ["26_allowlisted_sources_tombstone_only", "27_allowlisted_sources_tombstone_only"]) {
+      expect(retirementContract.parseAgentRetirementApprovalComment(
+        approvalText().replace("wave2_1_allowlisted_sources_tombstone_only", olderScope),
+      )).toBeNull();
+    }
+    const waveOneScope = retirementContract.agentRetirementApprovalScope({ wave: 1, sourceIds: [SOURCE_ID] });
+    const waveOneText = retirementContract.formatAgentRetirementApprovalComment(approvalBinding(), waveOneScope);
+    expect(waveOneText).toBe(approvalText().replace(
+      "wave2_1_allowlisted_sources_tombstone_only",
+      "wave1_1_allowlisted_sources_tombstone_only",
+    ));
+    expect(retirementContract.parseAgentRetirementApprovalComment(waveOneText, waveOneScope)).toEqual(approvalBinding());
+    expect(retirementContract.parseAgentRetirementApprovalComment(waveOneText)).toBeNull();
     for (const invalidLength of [32, 63, 65, 128]) {
       const invalidBinding = {
         ...approvalBinding(),

@@ -46,6 +46,9 @@ import {
 } from "@paperclipai/db";
 import {
   AGENT_RETIREMENT_ALLOWLIST,
+  AGENT_RETIREMENT_WAVES,
+  agentRetirementApprovalScope,
+  buildAgentRetirementWaves,
   getAgentRetirementSource,
   normalizeAgentRetirementId,
   agentLifecycleGateSchema,
@@ -75,6 +78,7 @@ import {
   type AgentRetirementPreflightResponse,
   type AgentRetirementTermination,
   type AgentRetirementTerminationReceipt,
+  type AgentRetirementWave,
 } from "@paperclipai/shared";
 import { badRequest, conflict, notFound } from "../errors.js";
 import {
@@ -179,6 +183,12 @@ type ServiceOptions = {
   retirementEvidenceRoot?: string;
   workspaceRoot?: string;
   onArtifactOpened?: (kind: string, artifactPath: string) => void | Promise<void>;
+  // Test seam: source ids per wave, wave n at index n - 1. Production uses the allowlist waves.
+  retirementWaves?: readonly (readonly string[])[];
+};
+type RetirementWaveRegistry = {
+  waves: readonly AgentRetirementWave[];
+  current: AgentRetirementWave;
 };
 type Inventory = {
   source: typeof agents.$inferSelect;
@@ -191,6 +201,7 @@ type ClaimedArtifacts = {
   commonArtifactReceipt: RetirementCommonArtifactReceipt;
 };
 type PlanRegistration = {
+  wave: AgentRetirementWave;
   registrationReceiptId: string;
   evidenceBySourceId: AgentRetirementEvidenceBySourceId;
   sourceArtifactReceiptsBySourceId: Record<string, RetirementSourceArtifactReceipt>;
@@ -297,32 +308,56 @@ function planCore(plan: AgentRetirementPlan) {
   return core;
 }
 
-function canonicalRetirementSourceIds() {
+// Every allowlisted source across all waves: the restore proof and live
+// inventory always cover the complete allowlist, not only the current wave.
+function allRetirementSourceIds() {
   return [...AGENT_RETIREMENT_ALLOWLIST.keys()].sort();
 }
 
-function canonicalManifestFingerprint() {
-  return fingerprint([...AGENT_RETIREMENT_ALLOWLIST.values()]
-    .map((entry) => ({
-      sourceAgentId: entry.sourceAgentId,
-      companyId: entry.companyId,
-      sourceName: entry.sourceName,
-      decision: "terminate",
-      physicalDelete: false,
-      replacementAgentId: entry.replacementAgentId,
-      replacementSystemRef: entry.replacementSystemRef,
-      decisionIssueId: entry.decisionIssueId,
-    }))
+export function retirementWaveManifestFingerprint(wave: AgentRetirementWave) {
+  return fingerprint(wave.sourceIds
+    .map((sourceId) => {
+      const entry = getAgentRetirementSource(sourceId);
+      if (!entry) throw new Error(`Retirement wave source ${sourceId} is not allowlisted`);
+      return {
+        sourceAgentId: entry.sourceAgentId,
+        companyId: entry.companyId,
+        sourceName: entry.sourceName,
+        decision: "terminate",
+        physicalDelete: false,
+        replacementAgentId: entry.replacementAgentId,
+        replacementSystemRef: entry.replacementSystemRef,
+        decisionIssueId: entry.decisionIssueId,
+      };
+    })
     .sort((left, right) => left.sourceAgentId.localeCompare(right.sourceAgentId)));
 }
 
-function canonicalManifestSha256() {
-  return canonicalManifestFingerprint().slice("v1:sha256:".length);
+function retirementWaveManifestSha256(wave: AgentRetirementWave) {
+  return retirementWaveManifestFingerprint(wave).slice("v1:sha256:".length);
+}
+
+export function resolveRetirementWaves(
+  override?: readonly (readonly string[])[],
+): RetirementWaveRegistry {
+  if (override?.some((sourceIds) => sourceIds.length === 0)) {
+    throw new Error("Retirement waves must not be empty");
+  }
+  const waves = override === undefined
+    ? AGENT_RETIREMENT_WAVES
+    : buildAgentRetirementWaves(override.flatMap((sourceIds, index) => (
+        sourceIds.map((sourceAgentId) => ({ sourceAgentId, retirementWave: index + 1 }))
+      )));
+  if (waves.some((wave) => wave.sourceIds.some((sourceId) => !AGENT_RETIREMENT_ALLOWLIST.has(sourceId)))) {
+    throw new Error("Retirement waves must consist of allowlisted sources only");
+  }
+  return { waves, current: waves[waves.length - 1]! };
 }
 
 function validateClientPlan(
   plan: AgentRetirementPlan,
   evidence: AgentRetirementEvidence,
+  wave: AgentRetirementWave,
   observedAt?: Date,
 ) {
   const validatedAt = new Date(plan.validatedAt);
@@ -335,9 +370,9 @@ function validateClientPlan(
     || validatedAt.getTime() < Date.parse(evidence.humanGate.approvedAt)
     || validatedAt.getTime() < Date.parse(evidence.backupRestore.restoreVerifiedAt)
     || plan.receiptId !== fingerprint(planCore(plan))
-    || plan.manifestFingerprint !== canonicalManifestFingerprint()
+    || plan.manifestFingerprint !== retirementWaveManifestFingerprint(wave)
     || plan.manifestFingerprint !== `v1:sha256:${evidence.humanGate.manifestSha256}`
-    || stableStringify(plan.sourceIds) !== stableStringify(canonicalRetirementSourceIds())
+    || stableStringify(plan.sourceIds) !== stableStringify(wave.sourceIds)
     || plan.approvalCommentId !== evidence.humanGate.commentId
     || plan.approvalFingerprint !== fingerprint(evidence.humanGate)
   ) {
@@ -413,6 +448,9 @@ export function resolveRetirementBackupRoot(configured: string) {
 
 export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
   const now = options.now ?? (() => new Date());
+  const retirementWaves = resolveRetirementWaves(options.retirementWaves);
+  const currentWave = retirementWaves.current;
+  const currentApprovalScope = agentRetirementApprovalScope(currentWave);
   const artifactOptions = () => ({
     backupRoot: options.backupRoot
       ?? resolveRetirementBackupRoot(path.join(os.homedir(), "paperclip/instances/default/data/backups")),
@@ -448,6 +486,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     const allowlisted = getAgentRetirementSource(sourceId);
     if (
       !allowlisted
+      || !currentWave.sourceIds.includes(sourceId)
       || allowlisted.companyId !== source.companyId
       || allowlisted.sourceName !== source.name
       || evidence.source.sourceAgentId !== sourceId
@@ -548,7 +587,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
         isNull(issueComments.deletedAt),
       ));
     const parsedApproval = gateComment
-      ? parseAgentRetirementApprovalComment(gateComment.body)
+      ? parseAgentRetirementApprovalComment(gateComment.body, currentApprovalScope)
       : null;
     const expectedApprovalBinding = {
       approvalNonce: evidence.humanGate.approvalNonce,
@@ -558,7 +597,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     };
     const nonceCommentIds = activeApprovalComments
       .filter((candidate) => (
-        parseAgentRetirementApprovalComment(candidate.body)?.approvalNonce
+        parseAgentRetirementApprovalComment(candidate.body, currentApprovalScope)?.approvalNonce
           === evidence.humanGate.approvalNonce
       ))
       .map((candidate) => candidate.id);
@@ -572,9 +611,9 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
       || gateComment.createdAt.getTime() <= Date.parse(evidence.backupRestore.restoreVerifiedAt)
       || parsedApproval === null
       || stableStringify(parsedApproval) !== stableStringify(expectedApprovalBinding)
-      || gateComment.body !== formatAgentRetirementApprovalComment(expectedApprovalBinding)
+      || gateComment.body !== formatAgentRetirementApprovalComment(expectedApprovalBinding, currentApprovalScope)
       || createHash("sha256").update(gateComment.body).digest("hex") !== evidence.humanGate.approvedTextSha256
-      || evidence.humanGate.manifestSha256 !== canonicalManifestSha256()
+      || evidence.humanGate.manifestSha256 !== retirementWaveManifestSha256(currentWave)
       || evidence.humanGate.backupSha256 !== evidence.backupRestore.dumpSha256
       || evidence.humanGate.restoreReceiptSha256 !== evidence.backupRestore.restoreEvidenceSha256
       || nonceCommentIds.length !== 1
@@ -867,9 +906,19 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
         code: "retirement_plan_registration_drift",
       });
     }
+    // Every stored plan is re-verified against its own wave, never the current one.
+    const wave = retirementWaves.waves.find((candidate) => (
+      stableStringify(candidate.sourceIds) === stableStringify(parsedPlan.data.sourceIds)
+      && retirementWaveManifestFingerprint(candidate) === parsedPlan.data.manifestFingerprint
+    ));
+    if (!wave || stableStringify(Object.keys(bundle.data).sort()) !== stableStringify(wave.sourceIds)) {
+      throw conflict("Retirement plan registration does not match exactly one retirement wave", {
+        code: "retirement_plan_registration_drift",
+      });
+    }
     const commonArtifactReceipt = planRow.commonArtifactReceipt as RetirementCommonArtifactReceipt;
     const sourceArtifactReceiptsBySourceId: Record<string, RetirementSourceArtifactReceipt> = {};
-    for (const sourceId of canonicalRetirementSourceIds()) {
+    for (const sourceId of wave.sourceIds) {
       const allowlisted = getAgentRetirementSource(sourceId)!;
       try {
         sourceArtifactReceiptsBySourceId[sourceId] = assertRetirementSourceArtifactReceipt(
@@ -897,7 +946,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     });
     if (
       details.schemaVersion !== "1.0.0"
-      || details.sourceCount !== canonicalRetirementSourceIds().length
+      || details.sourceCount !== wave.sourceIds.length
       || details.clientPlanReceiptId !== planRow.clientPlanReceiptId
       || details.planClaimReceiptId !== planRow.receiptId
       || details.registrationReceiptId !== expectedRegistrationReceiptId
@@ -912,11 +961,110 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
       });
     }
     return {
+      wave,
       registrationReceiptId: expectedRegistrationReceiptId,
       evidenceBySourceId: bundle.data,
       sourceArtifactReceiptsBySourceId,
       commonArtifactReceipt,
     };
+  }
+
+  // A new wave may only start once every source of every earlier wave is a
+  // tombstone backed by its own audited plan, cleanup and termination receipt.
+  // The row itself may have been touched after termination (e.g. config
+  // repairs), so the receipt must not postdate it instead of matching exactly.
+  async function assertEarlierRetirementWavesTerminated(targetDb: Db) {
+    const earlierWaves = retirementWaves.waves.filter((wave) => wave.wave < currentWave.wave);
+    const sourceIds = earlierWaves.flatMap((wave) => wave.sourceIds);
+    if (sourceIds.length === 0) return;
+    const fail = (sourceId: string): never => {
+      throw conflict("An earlier retirement wave is not completely terminated with audited receipts", {
+        code: "retirement_earlier_wave_incomplete",
+        sourceId,
+      });
+    };
+    const agentById = new Map((await targetDb
+      .select()
+      .from(agents)
+      .where(inArray(agents.id, sourceIds))).map((row) => [row.id, row]));
+    const executionBySource = new Map((await targetDb
+      .select()
+      .from(agentRetirementExecutionClaims)
+      .where(inArray(agentRetirementExecutionClaims.sourceAgentId, sourceIds)))
+      .map((row) => [row.sourceAgentId, row]));
+    const planById = new Map((await targetDb
+      .select()
+      .from(agentRetirementPlanClaims)).map((row) => [row.id, row]));
+    const terminationActivities = await targetDb
+      .select({
+        id: activityLog.id,
+        companyId: activityLog.companyId,
+        entityId: activityLog.entityId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.action, "agent.terminated"),
+        eq(activityLog.entityType, "agent"),
+        inArray(activityLog.entityId, sourceIds),
+      ));
+    const registrationByPlanId = new Map<string, PlanRegistration>();
+    for (const wave of earlierWaves) {
+      for (const sourceId of wave.sourceIds) {
+        const allowlisted = getAgentRetirementSource(sourceId) ?? fail(sourceId);
+        const agent = agentById.get(sourceId) ?? fail(sourceId);
+        const execution = executionBySource.get(sourceId) ?? fail(sourceId);
+        const planRow = planById.get(execution.planClaimId) ?? fail(sourceId);
+        if (
+          agent.companyId !== allowlisted.companyId
+          || agent.name !== allowlisted.sourceName
+          || agent.status !== "terminated"
+          || agent.pauseReason !== null
+          || agent.pausedAt !== null
+          || agent.errorReason !== null
+          || execution.companyId !== allowlisted.companyId
+          || execution.phase !== "terminated"
+          || execution.cleanupReceiptId === null
+          || execution.finalPreflightFingerprint === null
+        ) fail(sourceId);
+        let registration = registrationByPlanId.get(planRow.id);
+        if (!registration) {
+          try {
+            registration = await findPlanRegistration(targetDb, planRow);
+          } catch {
+            return fail(sourceId);
+          }
+          registrationByPlanId.set(planRow.id, registration);
+        }
+        if (registration.wave.wave !== wave.wave) fail(sourceId);
+        const matchingReceipts = terminationActivities.filter((activity) => {
+          if (activity.entityId !== sourceId || activity.companyId !== allowlisted.companyId) return false;
+          const details = asRecord(activity.details);
+          const receipt = readTerminationReceipt(details);
+          return Boolean(
+            receipt
+            && receipt.activityId === activity.id
+            && receipt.agentId === sourceId
+            && receipt.companyId === allowlisted.companyId
+            && receipt.status === "terminated"
+            && receipt.cleanupReceiptId === execution.cleanupReceiptId
+            && receipt.preflightFingerprint === execution.finalPreflightFingerprint
+            && receipt.tombstone.id === sourceId
+            && receipt.tombstone.companyId === allowlisted.companyId
+            && receipt.tombstone.name === allowlisted.sourceName
+            && receipt.tombstone.status === "terminated"
+            && receipt.tombstone.updatedAt === receipt.terminatedAt
+            && Date.parse(receipt.terminatedAt) <= agent.updatedAt.getTime()
+            && details.source === "retirement_gated"
+            && details.cleanupReceiptId === execution.cleanupReceiptId
+            && details.preflightFingerprint === execution.finalPreflightFingerprint
+            && details.planClaimReceiptId === planRow.receiptId
+            && details.executionClaimReceiptId === execution.receiptId
+          );
+        });
+        if (matchingReceipts.length !== 1) fail(sourceId);
+      }
+    }
   }
 
   async function createLiveRetirementRestoreInventory(
@@ -928,7 +1076,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
       RETIREMENT_RESTORE_CANONICAL_AGENT_PARTITION,
     );
     const partition = RETIREMENT_RESTORE_CANONICAL_AGENT_PARTITION;
-    const sourceIds = new Set(canonicalRetirementSourceIds());
+    const sourceIds = new Set(allRetirementSourceIds());
     const retainedIds = new Set(partition.retainedAgents.map((row) => row.agentId));
     const tombstoneIds = new Set(partition.historicalTombstones.map((row) => row.agentId));
     const classifiedIds = new Set([...sourceIds, ...retainedIds, ...tombstoneIds]);
@@ -1595,7 +1743,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
         if (!expectedRow || stableStringify(row) !== stableStringify(expectedRow)) fail();
       }
       const liveIds = new Set(liveRows.map((row) => row.id));
-      for (const canonicalSourceId of canonicalRetirementSourceIds()) {
+      for (const canonicalSourceId of allRetirementSourceIds()) {
         const expectedSourceRows = expectedRows.filter((row) => (
           row.sourceAgentId === canonicalSourceId
         ));
@@ -1678,13 +1826,15 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     if (
       plan.evidenceSha256 !== evidenceBundleSha256(evidenceBySourceId)
       || evidenceBySourceId[sourceId]?.source.sourceAgentId !== sourceId
+      || stableStringify(Object.keys(evidenceBySourceId).sort()) !== stableStringify(currentWave.sourceIds)
     ) {
       throw conflict("Retirement plan evidence bundle does not match its receipt", {
         code: "retirement_plan_evidence_mismatch",
       });
     }
     const selectedEvidence = evidenceBySourceId[sourceId]!;
-    validateClientPlan(plan, selectedEvidence, now());
+    validateClientPlan(plan, selectedEvidence, currentWave, now());
+    await assertEarlierRetirementWavesTerminated(targetDb);
     const approvalClaims = await targetDb
       .select({
         approvalCommentId: agentRetirementPlanClaims.approvalCommentId,
@@ -1714,7 +1864,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     const referenceGate = selectedEvidence.humanGate;
     const referenceBackup = selectedEvidence.backupRestore;
     const nowMs = now().getTime();
-    for (const sourceIdEntry of canonicalRetirementSourceIds()) {
+    for (const sourceIdEntry of currentWave.sourceIds) {
       const allowlisted = getAgentRetirementSource(sourceIdEntry)!;
       const evidence = evidenceBySourceId[sourceIdEntry]!;
       if (
@@ -1836,7 +1986,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
       entityId: planRow.id,
       details: {
         schemaVersion: "1.0.0",
-        sourceCount: canonicalRetirementSourceIds().length,
+        sourceCount: currentWave.sourceIds.length,
         clientPlanReceiptId: plan.receiptId,
         planClaimReceiptId: receiptId,
         registrationReceiptId: registrationReceipt,
@@ -1845,6 +1995,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     return {
       planRow,
       registration: {
+        wave: currentWave,
         registrationReceiptId: registrationReceipt,
         evidenceBySourceId,
         sourceArtifactReceiptsBySourceId,
@@ -1860,7 +2011,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     evidence: AgentRetirementEvidence,
     registration: PlanRegistration,
   ) {
-    validateClientPlan(plan, evidence, now());
+    validateClientPlan(plan, evidence, currentWave, now());
     const common = assertRetirementCommonArtifactReceipt(evidence, registration.commonArtifactReceipt);
     const expectedReceiptId = serverPlanReceiptId(plan, registration.registrationReceiptId);
     if (
@@ -2516,7 +2667,7 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     actor: { actorUserId?: string } = {},
   ) {
     const evidence = request.evidence;
-    const plan = validateClientPlan(request.plan, evidence, now());
+    const plan = validateClientPlan(request.plan, evidence, currentWave, now());
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, sourceId)).for("update");
@@ -3029,6 +3180,9 @@ export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
     postcheck: async (sourceId: string, rawInput: AgentRetirementTermination) => (
       postcheckTermination(db, canonicalRetirementAgentId(sourceId), rawInput)
     ),
+
+    // Read-only readiness check before a new wave's ceremony.
+    assertEarlierWavesTerminated: () => assertEarlierRetirementWavesTerminated(db),
 
     terminateAuthorized: async (
       sourceId: string,
