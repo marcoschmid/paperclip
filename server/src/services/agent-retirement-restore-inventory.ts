@@ -2672,6 +2672,13 @@ export const RETIREMENT_RESTORE_FULL_COLUMNS = Object.freeze(Object.fromEntries(
   Object.entries(ROW_SCHEMAS).map(([table, specs]) => [table, specs.map(([snakeName]) => snakeName)]),
 ) as Record<string, string[]>);
 
+export const RETIREMENT_RESTORE_COLUMN_SPECS = Object.freeze(Object.fromEntries(
+  Object.entries(ROW_SCHEMAS).map(([table, specs]) => [
+    table,
+    specs.map(([name, , type, nullable]) => ({ name, type, nullable })),
+  ]),
+) as Record<string, Array<{ name: string; type: ColumnType; nullable: boolean }>>);
+
 export function createRetirementSqlInventoryCollector(
   rawPartition: RetirementRestoreAgentPartition,
 ) {
