@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
@@ -399,10 +400,22 @@ function readTerminationReceipt(details: unknown): AgentRetirementTerminationRec
   return parsed.success ? parsed.data : null;
 }
 
+// The instance backup directory may live behind a symlink (relocated to external storage).
+// Artifact verification rejects symlinked roots, so the configured default is resolved first;
+// a missing path is left to the fail-closed artifact checks.
+export function resolveRetirementBackupRoot(configured: string) {
+  try {
+    return realpathSync(configured);
+  } catch {
+    return configured;
+  }
+}
+
 export function agentRetirementService(db: Db, options: ServiceOptions = {}) {
   const now = options.now ?? (() => new Date());
   const artifactOptions = () => ({
-    backupRoot: options.backupRoot ?? path.join(os.homedir(), "paperclip/instances/default/data/backups"),
+    backupRoot: options.backupRoot
+      ?? resolveRetirementBackupRoot(path.join(os.homedir(), "paperclip/instances/default/data/backups")),
     retirementEvidenceRoot: options.retirementEvidenceRoot
       ?? path.join(os.homedir(), ".openclaw/workspace/projects/paperclip/docs/reports/2026-07-12-agent-portfolio/retirement"),
     now: now(),
