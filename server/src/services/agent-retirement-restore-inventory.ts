@@ -253,7 +253,7 @@ export type RetirementRestoreInventoryProof = {
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
-const SOURCE_COUNT = 26;
+const SOURCE_COUNT = 27;
 const RETAINED_COUNT = 33;
 const HISTORICAL_TOMBSTONE_COUNT = 2;
 const MAX_TRACKED_ROWS = 100_000;
@@ -476,6 +476,9 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
     ["health_status", "healthStatus", "text", false],
     ["created_at", "createdAt", "timestamp", false],
     ["updated_at", "updatedAt", "timestamp", false],
+    ["exposure", "exposure", "json", true],
+    ["exposure_handle", "exposureHandle", "text", true],
+    ["backend_url", "backendUrl", "text", true],
   ],
   workspace_runtime_start_claims: [
     ["id", "id", "uuid", false],
@@ -595,6 +598,21 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
     ["context_snapshot", "contextSnapshot", "json", true],
     ["created_at", "createdAt", "timestamp", false],
     ["updated_at", "updatedAt", "timestamp", false],
+    ["runtime_mode", "runtimeMode", "text", false],
+    ["runtime_mode_resolver_version", "runtimeModeResolverVersion", "text", true],
+    ["runtime_mode_reason", "runtimeModeReason", "text", true],
+    ["runtime_mode_resolved_at", "runtimeModeResolvedAt", "timestamp", true],
+    ["runner_profile_json", "runnerProfileJson", "json", true],
+    ["runner_instance_id", "runnerInstanceId", "uuid", true],
+    ["native_session_id", "nativeSessionId", "uuid", true],
+    ["native_issue_id", "nativeIssueId", "uuid", true],
+    ["driver_kind", "driverKind", "text", true],
+    ["driver_version", "driverVersion", "text", true],
+    ["completion_contract_id", "completionContractId", "uuid", true],
+    ["completion_contract_sha256", "completionContractSha256", "text", true],
+    ["next_event_seq", "nextEventSeq", "bigint", false],
+    ["native_phase", "nativePhase", "text", true],
+    ["native_phase_updated_at", "nativePhaseUpdatedAt", "timestamp", true],
   ],
   issues: [
     ["id", "id", "uuid", false],
@@ -644,6 +662,13 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
     ["hidden_at", "hiddenAt", "timestamp", true],
     ["created_at", "createdAt", "timestamp", false],
     ["updated_at", "updatedAt", "timestamp", false],
+    ["harness_kind", "harnessKind", "text", true],
+    ["unblock_descriptor", "unblockDescriptor", "json", true],
+    ["blocked_transition_at", "blockedTransitionAt", "timestamp", true],
+    ["blocked_owner_notified_at", "blockedOwnerNotifiedAt", "timestamp", true],
+    ["review_policy", "reviewPolicy", "text", true],
+    ["status_version", "statusVersion", "bigint", false],
+    ["last_status_decision_id", "lastStatusDecisionId", "uuid", true],
   ],
   routines: [
     ["id", "id", "uuid", false],
@@ -673,6 +698,9 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
     ["last_enqueued_at", "lastEnqueuedAt", "timestamp", true],
     ["created_at", "createdAt", "timestamp", false],
     ["updated_at", "updatedAt", "timestamp", false],
+    ["activity_gate_policy", "activityGatePolicy", "text", false],
+    ["activity_gate_scope", "activityGateScope", "text", false],
+    ["folder_id", "folderId", "uuid", true],
   ],
   routine_triggers: [
     ["id", "id", "uuid", false],
@@ -763,7 +791,7 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
   environment_leases: [
     ["id", "id", "uuid", false],
     ["company_id", "companyId", "uuid", false],
-    ["environment_id", "environmentId", "uuid", false],
+    ["environment_id", "environmentId", "uuid", true],
     ["execution_workspace_id", "executionWorkspaceId", "uuid", true],
     ["issue_id", "issueId", "uuid", true],
     ["heartbeat_run_id", "heartbeatRunId", "uuid", true],
@@ -826,6 +854,8 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
     ["updated_by_run_id", "updatedByRunId", "uuid", true],
     ["created_at", "createdAt", "timestamp", false],
     ["updated_at", "updatedAt", "timestamp", false],
+    ["last_observed_stop_snapshot", "lastObservedStopSnapshot", "json", true],
+    ["last_reviewed_stop_snapshot", "lastReviewedStopSnapshot", "json", true],
   ],
   issue_recovery_actions: [
     ["id", "id", "uuid", false],
@@ -922,15 +952,15 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
     ["issue_prefix", "issuePrefix", "text", false], ["issue_counter", "issueCounter", "integer", false],
     ["budget_monthly_cents", "budgetMonthlyCents", "integer", false],
     ["spent_monthly_cents", "spentMonthlyCents", "integer", false],
-    ["attachment_max_bytes", "attachmentMaxBytes", "integer", false],
     ["default_responsible_user_id", "defaultResponsibleUserId", "text", true],
     ["require_board_approval_for_new_agents", "requireBoardApprovalForNewAgents", "boolean", false],
     ["feedback_data_sharing_enabled", "feedbackDataSharingEnabled", "boolean", false],
     ["feedback_data_sharing_consent_at", "feedbackDataSharingConsentAt", "timestamp", true],
     ["feedback_data_sharing_consent_by_user_id", "feedbackDataSharingConsentByUserId", "text", true],
     ["feedback_data_sharing_terms_version", "feedbackDataSharingTermsVersion", "text", true],
-    ["brand_color", "brandColor", "text", true], ["created_at", "createdAt", "timestamp", false],
+    ["created_at", "createdAt", "timestamp", false],
     ["updated_at", "updatedAt", "timestamp", false],
+    ["interaction_resolver_governance", "interactionResolverGovernance", "json", false],
   ],
   company_secrets: [
     ["id", "id", "uuid", false], ["company_id", "companyId", "uuid", false],
@@ -963,6 +993,8 @@ const ROW_SCHEMAS: Record<string, readonly RowSpec[]> = {
     ["version_selector", "versionSelector", "text", false], ["required", "required", "boolean", false],
     ["label", "label", "text", true], ["created_at", "createdAt", "timestamp", false],
     ["updated_at", "updatedAt", "timestamp", false],
+    ["projection_class", "projectionClass", "text", false],
+    ["projection_allowlist_key", "projectionAllowlistKey", "text", true],
   ],
   user_secret_declarations: [
     ["id", "id", "uuid", false], ["company_id", "companyId", "uuid", false],
@@ -1011,7 +1043,7 @@ function canonicalSources(
   rawSources: readonly AgentRetirementAllowlistEntry[] | readonly CanonicalSource[],
 ) {
   if (!Array.isArray(rawSources) || rawSources.length !== SOURCE_COUNT) {
-    throw new Error("Retirement inventory requires exactly 26 canonical sources");
+    throw new Error("Retirement inventory requires exactly 27 canonical sources");
   }
   const rows = rawSources.map((raw) => {
     const row = asRecord(raw);
@@ -1105,7 +1137,7 @@ function canonicalPartition(rawPartition: RetirementRestoreAgentPartition) {
     seen.add(id);
   }
   if (seen.size !== SOURCE_COUNT + RETAINED_COUNT + HISTORICAL_TOMBSTONE_COUNT) {
-    throw new Error("Retirement agent partition must contain exactly 61 unique agents");
+    throw new Error("Retirement agent partition must contain exactly 62 unique agents");
   }
   return { sources, retainedAgents, historicalTombstones };
 }
@@ -1190,7 +1222,7 @@ function sourceProof(rawRows: unknown, sources: CanonicalSource[]): RetirementRe
       || expectedRow.companyId !== companyId
       || expectedRow.sourceName !== full.name
       || typeof full.status !== "string"
-    ) throw new Error("Retirement source rows do not match the canonical 26-source allowlist");
+    ) throw new Error("Retirement source rows do not match the canonical 27-source allowlist");
     const immutable = {
       ...full,
       status: null,
@@ -1213,7 +1245,7 @@ function sourceProof(rawRows: unknown, sources: CanonicalSource[]): RetirementRe
     rows.length !== SOURCE_COUNT
     || new Set(rows.map((row) => row.id)).size !== SOURCE_COUNT
     || rows.some((row, index) => row.id !== sources[index]?.sourceAgentId)
-  ) throw new Error("Retirement restore does not contain the exact 26 source-agent rows");
+  ) throw new Error("Retirement restore does not contain the exact 27 source-agent rows");
   return rows;
 }
 

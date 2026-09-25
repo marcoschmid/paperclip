@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -76,6 +76,10 @@ const CANARY_ISSUE_ID = "33333333-3333-4333-8333-333333333333";
 const CANARY_RUN_ID = "22222222-2222-4222-8222-222222222222";
 const SOURCE_UPDATED_AT = "2026-07-13T10:00:00.000Z";
 const NOW = new Date("2026-07-13T10:10:00.000Z");
+// The shared lifecycle schema checks reviewAt and lastCanaryAt against the wall clock, so the
+// service tests pin Date inside the fixtures' validity window (after the 16:15 recovery canaries,
+// before the 2026-08-12 review deadline). Services still read time from the injected `now`.
+const FIXTURE_WALL_CLOCK = new Date("2026-07-20T12:00:00.000Z");
 const CONFIG_FINGERPRINT = `v1:sha256:${"d".repeat(64)}`;
 const APPROVAL_NONCE = "c".repeat(64);
 const APPROVED_AT = "2026-07-13T10:04:00.000Z";
@@ -193,14 +197,15 @@ const RETIREMENT_FULL_COLUMNS = {
     ["id", "id"], ["name", "name"], ["description", "description"], ["status", "status"],
     ["pause_reason", "pauseReason"], ["paused_at", "pausedAt"], ["issue_prefix", "issuePrefix"],
     ["issue_counter", "issueCounter"], ["budget_monthly_cents", "budgetMonthlyCents"],
-    ["spent_monthly_cents", "spentMonthlyCents"], ["attachment_max_bytes", "attachmentMaxBytes"],
+    ["spent_monthly_cents", "spentMonthlyCents"],
     ["default_responsible_user_id", "defaultResponsibleUserId"],
     ["require_board_approval_for_new_agents", "requireBoardApprovalForNewAgents"],
     ["feedback_data_sharing_enabled", "feedbackDataSharingEnabled"],
     ["feedback_data_sharing_consent_at", "feedbackDataSharingConsentAt"],
     ["feedback_data_sharing_consent_by_user_id", "feedbackDataSharingConsentByUserId"],
     ["feedback_data_sharing_terms_version", "feedbackDataSharingTermsVersion"],
-    ["brand_color", "brandColor"], ["created_at", "createdAt"], ["updated_at", "updatedAt"],
+    ["created_at", "createdAt"], ["updated_at", "updatedAt"],
+    ["interaction_resolver_governance", "interactionResolverGovernance"],
   ],
   company_secrets: [
     ["id", "id"], ["company_id", "companyId"], ["scope", "scope"], ["owner_user_id", "ownerUserId"],
@@ -225,6 +230,7 @@ const RETIREMENT_FULL_COLUMNS = {
     ["target_type", "targetType"], ["target_id", "targetId"], ["config_path", "configPath"],
     ["version_selector", "versionSelector"], ["required", "required"], ["label", "label"],
     ["created_at", "createdAt"], ["updated_at", "updatedAt"],
+    ["projection_class", "projectionClass"], ["projection_allowlist_key", "projectionAllowlistKey"],
   ],
   approval_execution_claims: RETIREMENT_RESTORE_FULL_COLUMNS.approval_execution_claims
     .map((name) => [name, name] as const),
@@ -339,10 +345,10 @@ function retirementFullCompanyRows() {
     .map((id, index) => ({
       id, name: `Company ${index + 1}`, description: null, status: "active", pauseReason: null,
       pausedAt: null, issuePrefix: `T${index + 1}`, issueCounter: 0, budgetMonthlyCents: 0,
-      spentMonthlyCents: 0, attachmentMaxBytes: 10_485_760, defaultResponsibleUserId: null,
+      spentMonthlyCents: 0, defaultResponsibleUserId: null,
       requireBoardApprovalForNewAgents: false, feedbackDataSharingEnabled: false,
       feedbackDataSharingConsentAt: null, feedbackDataSharingConsentByUserId: null,
-      feedbackDataSharingTermsVersion: null, brandColor: null,
+      feedbackDataSharingTermsVersion: null, interactionResolverGovernance: {},
       createdAt: "2026-07-01T10:00:00.000Z", updatedAt: RETIREMENT_FULL_ROW_TIME,
     }));
 }
@@ -454,7 +460,7 @@ function approvalText(binding: {
   return [
     "PAPERCLIP_RETIREMENT_APPROVAL_V1",
     "issue=TEC-355",
-    "scope=26_allowlisted_sources_tombstone_only",
+    "scope=27_allowlisted_sources_tombstone_only",
     `approvalNonce=${binding.approvalNonce}`,
     `manifestSha256=${binding.manifestSha256}`,
     `backupSha256=${binding.backupSha256}`,
@@ -869,7 +875,12 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     fs.writeFileSync(path.join(workspaceRoot, "projects/kaffee/PROJECT.md"), BARISTA_PROJECT_CONTENT, { mode: 0o600 });
   }, 30_000);
 
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"], now: FIXTURE_WALL_CLOCK, shouldAdvanceTime: true });
+  });
+
   afterEach(async () => {
+    vi.useRealTimers();
     retirementAccessRows = {
       activeApiKeys: [],
       principalPermissionGrants: [],
@@ -3049,7 +3060,7 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
       .resolves.toMatchObject({ ok: true, executionClaimReceiptId: initial.executionClaimReceiptId });
   });
 
-  it("atomically registers all 26 evidence receipts and refuses a newly claimed source after its canary expires", async () => {
+  it("atomically registers all 27 evidence receipts and refuses a newly claimed source after its canary expires", async () => {
     await seedReadyPortfolio();
     const input = evidence();
     const evidenceBySourceId = fullPlanEvidence(input);
@@ -3076,7 +3087,7 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
       .where(eq(activityLog.action, "agent.retirement_plan_registered"));
     expect(registrations).toHaveLength(1);
     expect(registrations[0]?.details).toMatchObject({
-      sourceCount: 26,
+      sourceCount: 27,
       clientPlanReceiptId: plan.receiptId,
     });
     expect(registrations[0]?.details).not.toHaveProperty("evidenceBySourceId");
@@ -3101,7 +3112,7 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     ]);
   });
 
-  it("rejects the entire 26-source registration when a non-selected source canary is expired", async () => {
+  it("rejects the entire 27-source registration when a non-selected source canary is expired", async () => {
     await seedReadyPortfolio();
     const target = AGENT_RETIREMENT_ALLOWLIST_ENTRIES.find((entry) => (
       entry.sourceAgentId !== SOURCE_ID && entry.canaryAgentId !== REPLACEMENT_ID
@@ -3379,7 +3390,7 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     const initial = await claimed.preflight(SOURCE_ID, claimPreflight(input) as any);
     expect(artifactOpens).toEqual([
       "source_export", "master_key_backup", "restore_evidence", "database_dump",
-      ...Array.from({ length: 25 }, () => "source_export"),
+      ...Array.from({ length: AGENT_RETIREMENT_ALLOWLIST_ENTRIES.length - 1 }, () => "source_export"),
       "source_export", "master_key_backup", "restore_evidence", "database_dump",
     ]);
     await claimed.cleanup(SOURCE_ID, claimedCleanup(input, initial) as any);
@@ -3393,7 +3404,7 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
     expect(final.planClaimReceiptId).toBe(initial.planClaimReceiptId);
     expect(artifactOpens).toEqual([
       "source_export", "master_key_backup", "restore_evidence", "database_dump",
-      ...Array.from({ length: 25 }, () => "source_export"),
+      ...Array.from({ length: AGENT_RETIREMENT_ALLOWLIST_ENTRIES.length - 1 }, () => "source_export"),
       ...Array.from({ length: 3 }, () => [
         "source_export", "master_key_backup", "restore_evidence", "database_dump",
       ]).flat(),

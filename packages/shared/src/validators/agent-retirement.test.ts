@@ -27,7 +27,7 @@ function approvalText() {
   return [
     "PAPERCLIP_RETIREMENT_APPROVAL_V1",
     "issue=TEC-355",
-    "scope=26_allowlisted_sources_tombstone_only",
+    "scope=27_allowlisted_sources_tombstone_only",
     `approvalNonce=${APPROVAL_NONCE}`,
     `manifestSha256=${MANIFEST_SHA256}`,
     `backupSha256=${"b".repeat(64)}`,
@@ -96,11 +96,14 @@ function validEvidence() {
 }
 
 describe("agent retirement validators", () => {
-  it("publishes an external exact 34-agent retained identity contract", () => {
+  it("publishes an external exact 33-agent retained identity contract", () => {
     const retainedAgents = (retirementContract as unknown as Record<string, unknown>)
       .AGENT_RETIREMENT_RETAINED_AGENTS as Array<Record<string, unknown>> | undefined;
-    expect(retainedAgents).toHaveLength(34);
-    expect(new Set(retainedAgents?.map((row) => row.agentId))).toHaveProperty("size", 34);
+    expect(retainedAgents).toHaveLength(33);
+    expect(new Set(retainedAgents?.map((row) => row.agentId))).toHaveProperty("size", 33);
+    expect(retainedAgents?.filter((row) => (
+      retirementContract.AGENT_RETIREMENT_ALLOWLIST.has(row.agentId as string)
+    ))).toEqual([]);
     expect(retainedAgents?.every((row) => (
       typeof row.agentId === "string"
       && typeof row.companyId === "string"
@@ -109,9 +112,9 @@ describe("agent retirement validators", () => {
     ))).toBe(true);
   });
 
-  it("publishes the exact 26-source termination allowlist and strict evidence schemas", async () => {
+  it("publishes the exact 27-source termination allowlist and strict evidence schemas", async () => {
     expect(retirementContract.AGENT_RETIREMENT_ALLOWLIST).toBeInstanceOf(Map);
-    expect(retirementContract.AGENT_RETIREMENT_ALLOWLIST.size).toBe(26);
+    expect(retirementContract.AGENT_RETIREMENT_ALLOWLIST.size).toBe(27);
     expect(retirementContract.AGENT_RETIREMENT_HISTORICAL_TOMBSTONES).toHaveLength(2);
     expect([...retirementContract.AGENT_RETIREMENT_HISTORICAL_TOMBSTONE_IDS]).toEqual([
       "8d403783-c4e2-4746-adad-7689cd95ae33",
@@ -133,6 +136,17 @@ describe("agent retirement validators", () => {
     )).toMatchObject({
       replacementSystemRef: "workspace:projects/kaffee",
       canaryAgentId: "2f430983-3c02-4e58-90e3-821ae00f80c2",
+    });
+    expect(retirementContract.AGENT_RETIREMENT_ALLOWLIST.get(
+      "04c5ffc3-7eb8-428f-8225-0c50063667e9",
+    )).toEqual({
+      sourceAgentId: "04c5ffc3-7eb8-428f-8225-0c50063667e9",
+      companyId: "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
+      sourceName: "Authentik IAM Admin",
+      replacementAgentId: "96c36604-fa6b-4a15-9027-2f0b50e32cea",
+      replacementSystemRef: null,
+      canaryAgentId: "96c36604-fa6b-4a15-9027-2f0b50e32cea",
+      decisionIssueId: "50d6efd7-85c7-4ce0-aceb-ff6a94127200",
     });
     expect(retirementContract.normalizeAgentRetirementId(
       "3F406D3A-9B98-4687-9A89-61A3F927CBF5",

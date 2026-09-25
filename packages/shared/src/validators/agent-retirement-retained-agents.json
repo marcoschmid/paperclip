@@ -130,11 +130,6 @@
     "name": "Security Reviewer"
   },
   {
-    "agentId": "04c5ffc3-7eb8-428f-8225-0c50063667e9",
-    "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
-    "name": "Authentik IAM Admin"
-  },
-  {
     "agentId": "065b5034-3acc-49a9-b728-857673111bde",
     "companyId": "f5ba56a6-afcd-43ad-8db7-fe6219139c4a",
     "name": "Backup and Recovery Engineer"

@@ -11,7 +11,7 @@ const approvalNonceSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const agentRetirementUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export const AGENT_RETIREMENT_APPROVAL_MARKER = "PAPERCLIP_RETIREMENT_APPROVAL_V1";
-export const AGENT_RETIREMENT_APPROVAL_SCOPE = "26_allowlisted_sources_tombstone_only";
+export const AGENT_RETIREMENT_APPROVAL_SCOPE = "27_allowlisted_sources_tombstone_only";
 
 export interface AgentRetirementAllowlistEntry {
   sourceAgentId: string;
@@ -259,7 +259,7 @@ export const agentRetirementEvidenceBySourceIdSchema = z.record(
   ) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: "Evidence bundle must contain exactly the canonical 26 retirement sources",
+      message: "Evidence bundle must contain exactly the canonical 27 retirement sources",
       path: [],
     });
   }
@@ -278,7 +278,7 @@ export const agentRetirementPlanSchema = z.object({
   schemaVersion: z.literal("1.0.0"),
   kind: z.literal("paperclip_retirement_plan"),
   manifestFingerprint: fingerprintSchema,
-  sourceIds: z.array(z.string().uuid()).length(26),
+  sourceIds: z.array(z.string().uuid()).length(27),
   evidenceSha256: sha256Schema,
   approvalCommentId: z.string().uuid(),
   approvalFingerprint: fingerprintSchema,
