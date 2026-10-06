@@ -236,8 +236,9 @@ export function validateAgentLifecyclePatchTransition(input: {
   const next = nextResult.data;
 
   const previousAbsent = input.previousLifecycle === undefined || input.previousLifecycle === null;
-  // The stored lifecycle is read with the overdue-review rule relaxed so an
-  // expired review can still be renewed; nextLifecycle stays strict above.
+  // The stored lifecycle is read with the overdue-review and expired-pause
+  // rules relaxed so an expired review can still be renewed and an expired
+  // quarantine still repaired; nextLifecycle stays strict above.
   const previousResult = previousAbsent
     ? null
     : agentLifecycleStoredSchema.safeParse(input.previousLifecycle);

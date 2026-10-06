@@ -2312,6 +2312,17 @@ function sessionConfigOptions(prepared: AcpxPreparedRuntime): Array<{ key: strin
   return options;
 }
 
+const EFFORT_SESSION_CONFIG_KEY = "effort";
+const UNADVERTISED_ACP_CONTROL_CODE = "ACP_BACKEND_UNSUPPORTED_CONTROL";
+
+function isUnadvertisedAcpControlError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === UNADVERTISED_ACP_CONTROL_CODE
+  );
+}
+
 async function applySessionConfigOptions(input: {
   runtime: AcpRuntime;
   handle: AcpRuntimeHandle;
@@ -2327,11 +2338,25 @@ async function applySessionConfigOptions(input: {
     throw new Error(message);
   }
   for (const option of options) {
-    await input.runtime.setConfigOption({
-      handle: input.handle,
-      key: option.key,
-      value: option.value,
-    });
+    try {
+      await input.runtime.setConfigOption({
+        handle: input.handle,
+        key: option.key,
+        value: option.value,
+      });
+    } catch (error) {
+      // A model without an effort control (Claude Haiku 4.5) cannot honour a
+      // requested effort. Effort is a tuning hint, so the run continues on the
+      // model default; every other rejected control still fails the session.
+      if (option.key !== EFFORT_SESSION_CONFIG_KEY || !isUnadvertisedAcpControlError(error)) {
+        throw error;
+      }
+      await input.onLog(
+        "stderr",
+        `[paperclip] ACPX ${input.prepared.acpxAgent} session does not offer an effort control; continuing with the model default (requested effort=${option.value} was not applied).\n`,
+      );
+      continue;
+    }
     await input.onLog(
       "stdout",
       `[paperclip] Applied ACPX ${input.prepared.acpxAgent} config ${option.key}=${option.value}\n`,

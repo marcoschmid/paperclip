@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AcpRuntimeOptions } from "acpx/runtime";
+import { AcpRuntimeError, type AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterExecutionContext, AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import {
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
@@ -166,6 +166,8 @@ async function runExecutor(
     runtimeMcp?: AdapterRuntimeMcpAccess;
     prepareRemoteManagedHome?: AcpxEngineExecutorOptions["prepareRemoteManagedHome"];
     startupTraceContext?: AdapterExecutionContext["startupTraceContext"];
+    rejectConfigOption?: (input: { key: string; value: string }) => Error | null;
+    expectedExitCode?: number;
   } = {},
 ) {
   const runtimeOptions: Record<string, unknown>[] = [];
@@ -174,6 +176,7 @@ async function runExecutor(
   const meta: Record<string, unknown>[] = [];
   const logs: Array<{ stream: string; text: string }> = [];
   const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+  const rejectConfigOption = options.rejectConfigOption;
   const execute = createAcpxEngineExecutor({
     ...(options.prepareRemoteManagedHome
       ? { prepareRemoteManagedHome: options.prepareRemoteManagedHome }
@@ -181,7 +184,11 @@ async function runExecutor(
     createRuntime: (options) => {
       runtimeOptions.push(options as unknown as Record<string, unknown>);
       return buildRuntime(
-        ({ key, value }) => configOptions.push({ key, value }),
+        ({ key, value }) => {
+          const rejection = rejectConfigOption?.({ key, value }) ?? null;
+          if (rejection) throw rejection;
+          configOptions.push({ key, value });
+        },
         (input) => sessionInputs.push(input),
       ) as never;
     },
@@ -212,7 +219,7 @@ async function runExecutor(
     },
   } as never);
 
-  expect(result.exitCode).toBe(0);
+  expect(result.exitCode).toBe(options.expectedExitCode ?? 0);
   return { logs, meta, events, runtimeOptions, configOptions, sessionInputs, result };
 }
 
@@ -521,6 +528,51 @@ describe("shared ACPX engine runtime behavior", () => {
       { key: "model", value: "gemini-2.5-pro" },
       { key: "effort", value: "high" },
     ]);
+  });
+
+  // Claude Haiku 4.5 offers no effort control. ACPX reports that as an unadvertised
+  // session config option; the run must use the model default instead of failing.
+  const unadvertisedControl = (key: string) => new AcpRuntimeError(
+    "ACP_BACKEND_UNSUPPORTED_CONTROL",
+    `ACP session session-1 does not advertise config option '${key}'. Supported config options: mode, model.`,
+  );
+
+  it("continues with the model default when the session does not advertise the effort control", async () => {
+    const { configOptions, logs } = await runExecutor(
+      { agent: "claude", model: "claude-haiku-4-5", effort: "low" },
+      { rejectConfigOption: ({ key }) => (key === "effort" ? unadvertisedControl(key) : null) },
+    );
+
+    expect(configOptions).toEqual([]);
+    expect(logs).toContainEqual({
+      stream: "stderr",
+      text: "[paperclip] ACPX claude session does not offer an effort control; continuing with the model default (requested effort=low was not applied).\n",
+    });
+    expect(logs.some((entry) => entry.text.includes("Applied ACPX claude config effort"))).toBe(false);
+  });
+
+  it("still fails the run when effort is rejected for any other reason", async () => {
+    const { result } = await runExecutor(
+      { agent: "claude", model: "claude-opus-4-7", effort: "low" },
+      {
+        rejectConfigOption: ({ key }) => (key === "effort" ? new Error("session/set_config_option timed out") : null),
+        expectedExitCode: 1,
+      },
+    );
+
+    expect(result.errorCode).toBe("acpx_session_config_failed");
+  });
+
+  it("still fails the run when the requested model control is not advertised", async () => {
+    const { result } = await runExecutor(
+      { agent: "gemini", model: "gemini-2.5-pro" },
+      {
+        rejectConfigOption: ({ key }) => (key === "model" ? unadvertisedControl(key) : null),
+        expectedExitCode: 1,
+      },
+    );
+
+    expect(result.errorCode).toBe("acpx_session_config_failed");
   });
 
   it("does not inject CODEX_CONFIG or session config when Codex overrides are absent", async () => {

@@ -619,6 +619,62 @@ describe("agent lifecycle service", () => {
     })).toEqual({ ok: true, mode: "reviewed_failed_repair" });
   });
 
+  it("repairs a failed canary whose quarantine pause has already expired", () => {
+    const repairIssueId = "44444444-4444-4444-8444-444444444444";
+    const failedAt = new Date(NOW.getTime() - 8 * DAY_MS).toISOString();
+    const expiredQuarantine = lifecycle({
+      lastCanaryResult: "failed",
+      lastCanaryAt: failedAt,
+      pause: {
+        reasonCode: "canary_failed",
+        reasonDetail: "Reviewed repair is required.",
+        outcome: "failed",
+        repairIssueId,
+        startedAt: failedAt,
+        expiresAt: new Date(NOW.getTime() - DAY_MS).toISOString(),
+      },
+    });
+    const pending = pendingLifecycle({ canaryIssueId: repairIssueId });
+    const transition = {
+      mode: "reviewed_failed_repair" as const,
+      repairIssueId,
+      expectedAgentUpdatedAt: NOW.toISOString(),
+    };
+
+    // The expired stored pause no longer short-circuits as previous_lifecycle_invalid;
+    // the repair is judged by its own CAS and issue-binding rules.
+    expect(lifecycleService.validateAgentLifecyclePatchTransition({
+      previousLifecycle: expiredQuarantine,
+      nextLifecycle: pending,
+      transition: undefined,
+      currentAgentUpdatedAt: NOW,
+    })).toMatchObject({ ok: false, reason: "reviewed_repair_required" });
+    expect(lifecycleService.validateAgentLifecyclePatchTransition({
+      previousLifecycle: expiredQuarantine,
+      nextLifecycle: pending,
+      transition,
+      currentAgentUpdatedAt: NOW,
+    })).toEqual({ ok: true, mode: "reviewed_failed_repair" });
+  });
+
+  it("still refuses a next lifecycle that carries an expired pause", () => {
+    const failedAt = new Date(NOW.getTime() - 8 * DAY_MS).toISOString();
+    expect(lifecycleService.validateAgentLifecyclePatchTransition({
+      previousLifecycle: lifecycle(),
+      nextLifecycle: lifecycle({
+        pause: {
+          reasonCode: "manual_review",
+          reasonDetail: "A board pause that has already run out.",
+          repairIssueId: "44444444-4444-4444-8444-444444444444",
+          startedAt: failedAt,
+          expiresAt: new Date(NOW.getTime() - DAY_MS).toISOString(),
+        },
+      }),
+      transition: undefined,
+      currentAgentUpdatedAt: NOW,
+    })).toMatchObject({ ok: false, reason: "next_lifecycle_invalid" });
+  });
+
   it("creates a normal passed gate already satisfied by the successful canary run", () => {
     const runId = "55555555-5555-4555-8555-555555555555";
     const receipt = lifecycleService.createAgentLifecycleValidationReceipt({

@@ -109,6 +109,56 @@ describe("agent lifecycle contract", () => {
     })).success).toBe(false);
   });
 
+  it("relaxes only the expired pause rule for a stored lifecycle", () => {
+    const expiredPause = {
+      reasonCode: "canary_failed",
+      reasonDetail: "Canary run failed before the quarantine window closed.",
+      outcome: "failed",
+      repairIssueId: "44444444-4444-4444-8444-444444444444",
+      startedAt: isoFromNow(-10),
+      expiresAt: isoFromNow(-3),
+    };
+    const quarantined = (pause: Record<string, unknown>) => validLifecycle({
+      lastCanaryResult: "failed",
+      lastCanaryAt: isoFromNow(-10),
+      pause,
+    });
+
+    const strict = agentValidators.agentLifecycleSchema.safeParse(quarantined(expiredPause));
+    expect(strict.success).toBe(false);
+    expect(strict.success === false && strict.error.issues.some(
+      (issue) => issue.path.join(".") === "pause.expiresAt" && issue.message === "Pause has expired",
+    )).toBe(true);
+    expect(agentValidators.agentLifecyclePauseSchema.safeParse(expiredPause).success).toBe(false);
+
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(quarantined(expiredPause)).success).toBe(true);
+
+    // Every other pause invariant stays fail-closed in the stored variant.
+    const { outcome: _outcome, ...withoutOutcome } = expiredPause;
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(quarantined(withoutOutcome)).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      quarantined({ ...expiredPause, expiresAt: isoFromNow(-11) }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      quarantined({ ...expiredPause, startedAt: isoFromNow(-60) }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      quarantined({ ...expiredPause, exceptionApprovedByUserId: "better-auth:user-marco" }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      quarantined({ ...expiredPause, exceptionReason: "A reason without its approver." }),
+    ).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(quarantined({
+      ...expiredPause,
+      startedAt: isoFromNow(-100),
+      exceptionApprovedByUserId: "better-auth:user-marco",
+      exceptionReason: "Even a reviewed extension is capped at 90 days.",
+    })).success).toBe(false);
+    expect(agentValidators.agentLifecycleStoredSchema.safeParse(
+      quarantined({ ...expiredPause, unknownField: true }),
+    ).success).toBe(false);
+  });
+
   it("enforces exactly one typed owner reference", () => {
     expect(agentValidators.agentLifecycleSchema.safeParse(validLifecycle({
       owner: {

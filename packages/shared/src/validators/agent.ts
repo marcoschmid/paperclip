@@ -49,7 +49,7 @@ export const agentLifecycleServiceLevelSchema = z.object({
   targetExceptionReason: lifecycleNonEmptyStringSchema.nullable(),
 }).strict();
 
-export const agentLifecyclePauseSchema = z.object({
+const agentLifecyclePauseBaseSchema = z.object({
   reasonCode: lifecycleNonEmptyStringSchema,
   reasonDetail: lifecycleNonEmptyStringSchema,
   outcome: lifecycleNonEmptyStringSchema.optional(),
@@ -58,7 +58,24 @@ export const agentLifecyclePauseSchema = z.object({
   expiresAt: lifecycleDateTimeSchema,
   exceptionApprovedByUserId: lifecycleNonEmptyStringSchema.optional(),
   exceptionReason: lifecycleNonEmptyStringSchema.optional(),
-}).strict().superRefine((pause, ctx) => {
+}).strict();
+
+type AgentLifecyclePauseInput = z.infer<typeof agentLifecyclePauseBaseSchema>;
+
+function isExpiredLifecyclePause(pause: AgentLifecyclePauseInput) {
+  return new Date(pause.expiresAt).getTime() <= Date.now();
+}
+
+function addExpiredPauseIssue(ctx: z.RefinementCtx, path: string[]) {
+  ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Pause has expired", path });
+}
+
+/**
+ * Pause invariants that hold for stored and freshly submitted pauses alike.
+ * The "pause has expired" rule is intentionally excluded here so that an
+ * expired quarantine can still be read back and repaired (TOL-332).
+ */
+function refineStoredAgentLifecyclePause(pause: AgentLifecyclePauseInput, ctx: z.RefinementCtx) {
   const startedAt = new Date(pause.startedAt).getTime();
   const expiresAt = new Date(pause.expiresAt).getTime();
   const hasApprover = pause.exceptionApprovedByUserId !== undefined;
@@ -72,9 +89,6 @@ export const agentLifecyclePauseSchema = z.object({
   }
   if (expiresAt <= startedAt) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Pause expiry must be after its start", path: ["expiresAt"] });
-  }
-  if (expiresAt <= Date.now()) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Pause has expired", path: ["expiresAt"] });
   }
   if (hasApprover !== hasReason) {
     ctx.addIssue({
@@ -91,6 +105,14 @@ export const agentLifecyclePauseSchema = z.object({
       path: ["expiresAt"],
     });
   }
+}
+
+const agentLifecycleStoredPauseSchema = agentLifecyclePauseBaseSchema
+  .superRefine(refineStoredAgentLifecyclePause);
+
+export const agentLifecyclePauseSchema = agentLifecyclePauseBaseSchema.superRefine((pause, ctx) => {
+  refineStoredAgentLifecyclePause(pause, ctx);
+  if (isExpiredLifecyclePause(pause)) addExpiredPauseIssue(ctx, ["expiresAt"]);
 });
 
 const permissionExceptionScopeSchema = z.object({
@@ -153,7 +175,7 @@ const agentLifecycleBaseSchema = z.object({
   decisionIssueId: z.string().uuid(),
   replacementAgentId: z.string().uuid().optional(),
   replacementSystemRef: lifecycleNonEmptyStringSchema.optional(),
-  pause: agentLifecyclePauseSchema.optional(),
+  pause: agentLifecycleStoredPauseSchema.optional(),
 }).strict();
 
 /**
@@ -225,10 +247,11 @@ function refineStoredAgentLifecycle(
 
 /**
  * Validates an already stored lifecycle. Every invariant of
- * {@link agentLifecycleSchema} applies except the future-dated review
- * deadline: a stored lifecycle whose reviewAt has passed must stay readable
- * so the overdue review can be renewed. Never use this for newly submitted
- * or next-state lifecycles.
+ * {@link agentLifecycleSchema} applies except the two wall-clock deadlines:
+ * a stored lifecycle whose reviewAt has passed must stay readable so the
+ * overdue review can be renewed, and one whose pause has expired must stay
+ * readable so the quarantine can be repaired. Never use this for newly
+ * submitted or next-state lifecycles.
  */
 export const agentLifecycleStoredSchema = agentLifecycleBaseSchema
   .superRefine(refineStoredAgentLifecycle);
@@ -237,6 +260,9 @@ export const agentLifecycleSchema = agentLifecycleBaseSchema.superRefine((lifecy
   refineStoredAgentLifecycle(lifecycle, ctx);
   if (new Date(lifecycle.reviewAt).getTime() <= Date.now()) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Lifecycle review is overdue", path: ["reviewAt"] });
+  }
+  if (lifecycle.pause && isExpiredLifecyclePause(lifecycle.pause)) {
+    addExpiredPauseIssue(ctx, ["pause", "expiresAt"]);
   }
 });
 
