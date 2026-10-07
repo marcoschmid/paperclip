@@ -115,11 +115,20 @@ describe("agent retirement validators", () => {
   it("publishes the exact 27-source termination allowlist and strict evidence schemas", async () => {
     expect(retirementContract.AGENT_RETIREMENT_ALLOWLIST).toBeInstanceOf(Map);
     expect(retirementContract.AGENT_RETIREMENT_ALLOWLIST.size).toBe(27);
-    expect(retirementContract.AGENT_RETIREMENT_HISTORICAL_TOMBSTONES).toHaveLength(2);
+    expect(retirementContract.AGENT_RETIREMENT_HISTORICAL_TOMBSTONES).toHaveLength(3);
     expect([...retirementContract.AGENT_RETIREMENT_HISTORICAL_TOMBSTONE_IDS]).toEqual([
       "8d403783-c4e2-4746-adad-7689cd95ae33",
       "dcd3cadb-8203-4048-be1e-77701a3a43a0",
+      "71cf1875-2da8-474c-bcdd-c950f3355e40",
     ]);
+    // TEC-960: der am 06.10.2026 regulaer terminierte Built-in "Summarizer" (Casa)
+    // bleibt als Tombstone erhalten, damit die Partition geschlossen bleibt.
+    expect(retirementContract.AGENT_RETIREMENT_HISTORICAL_TOMBSTONES[2]).toMatchObject({
+      agentId: "71cf1875-2da8-474c-bcdd-c950f3355e40",
+      companyId: "51eb52b7-49ed-461a-bd67-7384158374e6",
+      name: "Summarizer",
+    });
+    expect(retirementContract.isAgentRetirementSource("71cf1875-2da8-474c-bcdd-c950f3355e40")).toBe(false);
     expect(retirementContract.AGENT_RETIREMENT_HISTORICAL_TOMBSTONES.every((row) => (
       row.expectedStatus === "terminated"
       && row.disposition === "preserve_tombstone"

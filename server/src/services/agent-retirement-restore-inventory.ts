@@ -255,7 +255,8 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const SOURCE_COUNT = 27;
 const RETAINED_COUNT = 33;
-const HISTORICAL_TOMBSTONE_COUNT = 2;
+// TEC-960: dritter Tombstone ist der regulaer terminierte Built-in "Summarizer" (Casa).
+const HISTORICAL_TOMBSTONE_COUNT = 3;
 const MAX_TRACKED_ROWS = 100_000;
 const MAX_DUMP_TABLES = 2_048;
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
@@ -1125,7 +1126,7 @@ function canonicalPartition(rawPartition: RetirementRestoreAgentPartition) {
     throw new Error("Retirement agent partition requires exactly 33 retained agents");
   }
   if (historicalTombstones.length !== HISTORICAL_TOMBSTONE_COUNT) {
-    throw new Error("Retirement agent partition requires exactly 2 historical tombstones");
+    throw new Error("Retirement agent partition requires exactly 3 historical tombstones");
   }
   const seen = new Set<string>();
   for (const id of [
@@ -1137,7 +1138,7 @@ function canonicalPartition(rawPartition: RetirementRestoreAgentPartition) {
     seen.add(id);
   }
   if (seen.size !== SOURCE_COUNT + RETAINED_COUNT + HISTORICAL_TOMBSTONE_COUNT) {
-    throw new Error("Retirement agent partition must contain exactly 62 unique agents");
+    throw new Error("Retirement agent partition must contain exactly 63 unique agents");
   }
   return { sources, retainedAgents, historicalTombstones };
 }

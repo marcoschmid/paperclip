@@ -54,6 +54,7 @@ import {
   RETIREMENT_RESTORE_FULL_COLUMNS,
   assertRetirementRestoreInventory,
   createRetirementRestoreInventory,
+  createRetirementSqlInventoryCollector,
   isActiveRetirementHireApprovalStatus,
   isActiveRetirementIssueWatchdogStatus,
   isActiveRetirementRecoveryActionStatus,
@@ -763,7 +764,7 @@ describe("agent retirement restore inventory", () => {
     expect(inventory).toMatchObject({
       schemaVersion: "3.0.0",
       historicalTombstones: {
-        count: 2,
+        count: 3,
         rows: AGENT_RETIREMENT_HISTORICAL_TOMBSTONES.map((entry) => ({
           id: entry.agentId,
           companyId: entry.companyId,
@@ -859,6 +860,55 @@ describe("agent retirement restore inventory", () => {
         RETIREMENT_RESTORE_CANONICAL_AGENT_PARTITION,
       )).toThrow(/retained|canonical|exact unique/i);
     }
+  });
+
+  // TEC-960: Der Built-in "Summarizer" (Casa) wurde am 06.10.2026 regulaer terminiert.
+  // Built-ins lassen sich nicht physisch loeschen; die Zeile bleibt als dritter
+  // historischer Tombstone in der geschlossenen Partition (27 + 33 + 3 = 63).
+  const SUMMARIZER_TOMBSTONE_ID = "71cf1875-2da8-474c-bcdd-c950f3355e40";
+
+  it("keeps the partition closed at 63 agents including the Summarizer built-in tombstone", () => {
+    const partition = RETIREMENT_RESTORE_CANONICAL_AGENT_PARTITION;
+    expect(partition.sources).toHaveLength(27);
+    expect(partition.retainedAgents).toHaveLength(33);
+    expect(partition.historicalTombstones.map((row) => row.agentId)).toEqual([
+      "8d403783-c4e2-4746-adad-7689cd95ae33",
+      "dcd3cadb-8203-4048-be1e-77701a3a43a0",
+      SUMMARIZER_TOMBSTONE_ID,
+    ]);
+    expect(() => createRetirementSqlInventoryCollector(partition)).not.toThrow();
+
+    const legacyTwoTombstones = {
+      ...partition,
+      historicalTombstones: partition.historicalTombstones
+        .filter((row) => row.agentId !== SUMMARIZER_TOMBSTONE_ID),
+    };
+    expect(() => createRetirementSqlInventoryCollector(legacyTwoTombstones))
+      .toThrow(/exactly 3 historical tombstones/);
+
+    const fourTombstones = {
+      ...partition,
+      historicalTombstones: [
+        ...partition.historicalTombstones,
+        {
+          ...partition.historicalTombstones[0]!,
+          agentId: "91000000-0000-4000-8000-000000000004",
+          name: "Unlisted Tombstone",
+        },
+      ],
+    };
+    expect(() => createRetirementSqlInventoryCollector(fourTombstones))
+      .toThrow(/exactly 3 historical tombstones/);
+  });
+
+  it("classifies the Summarizer dump row as a tombstone and still rejects unknown agents", () => {
+    const columns = RETIREMENT_RESTORE_FULL_COLUMNS.agents!;
+    const agentRow = (id: string) => columns.map((column) => (column === "id" ? id : "\\N")).join("\t");
+    const collector = createRetirementSqlInventoryCollector(RETIREMENT_RESTORE_CANONICAL_AGENT_PARTITION);
+    collector.pushLine(`COPY public.agents (${columns.join(", ")}) FROM stdin;`);
+    expect(() => collector.pushLine(agentRow(SUMMARIZER_TOMBSTONE_ID))).not.toThrow();
+    expect(() => collector.pushLine(agentRow("91000000-0000-4000-8000-000000000009")))
+      .toThrow(/unclassified agent outside the closed partition/);
   });
 });
 
@@ -1177,7 +1227,7 @@ describeEmbeddedPostgres("agent retirement service", { timeout: 15_000 }, () => 
       reviewedPrestateSha256: "9".repeat(64),
       companyCount: 4,
       retainedAgentCount: 33,
-      historicalTombstoneCount: 2,
+      historicalTombstoneCount: 3,
       lifecycleContractCount: 33,
       tableCount: tableNames.length,
       tableNamesSha256: stableSha256(tableNames),

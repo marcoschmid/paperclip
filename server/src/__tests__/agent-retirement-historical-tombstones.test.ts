@@ -8,9 +8,11 @@ import {
   isHistoricalAgentTombstoneId,
 } from "../services/agent-retirement-historical-tombstones.js";
 
+// TEC-960: dritter Tombstone ist der am 06.10.2026 terminierte Built-in "Summarizer" (Casa).
 const TOMBSTONES = [
   "8d403783-c4e2-4746-adad-7689cd95ae33",
   "dcd3cadb-8203-4048-be1e-77701a3a43a0",
+  "71cf1875-2da8-474c-bcdd-c950f3355e40",
 ] as const;
 
 function inertState() {
@@ -122,7 +124,7 @@ describe("historical retirement tombstone work inertness", () => {
     const proof = assertHistoricalTombstoneWorkInertness(inertState());
 
     expect(proof).toEqual({
-      tombstoneCount: 2,
+      tombstoneCount: 3,
       terminalIssueCount: 2,
       inactiveRoutineCount: 1,
       disabledTriggerCount: 1,
@@ -200,6 +202,29 @@ describe("historical retirement tombstone work inertness", () => {
     const state = inertState();
     mutate(state);
     expect(() => assertHistoricalTombstoneWorkInertness(state)).toThrow(/not inert/i);
+  });
+
+  it("requires the complete canonical tombstone identity set", () => {
+    expect(isHistoricalAgentTombstoneId(TOMBSTONES[2])).toBe(true);
+    expect(() => assertHistoricalTombstoneWorkInertness(inertState())).not.toThrow();
+
+    const legacyPair = inertState();
+    legacyPair.tombstoneIds = legacyPair.tombstoneIds.slice(0, 2);
+    expect(() => assertHistoricalTombstoneWorkInertness(legacyPair)).toThrow(/tombstone identity set must contain exactly 3 IDs/i);
+
+    const oneTooMany = inertState();
+    (oneTooMany.tombstoneIds as string[]).push("90000000-0000-4000-8000-000000000002");
+    expect(() => assertHistoricalTombstoneWorkInertness(oneTooMany)).toThrow(/tombstone identity set must contain exactly 3 IDs/i);
+
+    // Richtige Anzahl, aber ein Eintrag ist kein kanonischer Tombstone.
+    const swapped = inertState();
+    (swapped.tombstoneIds as string[])[2] = "90000000-0000-4000-8000-000000000002";
+    expect(() => assertHistoricalTombstoneWorkInertness(swapped))
+      .toThrow(/tombstone identity set must match the canonical tombstone IDs/i);
+
+    const upperCase = inertState();
+    (upperCase.tombstoneIds as string[])[2] = TOMBSTONES[2].toUpperCase();
+    expect(() => assertHistoricalTombstoneWorkInertness(upperCase)).not.toThrow(/canonical tombstone IDs/i);
   });
 
   it("rejects unknown or duplicate tombstone identities and out-of-scope rows", () => {

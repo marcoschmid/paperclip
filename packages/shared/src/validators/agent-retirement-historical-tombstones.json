@@ -14,5 +14,13 @@
     "expectedStatus": "terminated",
     "disposition": "preserve_tombstone",
     "physicalDelete": false
+  },
+  {
+    "agentId": "71cf1875-2da8-474c-bcdd-c950f3355e40",
+    "companyId": "51eb52b7-49ed-461a-bd67-7384158374e6",
+    "name": "Summarizer",
+    "expectedStatus": "terminated",
+    "disposition": "preserve_tombstone",
+    "physicalDelete": false
   }
 ]

@@ -192,14 +192,19 @@ function assertAgentRows(
 export function assertHistoricalTombstoneWorkInertness(
   state: HistoricalTombstoneWorkState,
 ): HistoricalTombstoneWorkInertnessProof {
+  // Die erwartete Anzahl folgt der kanonischen Tombstone-Liste (TEC-960: 3 Eintraege).
+  const expectedTombstoneCount = AGENT_RETIREMENT_HISTORICAL_TOMBSTONE_IDS.size;
   if (!state || typeof state !== "object" || !Array.isArray(state.tombstoneIds) ||
-      state.tombstoneIds.length !== 2) {
-    throw new Error("Historical tombstone identity set must contain exactly two IDs");
+      state.tombstoneIds.length !== expectedTombstoneCount) {
+    throw new Error(`Historical tombstone identity set must contain exactly ${expectedTombstoneCount} IDs`);
   }
   for (const id of state.tombstoneIds) assertUuid(id, "identity");
   const tombstoneIds = new Set(state.tombstoneIds);
   if (tombstoneIds.size !== state.tombstoneIds.length) {
     throw new Error("Historical tombstone identity set contains duplicates");
+  }
+  if (state.tombstoneIds.some((id) => !isHistoricalAgentTombstoneId(id))) {
+    throw new Error("Historical tombstone identity set must match the canonical tombstone IDs");
   }
   if (!Array.isArray(state.issues) || !Array.isArray(state.routines) ||
       !Array.isArray(state.routineTriggers) || !Array.isArray(state.projects) ||
